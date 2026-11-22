@@ -1,0 +1,11 @@
+# Replace @Ayushkumar418 with your GitHub username (or an org team like @opencobot/maintainers).
+# Security-sensitive paths always need a human code-owner review.
+
+*                      @Ayushkumar418
+/policy/               @Ayushkumar418
+/remote/               @Ayushkumar418
+/skills/               @Ayushkumar418
+/.github/              @Ayushkumar418
+/SECURITY.md           @Ayushkumar418
+/AGENTS.md             @Ayushkumar418
+/LICENSE               @Ayushkumar418
