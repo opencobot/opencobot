@@ -11,12 +11,17 @@ Safety rules enforced here (not by the caller):
 * Args are validated against each tool's JSON Schema inside ``execute()``:
   required keys, types, enums; ``additionalProperties`` rejected. Bad input
   returns ``ok False`` with an error, never raises.
-* Every filesystem path is resolved through
-  :func:`adapters.linux.linux.safe_resolve` against the context workdir
-  (plus token scope folders when a capability token is present). Paths
-  escaping that scope — ``..`` segments, absolute paths elsewhere, symlink
+* Every filesystem path is resolved through the dispatched OS
+  adapter's ``safe_resolve`` (Linux: :mod:`adapters.linux.linux`;
+  Windows: :mod:`adapters.windows.windows`, selected by
+  :func:`_os_adapter`) against the context workdir (plus token scope
+  folders when a capability token is present). Paths escaping that
+  scope — ``..`` segments, absolute paths elsewhere, symlink
   escapes — are denied.
 * No ``shell=True`` anywhere; all subprocess calls use argv arrays.
+  On Windows ``run_command`` goes through the Windows adapter's
+  ``run_powershell`` (argv arrays only, quoted as PowerShell data),
+  never ``cmd.exe``.
 * ``delete_to_trash`` never hard-deletes; ``write_file`` snapshots the
   original first (undo support).
 * Stdlib only. No network access in any tool.
@@ -36,7 +41,9 @@ import copy
 import fnmatch
 import functools
 import hashlib
+import ntpath
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -50,6 +57,43 @@ try:
 except ImportError:  # allow import without the repo root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from adapters.linux import linux as linux_adapter
+
+
+def _is_windows() -> bool:
+    """True on a Windows host (``platform.system() == "Windows"``)."""
+    return platform.system() == "Windows"
+
+
+def _os_adapter():
+    """Return the OS adapter module for this platform.
+
+    Selected per call, not cached: the import is already in
+    ``sys.modules`` after the first call, so this is cheap, and
+    per-call selection lets tests patch ``platform.system`` without
+    cache invalidation. POSIX returns :mod:`adapters.linux.linux`;
+    Windows returns :mod:`adapters.windows.windows`. The Windows
+    module imports cleanly on Linux (stdlib only) but is only
+    imported on a Windows host, so a Linux process never touches
+    Windows-only code paths.
+    """
+    if _is_windows():
+        from adapters.windows import windows as windows_adapter
+
+        return windows_adapter
+    return linux_adapter
+
+
+def _windows_command_name(argv0: str) -> str:
+    """Lower-cased argv[0] basename, drive/path and ``.exe`` stripped.
+
+    ``ntpath`` is used (not ``pathlib``) so the normalisation is
+    correct for Windows spellings even when this code is read on
+    Linux, e.g. ``C:\\Windows\\FORMAT.EXE`` -> ``format``.
+    """
+    name = ntpath.basename(str(argv0).replace("/", "\\")).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
 __all__ = ["ToolSpec", "TOOLS", "get_tool", "list_tools"]
 
@@ -180,9 +224,76 @@ def _allowed_roots(ctx: dict) -> list[Path]:
 
 
 def _resolve(ctx: dict, user_path: str) -> Path:
-    """Resolve a user-supplied path inside the allowed scope (raises ValueError)."""
-    return linux_adapter.safe_resolve(_workdir(ctx), user_path,
-                                      allowed_roots=_allowed_roots(ctx))
+    """Resolve a user-supplied path inside the allowed scope (raises ValueError).
+
+    The dispatched adapter returns a Linux ``Path`` on POSIX and a
+    ``PureWindowsPath`` on Windows; wrapping in ``Path(...)`` yields a
+    concrete, filesystem-capable path on the host platform.
+    """
+    resolved = _os_adapter().safe_resolve(_workdir(ctx), user_path,
+                                          allowed_roots=_allowed_roots(ctx))
+    return Path(str(resolved))
+
+
+def _git_binary() -> str | None:
+    """Resolved git executable for this platform, or None if absent.
+
+    Git tools need git installed; no new dependency is introduced.
+    ``shutil.which("git")`` already resolves ``git.exe`` via PATHEXT
+    on Windows, but ``git.exe`` is checked first there so the lookup
+    is explicit about the Windows binary name.
+    """
+    if _is_windows():
+        return shutil.which("git.exe") or shutil.which("git")
+    return shutil.which("git")
+
+
+def _run_git(path: Path, argv: list[str], timeout: int = 15):
+    """Run git with an argv array only, cwd=path (dispatch by platform).
+
+    POSIX keeps the Linux adapter's ``run_git``; Windows runs the
+    resolved ``git.exe`` the same way (argv array, no shell).
+    """
+    if _is_windows():
+        git = _git_binary()
+        if git is None:
+            raise FileNotFoundError("git binary not found")
+        return subprocess.run(
+            [git, *argv], cwd=str(path), capture_output=True,
+            text=True, timeout=timeout, shell=False,
+        )
+    return _os_adapter().run_git(path, argv, timeout=timeout)
+
+
+def _is_git_repo(path: Path) -> bool:
+    """True iff ``path`` is inside a git working tree (either platform)."""
+    try:
+        result = _run_git(Path(path), ["rev-parse", "--git-dir"], timeout=10)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _run_powershell(argv: list[str], timeout: int, cwd: Path | None):
+    """Run ``argv`` through the Windows adapter's ``run_powershell``.
+
+    ``run_powershell`` takes no cwd, so when a cwd is given it is
+    passed through the adapter's injectable ``runner`` seam: the
+    adapter still builds the full PowerShell argv (argv array only,
+    quoted as data), and the runner only adds ``cwd=`` to the
+    ``subprocess.run`` call. No shell is involved at any point.
+    """
+    adapter = _os_adapter()
+    if cwd is None:
+        return adapter.run_powershell(argv, timeout=timeout)
+
+    def _runner(full_argv, timeout: int = 30):
+        return subprocess.run(
+            full_argv, cwd=str(cwd), capture_output=True, text=True,
+            timeout=timeout, shell=False,
+        )
+
+    return adapter.run_powershell(argv, timeout=timeout, runner=_runner)
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +625,7 @@ def _exec_system_info(args, ctx):
     err = _validate(args, _SCHEMAS["system_info"])
     if err:
         return _fail(err)
-    return _ok(linux_adapter.system_info(_workdir(ctx)))
+    return _ok(_os_adapter().system_info(_workdir(ctx)))
 
 
 @_guard_verify
@@ -522,7 +633,7 @@ def _verify_system_info(args, result, ctx):
     failed = _verify_failed(result)
     if failed:
         return failed
-    fresh = linux_adapter.system_info(_workdir(ctx))
+    fresh = _os_adapter().system_info(_workdir(ctx))
     data = result["data"]
     if data.get("cpu_count") != fresh["cpu_count"]:
         return False, "cpu count changed"
@@ -539,7 +650,7 @@ def _exec_list_processes(args, ctx):
     err = _validate(args, _SCHEMAS["list_processes"])
     if err:
         return _fail(err)
-    processes = linux_adapter.list_processes(args.get("name_filter"))
+    processes = _os_adapter().list_processes(args.get("name_filter"))
     return _ok({"processes": processes, "count": len(processes)})
 
 
@@ -548,7 +659,7 @@ def _verify_list_processes(args, result, ctx):
     failed = _verify_failed(result)
     if failed:
         return failed
-    fresh = {p["pid"]: p for p in linux_adapter.list_processes()}
+    fresh = {p["pid"]: p for p in _os_adapter().list_processes()}
     reported = result["data"].get("processes", [])
     # Processes may legitimately exit between execute() and verify(); a pid
     # that vanished is not evidence of a lie. What we can check strictly:
@@ -628,9 +739,9 @@ def _require_git_repo(ctx, args) -> tuple[Path | None, str | None]:
     path = _resolve(ctx, args["path"])
     if not path.is_dir():
         return None, f"not a directory: {args['path']!r}"
-    if shutil.which("git") is None:
+    if _git_binary() is None:
         return None, "git binary not found"
-    if not linux_adapter.is_git_repo(path):
+    if not _is_git_repo(path):
         return None, "not a git repository"
     return path, None
 
@@ -643,7 +754,7 @@ def _exec_git_status(args, ctx):
     path, repo_err = _require_git_repo(ctx, args)
     if repo_err:
         return _fail(repo_err)
-    result = linux_adapter.run_git(path, ["status", "--porcelain=v1", "-b"])
+    result = _run_git(path, ["status", "--porcelain=v1", "-b"])
     if result.returncode != 0:
         return _fail(f"git status failed: {result.stderr.strip()}")
     branch = ""
@@ -668,7 +779,7 @@ def _exec_git_status(args, ctx):
 
 
 def _git_status_again(path: Path) -> dict:
-    result = linux_adapter.run_git(path, ["status", "--porcelain=v1", "-b"])
+    result = _run_git(path, ["status", "--porcelain=v1", "-b"])
     branch = ""
     changed = []
     for line in result.stdout.splitlines():
@@ -703,7 +814,7 @@ def _exec_git_log(args, ctx):
     path, repo_err = _require_git_repo(ctx, args)
     if repo_err:
         return _fail(repo_err)
-    result = linux_adapter.run_git(
+    result = _run_git(
         path, ["log", f"-n{max_count}", "--date=iso",
                "--format=%H%x1f%an%x1f%ad%x1f%s%x1e"])
     if result.returncode != 0:
@@ -727,7 +838,7 @@ def _verify_git_log(args, result, ctx):
         return failed
     path = _resolve(ctx, args["path"])
     max_count = args.get("max_count", 10)
-    fresh = linux_adapter.run_git(
+    fresh = _run_git(
         path, ["log", f"-n{max_count}", "--date=iso",
                "--format=%H%x1f%an%x1f%ad%x1f%s%x1e"])
     commits = []
@@ -752,11 +863,11 @@ def _exec_git_diff(args, ctx):
     path, repo_err = _require_git_repo(ctx, args)
     if repo_err:
         return _fail(repo_err)
-    diff = linux_adapter.run_git(path, ["diff"])
+    diff = _run_git(path, ["diff"])
     if diff.returncode != 0:
         return _fail(f"git diff failed: {diff.stderr.strip()}")
-    names = linux_adapter.run_git(path, ["diff", "--name-only"])
-    stat = linux_adapter.run_git(path, ["diff", "--stat"])
+    names = _run_git(path, ["diff", "--name-only"])
+    stat = _run_git(path, ["diff", "--stat"])
     text = diff.stdout
     truncated = len(text) > MAX_OUTPUT_BYTES
     if truncated:
@@ -774,7 +885,7 @@ def _verify_git_diff(args, result, ctx):
     if failed:
         return failed
     path = _resolve(ctx, args["path"])
-    fresh = linux_adapter.run_git(path, ["diff"])
+    fresh = _run_git(path, ["diff"])
     expected = fresh.stdout[:MAX_OUTPUT_BYTES] if len(fresh.stdout) > MAX_OUTPUT_BYTES else fresh.stdout
     if expected == result["data"].get("diff"):
         return True, "git diff matches working tree"
@@ -789,9 +900,18 @@ def _exec_screenshot(args, ctx):
     err = _validate(args, _SCHEMAS["screenshot"])
     if err:
         return _fail(err)
-    available, reason = linux_adapter.screenshot_available()
+    available, reason = _os_adapter().screenshot_available()
     if not available:
         return _fail(reason, {"unavailable": True, "reason": reason})
+    if _is_windows():
+        # No capture implementation exists behind the adapter on
+        # Windows (the adapter honestly reports unavailable until a
+        # Graphics Capture path lands); never run the Linux scrot
+        # path below. Unreachable today, kept as a guard for a future
+        # adapter that reports available without a capture function.
+        return _fail("screenshot capture is not implemented on Windows",
+                     {"unavailable": True,
+                      "reason": "screenshot capture is not implemented on Windows"})
     tool = next(t for t in ("scrot", "import", "gnome-screenshot")
                 if shutil.which(t))
     dest = _state_dir(ctx) / "screenshots" / (
@@ -861,10 +981,15 @@ def _exec_list_windows(args, ctx):
     err = _validate(args, _SCHEMAS["list_windows"])
     if err:
         return _fail(err)
-    available, reason = linux_adapter.list_windows_available()
+    available, reason = _os_adapter().list_windows_available()
     if not available:
         return _fail(reason, {"unavailable": True, "reason": reason})
-    windows = _list_windows_live()
+    if _is_windows():
+        # Windows lists windows via the adapter's PowerShell query;
+        # the Linux wmctrl/xdotool path below does not exist there.
+        windows = _os_adapter().list_windows()
+    else:
+        windows = _list_windows_live()
     return _ok({"windows": windows, "count": len(windows)})
 
 
@@ -873,13 +998,17 @@ def _verify_list_windows(args, result, ctx):
     failed = _verify_failed(result)
     if failed:
         return failed
-    available, reason = linux_adapter.list_windows_available()
+    available, reason = _os_adapter().list_windows_available()
     if not available:
         return False, f"window tool no longer available: {reason}"
-    live_ids = {w["id"] for w in _list_windows_live()}
+    # Live window ids: Linux entries carry "id", Windows entries
+    # carry "pid" — compare whichever the adapter returned.
+    live = _os_adapter().list_windows() if _is_windows() else _list_windows_live()
+    live_ids = {str(w.get("pid") or w.get("id")) for w in live}
     for window in result["data"].get("windows", []):
-        if window.get("id") not in live_ids:
-            return False, f"window {window.get('id')} no longer listed"
+        wid = str(window.get("pid") or window.get("id"))
+        if wid not in live_ids:
+            return False, f"window {wid} no longer listed"
     return True, f"all {len(result['data'].get('windows', []))} windows still listed"
 
 
@@ -1140,7 +1269,7 @@ def _exec_delete_to_trash(args, ctx):
     if not path.exists():
         return _fail(f"no such file or directory: {args['path']!r}")
     sha = _hash_file(path) if path.is_file() else None
-    dest = linux_adapter.trash_path(_state_dir(ctx), path)
+    dest = _os_adapter().trash_path(_state_dir(ctx), path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(path), str(dest))
     return _ok({"path": str(path), "trash_path": str(dest), "sha256": sha})
@@ -1183,6 +1312,17 @@ def _exec_run_command(args, ctx):
         return _fail("argv must be a non-empty list of strings")
     if Path(argv[0]).name in BLOCKED_BINARIES:
         return _fail(f"running {Path(argv[0]).name!r} is blocked")
+    if _is_windows():
+        # The Linux blocklist above still applies on Windows; the
+        # Windows blocklist adds destructive / privilege-escalating
+        # commands (format, diskpart, del, ...) and nested shells
+        # (powershell, pwsh, cmd) that would defeat the argv-only
+        # quoting boundary. The adapter's run_powershell enforces the
+        # same list again (plus conditional blocks like `reg delete`)
+        # as defence-in-depth.
+        blocked = getattr(_os_adapter(), "WINDOWS_BLOCKED_COMMANDS", frozenset())
+        if _windows_command_name(argv[0]) in blocked:
+            return _fail(f"running {_windows_command_name(argv[0])!r} is blocked")
     if "--no-preserve-root" in argv:
         return _fail("argument '--no-preserve-root' is blocked")
     timeout = args.get("timeout", 30)
@@ -1192,8 +1332,14 @@ def _exec_run_command(args, ctx):
     if not cwd.is_dir():
         return _fail(f"cwd is not a directory: {args.get('cwd')!r}")
     try:
-        proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
-                              timeout=timeout, shell=False)
+        if _is_windows():
+            # Windows: argv array through PowerShell (never cmd.exe,
+            # never shell=True). run_powershell raises ValueError for
+            # blocked commands, which _guard turns into a clean failure.
+            proc = _run_powershell(argv, timeout, cwd if args.get("cwd") else None)
+        else:
+            proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
+                                  timeout=timeout, shell=False)
     except subprocess.TimeoutExpired as exc:
         stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         if len(stdout) > MAX_OUTPUT_BYTES:

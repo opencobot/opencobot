@@ -17,7 +17,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adapters.linux.linux import safe_resolve, trash_path  # noqa: E402
-from adapters.windows.stub import WindowsAdapter  # noqa: E402
+from adapters.windows.windows import (  # noqa: E402
+    WINDOWS_BLOCKED_COMMANDS,
+    screenshot_available as windows_screenshot_available,
+)
 from tools.definitions import TOOLS, get_tool, list_tools  # noqa: E402
 
 EXPECTED = {
@@ -527,12 +530,19 @@ def test_run_command_output_truncated(ctx):
 
 
 # ---------------------------------------------------------------------------
-# Windows stub
+# Windows adapter (real implementation; the ADR-001 stub is gone)
 # ---------------------------------------------------------------------------
 
-def test_windows_adapter_stub():
-    with pytest.raises(NotImplementedError, match="ADR-001"):
-        WindowsAdapter()
-    adapter = WindowsAdapter.__new__(WindowsAdapter)
-    with pytest.raises(NotImplementedError, match="ADR-001"):
-        adapter.list_processes()
+def test_windows_adapter_screenshot_honestly_unavailable():
+    # No capture path exists yet: the adapter must report unavailable
+    # rather than fake a screenshot.
+    available, reason = windows_screenshot_available()
+    assert available is False
+    assert isinstance(reason, str) and reason
+
+
+def test_windows_adapter_blocklist_has_destructive_commands():
+    assert "format" in WINDOWS_BLOCKED_COMMANDS
+    assert "diskpart" in WINDOWS_BLOCKED_COMMANDS
+    assert "powershell" in WINDOWS_BLOCKED_COMMANDS
+    assert "cmd" in WINDOWS_BLOCKED_COMMANDS
