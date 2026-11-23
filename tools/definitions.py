@@ -662,16 +662,33 @@ def _verify_list_processes(args, result, ctx):
     fresh = {p["pid"]: p for p in _os_adapter().list_processes()}
     reported = result["data"].get("processes", [])
     # Processes may legitimately exit between execute() and verify(); a pid
-    # that vanished is not evidence of a lie. What we can check strictly:
-    # every pid that still exists must match, and at least one reported
-    # process must still be alive (a wholly fabricated list would fail).
+    # that vanished is not evidence of a lie. A pid's NAME, however, is not
+    # a sound identity check either: a process that exec()s a new program
+    # keeps its pid but gets a new comm (``sh`` -> ``sleep``), which happens
+    # constantly on a busy CI runner — the old strict name check failed the
+    # main-branch CI run on f302c87 for exactly this reason. Identity is
+    # therefore pid + starttime (``/proc`` stat field 22, invariant across
+    # exec): same starttime means the same process even if it renamed
+    # itself, a different starttime means the pid was reused by a new
+    # process and confirms nothing. Entries without a starttime (Windows
+    # shape) fall back to name equality — sound there, because on Windows
+    # exec creates a new process (new pid) instead of reusing one.
+    # What we can check strictly: at least one reported process must still
+    # be alive under the same identity (a wholly fabricated list fails).
     still_alive = 0
     for proc in reported:
         pid = proc.get("pid")
-        if pid in fresh:
-            still_alive += 1
-            if fresh[pid]["name"] != proc.get("name"):
-                return False, f"process {pid} name changed: {fresh[pid]['name']!r}"
+        live = fresh.get(pid)
+        if live is None:
+            continue
+        reported_st = proc.get("starttime")
+        live_st = live.get("starttime")
+        if reported_st is not None and live_st is not None:
+            if reported_st != live_st:
+                continue  # pid reuse: a different process owns this pid now
+        elif live.get("name") != proc.get("name"):
+            continue  # no starttime to compare: name is the only identity
+        still_alive += 1
     if reported and still_alive == 0:
         return False, "none of the reported processes exist anymore"
     name_filter = args.get("name_filter")
