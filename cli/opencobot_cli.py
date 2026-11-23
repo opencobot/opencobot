@@ -558,10 +558,11 @@ def cmd_readonly(args):
 
 
 def _gateway_configs():
-    """Configured gateway providers (defaults when nothing is configured)."""
-    from core.model_gateway import Gateway
+    """Configured gateway providers: config-file overrides (if any)
+    applied over the defaults (see core.model_gateway.load_gateway_configs)."""
+    from core.model_gateway import load_gateway_configs
 
-    return Gateway().configs
+    return load_gateway_configs()
 
 
 def _provider_egress(config):
@@ -588,7 +589,8 @@ def cmd_gateway_providers(args):
             try:
                 from core.model_gateway import Gateway
 
-                record["available"] = bool(Gateway().ping(config))
+                record["available"] = bool(
+                    Gateway(configs=configs).ping(config))
             except Exception:
                 record["available"] = False
         providers.append(record)
@@ -599,6 +601,31 @@ def cmd_gateway_providers(args):
              for p in providers] or ["(no gateway providers configured)"]
     _emit(payload, args.json, lines)
     return 0
+
+
+def _benchmark_probe(gateway, provider_name):
+    """One cheap call to check the provider answers before a benchmark.
+
+    Returns an error string when the provider fails, needs approval, or
+    returns no text -- so a missing model fails fast with a clear message
+    instead of scoring 0.00 on all 7 tests with empty outputs.
+    Returns None when the provider answered.
+    """
+    try:
+        probe = gateway.complete("EXECUTOR", "Reply with the single word PING.",
+                                 "public")
+    except Exception as exc:
+        return f"gateway call failed: {exc}"
+    if not isinstance(probe, dict):
+        return "gateway returned an unexpected response"
+    if probe.get("error"):
+        return str(probe["error"])
+    if probe.get("needs_approval"):
+        return ("gateway call needs approval (cloud escalation is not "
+                "pre-approved for this provider)")
+    if not (probe.get("text") or "").strip():
+        return "gateway returned no text"
+    return None
 
 
 def cmd_benchmark(args):
@@ -614,6 +641,11 @@ def cmd_benchmark(args):
              f"(configured: {', '.join(names) or 'none'}; "
              "see `opencobot gateway providers`)")
         return 2
+    if getattr(args, "model", None):
+        # One-run model override (does not touch the config file).
+        for config in configs:
+            if config.name == provider_name:
+                config.model = args.model
     try:
         from core.benchmark import run_benchmark
     except ImportError:
@@ -624,6 +656,16 @@ def cmd_benchmark(args):
 
     gateway = Gateway(configs=configs)
 
+    probe_error = _benchmark_probe(gateway, provider_name)
+    if probe_error is not None:
+        model = next(c.model for c in configs if c.name == provider_name)
+        _err(f"provider {provider_name!r} (model {model!r}) failed before "
+             f"benchmark: {probe_error}. Check the model is installed "
+             f"(`ollama pull {model}` for Ollama) or pick another model "
+             f"with --model, or set it in the gateway config file "
+             f"(see docs/GATEWAY.md).")
+        return 2
+
     def call(prompt):
         complete = getattr(gateway, "complete", None)
         if callable(complete):
@@ -632,9 +674,14 @@ def cmd_benchmark(args):
             result = gateway.chat(
                 "EXECUTOR", [{"role": "user", "content": prompt}], "public")
         if isinstance(result, dict):
-            if result.get("ok") is False:
-                raise RuntimeError(result.get("error") or "gateway call failed")
-            return str(result.get("text") or "")
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            if result.get("needs_approval"):
+                raise RuntimeError("gateway call needs approval")
+            text = str(result.get("text") or "")
+            if not text.strip():
+                raise RuntimeError("gateway returned no text")
+            return text
         return str(result or "")
 
     try:
@@ -1010,6 +1057,9 @@ def build_parser():
     p_benchmark = sub.add_parser("benchmark", help="benchmark a gateway provider")
     p_benchmark.add_argument("--provider", required=True,
                              help="provider name (see `opencobot gateway providers`)")
+    p_benchmark.add_argument("--model", default=None,
+                             help="model to use for this run only "
+                                  "(overrides the gateway config file)")
     p_benchmark.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     p_benchmark.set_defaults(func=cmd_benchmark)
 

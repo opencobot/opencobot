@@ -37,6 +37,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Any, Callable
 
 from .usage import UsageStore
@@ -216,6 +217,90 @@ def _default_configs() -> list[ProviderConfig]:
     ]
 
 
+#: Environment variable naming a gateway config file (JSON). The file
+#: is trusted local configuration -- it only overrides which model /
+#: endpoint the already-configured providers use, and never carries
+#: API keys (those still come from environment variables at call time).
+GATEWAY_CONFIG_ENV = "OPENCOBOT_GATEWAY_CONFIG"
+
+#: Default config file location; used only when it exists.
+DEFAULT_GATEWAY_CONFIG_PATH = Path.home() / ".config" / "opencobot" / "gateway.json"
+
+#: Provider fields a config file may override on an existing provider.
+_CONFIG_OVERRIDABLE = ("model", "base_url", "timeout", "api_key_env",
+                       "cost_per_call", "daily_budget", "monthly_budget")
+
+
+def gateway_config_path(explicit: str | None = None) -> Path | None:
+    """Resolve the gateway config file: explicit path, else the
+    ``OPENCOBOT_GATEWAY_CONFIG`` env var, else the default location.
+    Returns None when no file exists at the resolved location."""
+    if explicit:
+        path = Path(explicit)
+    elif os.environ.get(GATEWAY_CONFIG_ENV):
+        path = Path(os.environ[GATEWAY_CONFIG_ENV])
+    else:
+        path = DEFAULT_GATEWAY_CONFIG_PATH
+    return path if path.is_file() else None
+
+
+def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
+    """Defaults plus optional JSON config-file overrides.
+
+    File format::
+
+        {"providers": [
+          {"name": "ollama-local", "model": "qwen2.5:0.5b"},
+          {"name": "my-local", "kind": "ollama",
+           "base_url": "http://localhost:11434", "model": "llama3.1:8b"}
+        ]}
+
+    An entry whose ``name`` matches a default provider overrides that
+    provider's ``model`` / ``base_url`` (and the other fields in
+    ``_CONFIG_OVERRIDABLE``). An entry with a new name and a ``kind``
+    adds a provider. An unknown name without ``kind`` raises ValueError
+    so a typo fails loudly instead of being silently ignored. With no
+    config file, this is exactly ``_default_configs()``.
+    """
+    configs = _default_configs()
+    config_path = gateway_config_path(path)
+    if config_path is None:
+        return configs
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"gateway config {config_path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
+        raise ValueError(
+            f"gateway config {config_path} must be an object with a "
+            f"'providers' list")
+    by_name = {c.name: c for c in configs}
+    for entry in data["providers"]:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            raise ValueError(
+                f"gateway config {config_path}: each provider needs a 'name'")
+        name = entry["name"]
+        if name in by_name:
+            config = by_name[name]
+            for field in _CONFIG_OVERRIDABLE:
+                if field in entry:
+                    setattr(config, field, entry[field])
+        elif entry.get("kind"):
+            configs.append(ProviderConfig(
+                name=name,
+                kind=entry["kind"],
+                base_url=entry.get("base_url", ""),
+                model=entry.get("model", ""),
+                api_key_env=entry.get("api_key_env"),
+                timeout=entry.get("timeout", 30),
+            ))
+        else:
+            raise ValueError(
+                f"gateway config {config_path}: unknown provider {name!r} "
+                f"(add a 'kind' to define it, or fix the name)")
+    return configs
+
+
 def _extract_text(response: Any) -> str | None:
     """Pull generated text out of a transport/HTTP response body."""
     if isinstance(response, str):
@@ -256,7 +341,7 @@ class Gateway:
         role_providers: dict | None = None,
     ):
         self.configs: list[ProviderConfig] = (
-            list(configs) if configs is not None else _default_configs()
+            list(configs) if configs is not None else load_gateway_configs()
         )
         self._transport = transport
         self._budgets: dict = dict(budgets) if budgets else {}
@@ -488,6 +573,12 @@ class Gateway:
             raw = self._call_transport(config, url, payload, headers)
         else:
             raw = self._call_http(config, url, payload, headers)
+        if isinstance(raw, dict) and raw.get("ok") is False:
+            # _call_http reports transport/HTTP failures as an error
+            # dict instead of raising; surface its message (e.g. the
+            # model name in a 404) instead of the generic
+            # "unexpected response" below.
+            raise RuntimeError(raw.get("error") or "model error")
         text = _extract_text(raw)
         if text is None:
             raise RuntimeError("model error: unexpected response")
@@ -563,6 +654,7 @@ class Gateway:
                     role, target.name, None, target.cost_per_call, True, True
                 )
             return self._complete_with(role, target, prompt, escalated=True)
+        errors: list[str] = []
         for index, config in enumerate(chain):
             if not self.is_available(config.name):
                 continue
@@ -579,7 +671,14 @@ class Gateway:
                 )
             try:
                 text = self._call_provider(config, prompt)
-            except Exception:
+            except Exception as exc:
+                # Remember *why* each provider failed instead of
+                # swallowing it: a missing model used to surface as
+                # "no provider available" with no detail, and callers
+                # (e.g. the benchmark) scored silent 0.00s. All
+                # failures are listed -- the first is usually the
+                # provider the role actually wanted.
+                errors.append(f"provider {config.name}: {exc}")
                 self.mark_failure(config.name)
                 continue
             self.record_usage(config.name)
@@ -589,7 +688,8 @@ class Gateway:
             )
         return self._result(
             role, None, None, 0.0, False, False,
-            error="no provider available or budget exceeded",
+            error=("no provider available or budget exceeded"
+                   + (f" ({'; '.join(errors)})" if errors else "")),
         )
 
     def _complete_with(
@@ -608,11 +708,11 @@ class Gateway:
             )
         try:
             text = self._call_provider(config, prompt)
-        except Exception:
+        except Exception as exc:
             self.mark_failure(config.name)
             return self._result(
                 role, None, None, 0.0, False, False,
-                error=f"provider {config.name} failed",
+                error=f"provider {config.name} failed: {exc}",
             )
         self.record_usage(config.name)
         self.note_success(role)
@@ -648,6 +748,7 @@ class Gateway:
         current = self.role_provider(role)
         names = [c.name for c in chain]
         start = names.index(current) if current in names else 0
+        errors: list[str] = []
         for config in chain[start + 1:]:
             if not self.is_available(config.name):
                 continue
@@ -661,7 +762,8 @@ class Gateway:
                 return result
             try:
                 text = self._call_provider(config, prompt)
-            except Exception:
+            except Exception as exc:
+                errors.append(f"provider {config.name}: {exc}")
                 self.mark_failure(config.name)
                 continue
             self.record_usage(config.name)
@@ -673,7 +775,8 @@ class Gateway:
             return result
         result = self._result(
             role, None, None, 0.0, False, False,
-            error="no further provider available for escalation",
+            error=("no further provider available for escalation"
+                   + (f" ({'; '.join(errors)})" if errors else "")),
         )
         result["reason"] = reason
         return result
@@ -783,6 +886,16 @@ class Gateway:
                 "text": None,
                 "provider": config.name,
                 "error": f"model error: {type(exc).__name__}: {exc}",
+            }
+        if isinstance(raw, dict) and raw.get("ok") is False:
+            # _call_http reports transport/HTTP failures as an error
+            # dict; keep its message (e.g. "model error: HTTP 404")
+            # instead of the generic "unexpected response" below.
+            return {
+                "ok": False,
+                "text": None,
+                "provider": config.name,
+                "error": raw.get("error") or "model error",
             }
         text = _extract_text(raw)
         if text is None:

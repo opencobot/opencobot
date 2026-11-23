@@ -103,11 +103,43 @@ pass/fail + score, total score 0–1, and a recommended automation profile:
 ```sh
 opencobot benchmark --provider opencode
 opencobot benchmark --provider ollama-local --json
+opencobot benchmark --provider ollama-local --model qwen2.5:0.5b
 python evals/benchmark_run.py          # mock providers, no model needed
 ```
 
+Before running the 7 tests, the CLI makes one cheap probe call. If the
+provider fails, needs approval, or returns no text, the benchmark stops
+with a clear error instead of scoring 0.00 on every test with empty
+outputs — that silent failure is what happened in live testing when the
+default model `llama3.1` was not installed (the gateway swallowed the
+model error and the benchmark scored it as 0). The probe error names the
+model and the underlying cause, e.g. `model error: HTTP 404`.
+
 Vision is not covered by this text-only benchmark yet; a separate vision
 benchmark is needed once a grounder exists.
+
+## Gateway config file
+
+The default model is `llama3.1` on `ollama-local`, which may not be what
+is installed. Override it without code changes in
+`~/.config/opencobot/gateway.json` (or set `OPENCOBOT_GATEWAY_CONFIG` to
+another path):
+
+```json
+{"providers": [{"name": "ollama-local", "model": "qwen2.5:0.5b"}]}
+```
+
+Entries override `model` / `base_url` (and `timeout`, `api_key_env`,
+`cost_per_call`, budgets) on a provider of the same name; an entry with a
+new name plus a `kind` adds a provider. An unknown name without a `kind`
+fails loudly so a typo is caught. A one-run override is also available:
+`opencobot benchmark --provider ollama-local --model qwen2.5:0.5b`.
+
+Precedence: explicit `Gateway(configs=...)` in code > `--model` on the CLI
+> config file > built-in defaults. The file is trusted local
+configuration — it only changes which model/endpoint already-configured
+providers use; API keys are never read from it (they still come from
+environment variables at call time).
 
 ## Read-only mode
 

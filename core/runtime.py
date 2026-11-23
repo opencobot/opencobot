@@ -281,7 +281,7 @@ class Runtime:
                     "provider": raw.get("provider"),
                     "escalated": bool(raw.get("escalated", False)),
                     "needs_approval": False,
-                    "error": "gateway returned no text"}
+                    "error": raw.get("error") or "gateway returned no text"}
         return {"ok": True, "text": text, "provider": raw.get("provider"),
                 "role": raw.get("role", role),
                 "escalated": bool(raw.get("escalated", False)),
@@ -483,8 +483,18 @@ class Runtime:
                 all_ok = False
                 all_verified = False
                 decision = outcome.get("decision") or {}
-                error = (f"step {tool_name!r} failed: "
-                         f"{decision.get('reason') or outcome.get('evidence') or 'not verified'}")
+                tool_error = (outcome.get("result") or {}).get("error")
+                if decision.get("allowed"):
+                    # The step was allowed but the tool itself failed
+                    # (scope, execution, verification): report the
+                    # tool's own error, never the decision reason --
+                    # "allowed" is not a failure reason.
+                    detail = (tool_error or outcome.get("evidence")
+                              or "not verified")
+                else:
+                    detail = (decision.get("reason") or tool_error
+                              or "not verified")
+                error = f"step {tool_name!r} failed: {detail}"
                 break
         out = {"ok": all_ok, "verified": all_verified, "steps": results,
                "escalated": escalated, "plan_source": plan_source,
@@ -664,6 +674,11 @@ class Runtime:
             except Exception as exc:
                 verified, evidence = False, f"verify failed: {exc}"
         else:
-            verified, evidence = False, "execution reported failure"
+            # Execution reported failure: carry the tool's own error
+            # into the evidence so callers see *why* it failed, not
+            # just that it did. (Before this, the evidence was the
+            # generic "execution reported failure" and run_task then
+            # reported the decision reason "allowed" instead.)
+            verified, evidence = False, result.get("error") or "execution reported failure"
         ok = exec_ok and verified
         return finish()
