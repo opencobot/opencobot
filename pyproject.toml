@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencobot"
+version = "0.1.0"
+description = "Local-first, model-agnostic computer control for AI. Safe by design, verified by default."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[project.scripts]
+opencobot = "cli.opencobot_cli:main"
+
+[tool.setuptools]
+packages = ["core", "policy", "tools", "adapters", "adapters.linux", "adapters.windows", "cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "evals"]
+pythonpath = ["."]

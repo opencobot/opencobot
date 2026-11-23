@@ -1,0 +1,192 @@
+"""policyd: the policy engine as a separate process (SECURITY.md inv. 2).
+
+Listens on a Unix socket at ``<state-dir>/policyd.sock`` and speaks
+newline-delimited JSON: one JSON request object per line, one JSON reply
+per line. Every request must carry the ``auth`` token from
+``<state-dir>/policyd.auth`` (mode 0600, generated once and reused);
+requests with a missing or wrong token are rejected without being acted
+on. Handles one connection at a time. Logs to stderr only.
+
+Run: ``python -m policy.policyd --state-dir DIR``
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import socket
+import sys
+import threading
+from pathlib import Path
+
+from .engine import PolicyEngine, _default_state_dir
+from .tokens import CapabilityToken
+
+
+def _load_or_create_auth(state_dir: Path) -> str:
+    """Return the daemon auth token, creating it (0600) on first run."""
+    auth_path = state_dir / "policyd.auth"
+    if auth_path.exists():
+        token = auth_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_hex(32)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(auth_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (token + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(auth_path, 0o600)
+    return token
+
+
+def handle_request(
+    engine: PolicyEngine, auth_token: str, request: dict
+) -> dict:
+    """Dispatch one request dict and return the reply dict."""
+    if not isinstance(request, dict):
+        return {"ok": False, "error": "request must be a JSON object"}
+    if request.get("auth") != auth_token:
+        return {"ok": False, "error": "auth failed", "code": "auth_failed"}
+
+    op = request.get("op")
+    try:
+        if op == "check":
+            token_data = request.get("token")
+            token = (
+                CapabilityToken.from_dict(token_data)
+                if isinstance(token_data, dict)
+                else None
+            )
+            decision = engine.check(
+                token,
+                str(request.get("tool_name", "")),
+                int(request.get("level", 0)),
+                request.get("args") or {},
+                bool(request.get("tainted", False)),
+            )
+            return {
+                "ok": True,
+                "allowed": decision.allowed,
+                "reason": decision.reason,
+                "needs_approval": decision.needs_approval,
+                "decision": {
+                    "allowed": decision.allowed,
+                    "reason": decision.reason,
+                    "needs_approval": decision.needs_approval,
+                },
+            }
+        if op == "issue_token":
+            token = engine.issue_token(
+                request.get("scope_folders") or [],
+                request.get("tools") or [],
+                int(request.get("duration_seconds", 600)),
+                bool(request.get("network", False)),
+            )
+            return {"ok": True, "token": token.to_dict()}
+        if op == "approve":
+            approval_id = engine.approve(
+                str(request.get("token_id", "")),
+                str(request.get("tool_name", "")),
+                int(request.get("duration_seconds", 600)),
+            )
+            return {"ok": True, "approval_id": approval_id}
+        if op == "taint":
+            engine.mark_tainted(str(request.get("token_id", "")))
+            return {"ok": True, "tainted": True}
+        if op == "untaint":
+            engine.clear_taint(str(request.get("token_id", "")))
+            return {"ok": True, "tainted": False}
+        if op == "kill":
+            engine.set_kill(True)
+            return {"ok": True, "killed": True}
+        if op == "unkill":
+            engine.set_kill(False)
+            return {"ok": True, "killed": False}
+        if op == "status":
+            return {
+                "ok": True,
+                "killed": engine.is_killed(),
+                "socket": str(engine.state_dir / "policyd.sock"),
+                "audit_entries": len(engine.audit.read_all()),
+            }
+        if op == "audit_verify":
+            valid, errors = engine.audit.verify()
+            return {"ok": True, "valid": valid, "errors": errors}
+        return {"ok": False, "error": f"unknown op: {op}"}
+    except (ValueError, TypeError, KeyError) as exc:
+        return {"ok": False, "error": f"bad request: {exc}"}
+
+
+def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
+    """Serve policyd on ``state_dir/policyd.sock`` until ``stop`` is set."""
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    auth_token = _load_or_create_auth(state_dir)
+    engine = PolicyEngine(state_dir)
+    sock_path = state_dir / "policyd.sock"
+    if sock_path.exists():
+        # Stale socket from a previous run; remove it before binding.
+        sock_path.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(sock_path))
+        server.listen(5)
+        server.settimeout(0.5)
+        print(f"policyd listening on {sock_path}", file=sys.stderr, flush=True)
+        while stop is None or not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                handle_connection(conn, engine, auth_token)
+    finally:
+        server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def handle_connection(
+    conn: socket.socket, engine: PolicyEngine, auth_token: str
+) -> None:
+    """Serve one connection: one JSON request per line, one reply per line."""
+    with conn.makefile("rwb") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                reply = {"ok": False, "error": "invalid JSON"}
+            else:
+                reply = handle_request(engine, auth_token, request)
+            f.write((json.dumps(reply) + "\n").encode("utf-8"))
+            f.flush()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="policyd")
+    parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="state directory (default: $OPENCOBOT_STATE or ~/.opencobot)",
+    )
+    args = parser.parse_args(argv)
+    state_dir = (
+        Path(args.state_dir) if args.state_dir else _default_state_dir()
+    )
+    try:
+        serve(state_dir)
+    except KeyboardInterrupt:
+        print("policyd stopping", file=sys.stderr, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

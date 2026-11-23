@@ -1,6 +1,6 @@
 # OpenCobot Architecture
 
-Status: Draft v0.1 (Phase 0). This document is the design source of truth until code exists. If code and this document disagree, add an ADR entry in [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) before changing either.
+Status: Draft v0.1. Phase 1 (Linux MVP) is implemented on branch `agent/phase1-linux-mvp` per ADR-001 (Linux-first; the §4 note "Windows is the suggested MVP target" is superseded for Phase 1) and ADR-002 (Python-only policy engine; Rust deferred). This document remains the design source of truth; if code and this document disagree, add an ADR entry in [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) before changing either.
 
 ## 1. Goals and non-goals
 

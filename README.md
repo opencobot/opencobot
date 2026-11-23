@@ -2,7 +2,38 @@
 
 **Local-first, model-agnostic computer control for AI. Safe by design, verified by default.**
 
-> **Status: Phase 0 (spec and design).** There is no runnable code yet. This repository currently holds the vision, architecture and safety model. Do not use anything here to control a real machine until a tagged release says it is ready.
+> **Status: Phase 1 (Linux MVP) — in progress on branch `agent/phase1-linux-mvp`, not merged.**
+> The Phase 0 spec and design are complete. Phase 1 adds runnable Linux code: a headless daemon, a separate policy process (`policyd`), 22 tools with `execute()` + `verify()`, capability tokens, a hash-chained audit log, a kill switch, an MCP server and a CLI. There is still no tagged release — do not use anything here to control a real machine until a tagged release says it is ready. See [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) (ADR-001 Linux-first, ADR-002 Python-only policy for Phase 1).
+
+## Quick start (Linux, Phase 1)
+
+Requires Python 3.10+ (3.12 tested). No model, no API key and no Docker needed — the tool engine, policy and audit log all work with no LLM running.
+
+```bash
+python3 -m venv .venv-opencobot
+.venv-opencobot/bin/pip install -r requirements.txt
+.venv-opencobot/bin/python -m pytest -q          # full test suite
+.venv-opencobot/bin/python -m cli.opencobot_cli doctor
+.venv-opencobot/bin/python -m cli.opencobot_cli tools list
+.venv-opencobot/bin/python -m cli.opencobot_cli tool run list_dir --args-json '{"path": "."}'
+```
+
+Start the policy engine and daemon (Unix sockets under `~/.opencobot/`, localhost only, no network port):
+
+```bash
+.venv-opencobot/bin/python -m cli.opencobot_cli daemon start
+.venv-opencobot/bin/python -m cli.opencobot_cli daemon status
+.venv-opencobot/bin/python -m cli.opencobot_cli audit verify
+.venv-opencobot/bin/python -m cli.opencobot_cli kill   # kill switch: blocks the next tool call
+```
+
+MCP server (stdio, for MCP-compatible clients):
+
+```bash
+.venv-opencobot/bin/python mcp-server/server.py
+```
+
+Level 3 tools (for example `run_command`, `delete_to_trash`) need an explicit human approval — use `policy check` / the CLI approval flow; approvals never come from model output. `delete_to_trash` never hard-deletes. On a headless server `screenshot` and `list_windows` honestly report "unavailable" instead of faking success. The Windows adapter is a stub in Phase 1 (ADR-001).
 
 ## What is OpenCobot?
 
