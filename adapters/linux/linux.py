@@ -88,11 +88,34 @@ def trash_path(state_dir: Path, original: Path) -> Path:
     return base / rel.parent / f"{rel.name}.{stamp}"
 
 
+def _process_starttime(pid: int) -> int | None:
+    """Start time of a process, in clock ticks since boot (``/proc`` stat field 22).
+
+    Best-effort: returns ``None`` when the row disappears mid-scan or does
+    not parse. The value is invariant across ``exec()`` (same pid, new
+    program), which makes it the stable half of a process identity — see
+    :func:`tools.definitions._verify_list_processes`.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        # Format: ``pid (comm) state ppid ...``; comm may contain spaces or
+        # parens, so split on the LAST ')'. Fields after comm start at
+        # field 3, so starttime (field 22) is index 19 of the remainder.
+        fields = stat.rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def list_processes(name_filter: str | None = None) -> list[dict]:
     """List processes from /proc (no ``ps`` dependency).
 
-    Each entry: ``{"pid": int, "name": str, "cmdline": str}``. Entries whose
-    /proc rows disappear mid-scan are skipped.
+    Each entry: ``{"pid": int, "name": str, "cmdline": str}`` plus
+    ``"starttime": int`` when ``/proc/<pid>/stat`` could be read (clock
+    ticks since boot; invariant across ``exec()``). Entries whose /proc
+    rows disappear mid-scan are skipped.
     """
     processes: list[dict] = []
     proc = Path("/proc")
@@ -109,7 +132,11 @@ def list_processes(name_filter: str | None = None) -> list[dict]:
         if name_filter and name_filter.lower() not in name.lower() \
                 and name_filter.lower() not in cmdline.lower():
             continue
-        processes.append({"pid": pid, "name": name, "cmdline": cmdline})
+        item: dict = {"pid": pid, "name": name, "cmdline": cmdline}
+        starttime = _process_starttime(pid)
+        if starttime is not None:
+            item["starttime"] = starttime
+        processes.append(item)
     processes.sort(key=lambda p: p["pid"])
     return processes
 
