@@ -65,7 +65,16 @@ _HASH_ALGORITHMS = ("sha256", "sha1", "md5")
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """One tool: schema, permission level, execute() and verify()."""
+    """One tool: schema, permission level, execute() and verify().
+
+    ``network`` says whether this tool is *capable* of network access
+    (only ``run_command`` is, because it can run a network binary).
+    Whether one particular call actually uses the network is decided
+    by :func:`is_network_call` — e.g. ``run_command`` with ``echo``
+    does not, with ``curl`` it does. The policy engine enforces the
+    token's ``network`` flag against the per-call answer, not the
+    static capability.
+    """
 
     name: str
     description: str
@@ -73,6 +82,48 @@ class ToolSpec:
     schema: dict
     execute: Callable[[dict, dict], dict]
     verify: Callable[[dict, dict, dict], tuple[bool, str]]
+    network: bool = False
+
+
+# Binaries whose execution is, by itself, network access. `git` is
+# handled separately below: only its network subcommands count.
+NETWORK_BINARIES = frozenset(
+    {"curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "socat",
+     "aria2c", "ftp", "lftp", "telnet", "ping"}
+)
+
+# `git` subcommands that touch the network (status/log/diff do not).
+NETWORK_GIT_SUBCOMMANDS = frozenset(
+    {"clone", "fetch", "pull", "push", "ls-remote", "submodule", "archive"}
+)
+
+# Tools capable of network access at all (see ToolSpec.network).
+NETWORK_CAPABLE_TOOLS = frozenset({"run_command"})
+
+
+def is_network_call(tool_name: str, args: dict | None) -> bool:
+    """True when this exact call performs network access.
+
+    Today only ``run_command`` can: its argv is inspected (argv[0]
+    basename against :data:`NETWORK_BINARIES`, `git` network
+    subcommands). Every other tool performs no network I/O. This is
+    an argv-based classification, not a sandbox: arbitrary code run
+    through ``run_command`` (e.g. ``python3 -c`` using urllib) can
+    still reach the network, which is why the tool stays Level 3 and
+    approval-gated regardless of the token flag — the flag is
+    defence-in-depth on top of approval, not a replacement for it.
+    """
+    if tool_name != "run_command" or not isinstance(args, dict):
+        return False
+    argv = args.get("argv")
+    if not isinstance(argv, list) or not argv or not argv[0]:
+        return False
+    binary = Path(str(argv[0])).name
+    if binary in NETWORK_BINARIES:
+        return True
+    if binary == "git" and len(argv) > 1 and argv[1] in NETWORK_GIT_SUBCOMMANDS:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1271,7 +1322,8 @@ _SPECS: list[tuple[str, str, int, Callable, Callable]] = [
 TOOLS: dict[str, ToolSpec] = {}
 for _name, _desc, _level, _exec, _verify in _SPECS:
     TOOLS[_name] = ToolSpec(name=_name, description=_desc, level=_level,
-                            schema=_SCHEMAS[_name], execute=_exec, verify=_verify)
+                            schema=_SCHEMAS[_name], execute=_exec, verify=_verify,
+                            network=_name in NETWORK_CAPABLE_TOOLS)
 del _name, _desc, _level, _exec, _verify
 
 
@@ -1281,7 +1333,8 @@ def get_tool(name: str) -> ToolSpec:
 
 
 def list_tools() -> list[dict]:
-    """All tools as {name, description, level, schema} (schema deep-copied)."""
+    """All tools as {name, description, level, network, schema} (schema deep-copied)."""
     return [{"name": spec.name, "description": spec.description,
-             "level": spec.level, "schema": copy.deepcopy(spec.schema)}
+             "level": spec.level, "network": spec.network,
+             "schema": copy.deepcopy(spec.schema)}
             for spec in TOOLS.values()]

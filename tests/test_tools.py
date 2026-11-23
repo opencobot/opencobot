@@ -84,7 +84,7 @@ def test_list_tools_shape():
     listed = list_tools()
     assert len(listed) == 22
     for item in listed:
-        assert set(item) == {"name", "description", "level", "schema"}
+        assert set(item) == {"name", "description", "level", "network", "schema"}
         assert item["schema"]["type"] == "object"
 
 

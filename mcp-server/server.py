@@ -15,14 +15,16 @@ requests — a JSON array on one line — are also accepted). Methods:
 * ``tools/call`` -> run one tool through the policy engine + runtime
 
 Standalone-mode note: this server uses the policy engine **in-process**
-(``policy.engine.PolicyEngine`` when installed, else the same fallback
-engine the CLI uses), backed by the shared state dir and audit log.
-That is weaker isolation than the separate ``policyd`` process the
-daemon/CLI path uses. When ``policyd`` (or the daemon) is running, the
-daemon path should be preferred; a future version of this server will
-route ``tools/call`` through the daemon socket instead. Tool calls here
-still go through the same policy code: short-lived token scoped to the
-working directory (+ any paths named in the arguments), 600s, single
+(``policy.engine.PolicyEngine``), backed by the shared state dir and
+audit log. That is weaker isolation than the separate ``policyd``
+process the daemon/CLI path uses, and if the real policy engine is
+not installed the server fails loudly instead of running a weaker
+copy (R-009: the old ``cli/_fallback.py`` was deleted). When
+``policyd`` (or the daemon) is running, the daemon path should be
+preferred; a future version of this server will route ``tools/call``
+through the daemon socket instead. Tool calls here still go through
+the same policy code: short-lived token scoped to the working
+directory (+ any paths named in the arguments), 600s, single
 tool, Level 3+ needs an explicit approval.
 
 Nothing is ever printed to stdout except JSON-RPC responses; diagnostics

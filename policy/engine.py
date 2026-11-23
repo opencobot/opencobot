@@ -9,19 +9,44 @@ Permission levels (SPEC §5.1): 0 read/inspect, 1 basic interaction,
 2 controlled modification, 3 sensitive (explicit approval), 4 high risk
 (strong approval). While tainted (untrusted) data is in context, level
 3+ is locked even if an approval exists.
+
+Approvals (R-007, ADR-005) are scoped to exactly one call:
+``(token_id, tool_name, permission level, argument hash)``. An
+approval granted for ``run_command`` with ``argv=["echo", "hi"]``
+authorises nothing else -- not the same tool with different arguments,
+and not the same arguments at a different level. The hash is over the
+canonical JSON of the arguments, so argument order does not matter and
+no raw argument values are stored in the approval record or the audit
+log (only the hash).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-from .audit import AuditLog
+from .audit import AuditLog, enforce_state_permissions
 from .tokens import CapabilityToken
+
+
+def argument_hash(args: dict | None) -> str:
+    """Stable SHA-256 of the canonical JSON of ``args``.
+
+    ``sort_keys`` + fixed separators make the hash independent of key
+    order; ``default=str`` keeps non-JSON values hashable instead of
+    crashing the policy check. ``None`` hashes as ``{}``.
+    """
+    canonical = json.dumps(
+        args or {}, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 # Argument keys whose values name filesystem locations. Any of these
 # outside the token's scope denies the call.
@@ -93,7 +118,9 @@ class PolicyEngine:
         self.state_dir = (
             Path(state_dir) if state_dir is not None else _default_state_dir()
         )
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        # R-006: tighten the state dir (0700) and private files (0600)
+        # on startup; raises PermissionError if it cannot be done.
+        enforce_state_permissions(self.state_dir)
         self._killed = False
         self.audit = AuditLog(self.state_dir / "audit.jsonl")
 
@@ -164,11 +191,26 @@ class PolicyEngine:
             issued_at=now,
         )
 
-    # -- approvals -----------------------------------------------------
+    # -- approvals (R-007: level-scoped + argument-bound) -------------
     def approve(
-        self, token_id: str, tool_name: str, duration_seconds: int = 600
+        self,
+        token_id: str,
+        tool_name: str,
+        level: int | None = None,
+        args: dict | None = None,
+        duration_seconds: int = 600,
     ) -> str:
-        """Record a human approval for (token, tool); returns its id."""
+        """Record a human approval for exactly one call.
+
+        The approval is bound to ``(token_id, tool_name, level,
+        argument_hash(args))``. ``level`` and ``args`` must be supplied
+        by every caller that wants the approval to match a real check:
+        an approval recorded without them (``level=None``) can never
+        match, because :meth:`check` always supplies a concrete level
+        and arguments — that is fail-closed by design, never a
+        wildcard. Only the argument *hash* is stored, never raw args.
+        Returns the approval id.
+        """
         approvals = _read_json(self._approvals_path, [])
         if not isinstance(approvals, list):
             approvals = []
@@ -179,6 +221,8 @@ class PolicyEngine:
                 "id": approval_id,
                 "token_id": token_id,
                 "tool_name": tool_name,
+                "level": level,
+                "arg_hash": argument_hash(args),
                 "issued_at": now,
                 "expires_at": now + duration_seconds,
             }
@@ -197,15 +241,30 @@ class PolicyEngine:
         _write_json_0600(self._approvals_path, kept)
         return True
 
-    def has_approval(self, token_id: str, tool_name: str) -> bool:
-        """True when a live (unexpired) approval exists for (token, tool)."""
+    def has_approval(
+        self,
+        token_id: str,
+        tool_name: str,
+        level: int | None = None,
+        args: dict | None = None,
+    ) -> bool:
+        """True when a live approval exists for the exact call.
+
+        Matches ``(token_id, tool_name, level, argument_hash(args))``
+        and an unexpired ``expires_at``. A different level, different
+        arguments, a different token or a different tool does not
+        match; neither does an approval recorded without a level.
+        """
         approvals = _read_json(self._approvals_path, [])
         if not isinstance(approvals, list):
             return False
         now = time.time()
+        wanted = argument_hash(args)
         return any(
             a.get("token_id") == token_id
             and a.get("tool_name") == tool_name
+            and a.get("level") == level
+            and a.get("arg_hash") == wanted
             and float(a.get("expires_at", 0)) > now
             for a in approvals
         )
@@ -267,14 +326,22 @@ class PolicyEngine:
         level: int,
         args: dict | None = None,
         tainted: bool = False,
+        network_call: bool = False,
     ) -> Decision:
         """Decide whether ``tool_name`` at ``level`` may run under ``token``.
 
         Rules, in order: kill switch; read-only mode (level 1+ denied);
         token present and unexpired; tool in token; every path-like
-        argument inside token scope; tainted context locks level 3+;
-        levels 3 and 4 need a live approval; levels 0-2 are allowed in
-        scope.
+        argument inside token scope; network calls need a token with
+        ``network=True`` (default False — fail closed); tainted
+        context locks level 3+; levels 3 and 4 need a live approval;
+        levels 0-2 are allowed in scope.
+
+        ``network_call`` says whether *this* call performs network
+        access (see ``tools.definitions.is_network_call``); callers
+        must compute it from the tool and arguments, never from the
+        model. A network call with a network=False token is denied
+        even when it would otherwise be allowed.
         """
         args = args or {}
         effective_tainted = bool(tainted) or (
@@ -293,17 +360,21 @@ class PolicyEngine:
             decision = Decision(False, "tool not allowed by capability token")
         elif self._path_args_outside_scope(token, args) is not None:
             decision = Decision(False, "outside capability token scope")
+        elif network_call and not token.network:
+            decision = Decision(
+                False, "network access not allowed by capability token"
+            )
         elif effective_tainted and level >= 3:
             decision = Decision(False, "tainted context: level 3+ locked")
         elif level == 4:
-            if self.has_approval(token.token_id, tool_name):
+            if self.has_approval(token.token_id, tool_name, level, args):
                 decision = Decision(True, "allowed")
             else:
                 decision = Decision(
                     False, "level 4 requires approval", needs_approval=True
                 )
         elif level == 3:
-            if self.has_approval(token.token_id, tool_name):
+            if self.has_approval(token.token_id, tool_name, level, args):
                 decision = Decision(True, "allowed")
             else:
                 decision = Decision(
@@ -314,17 +385,22 @@ class PolicyEngine:
         else:
             decision = Decision(False, f"invalid permission level: {level}")
 
-        # Audit every decision, including denials (invariant 8).
+        # Audit every decision, including denials (invariant 8). The
+        # audit records the argument hash, never raw arguments, so a
+        # sensitive path or command line is not copied into the log.
         self.audit.append(
             {
                 "type": "policy_decision",
                 "tool": tool_name,
                 "level": level,
+                "arg_hash": argument_hash(args),
                 "allowed": decision.allowed,
                 "reason": decision.reason,
                 "needs_approval": decision.needs_approval,
                 "token_id": token.token_id if token is not None else None,
                 "tainted": effective_tainted,
+                "network_call": bool(network_call),
+                "token_network": bool(token.network) if token is not None else False,
             }
         )
         return decision

@@ -131,6 +131,16 @@ class WebUIBackend:
 
         return PolicyEngine(self.state_dir)
 
+    def _tool_level(self, tool_name: str) -> int:
+        """Registered permission level of a tool (0 when unknown)."""
+        for tool in self.tools():
+            if tool.get("name") == tool_name:
+                try:
+                    return int(tool.get("level", 0))
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
     def status(self) -> dict:
         engine = self._engine()
         tools = self.tools()
@@ -160,8 +170,11 @@ class WebUIBackend:
         approvals = _read_json(self.state_dir / "approvals.json", [])
         return list(approvals) if isinstance(approvals, list) else []
 
-    def approve(self, token_id: str, tool_name: str, duration: int = 600) -> str:
-        return str(self._engine().approve(token_id, tool_name, duration))
+    def approve(self, token_id: str, tool_name: str, level: int | None = None,
+                args: dict | None = None, duration: int = 600) -> str:
+        """Approve exactly one call (R-007): (token, tool, level, args)."""
+        return str(self._engine().approve(token_id, tool_name, level,
+                                          args, duration))
 
     def revoke_approval(self, approval_id: str) -> bool:
         return bool(self._engine().revoke_approval(approval_id))
@@ -432,6 +445,9 @@ class _Handler(BaseHTTPRequestHandler):
                                               "error": f"unknown approval: {approval_id}"})
                     return
                 # approve: create from the body, or confirm an existing id.
+                # R-007: the approval is bound to the exact level and
+                # exact arguments in the body (level defaults to the
+                # tool's registered level, args default to {}).
                 token_id = body.get("token_id")
                 tool_name = body.get("tool_name")
                 if isinstance(token_id, str) and token_id and isinstance(tool_name, str) and tool_name:
@@ -439,9 +455,29 @@ class _Handler(BaseHTTPRequestHandler):
                         duration = int(body.get("duration_seconds", 600))
                     except (TypeError, ValueError):
                         duration = 600
-                    new_id = self.backend.approve(token_id, tool_name, duration)
+                    raw_args = body.get("args")
+                    args: dict = {}
+                    if isinstance(raw_args, dict):
+                        args = raw_args
+                    elif isinstance(raw_args, str) and raw_args.strip():
+                        try:
+                            parsed = json.loads(raw_args)
+                            args = parsed if isinstance(parsed, dict) else {}
+                        except ValueError:
+                            args = {}
+                    level = body.get("level")
+                    if level is None:
+                        level = self.backend._tool_level(tool_name)
+                    else:
+                        try:
+                            level = int(level)
+                        except (TypeError, ValueError):
+                            level = self.backend._tool_level(tool_name)
+                    new_id = self.backend.approve(token_id, tool_name, level,
+                                                  args, duration)
                     self._after_post({"ok": True, "approval_id": new_id,
-                                      "token_id": token_id, "tool_name": tool_name})
+                                      "token_id": token_id, "tool_name": tool_name,
+                                      "level": level})
                 elif any(a.get("id") == approval_id for a in self.backend.approvals()):
                     self._after_post({"ok": True, "approval_id": approval_id,
                                       "note": "approval already exists"})
@@ -475,6 +511,8 @@ class _Handler(BaseHTTPRequestHandler):
             f"<tr><td>{esc(str(a.get('id', '')))}</td>"
             f"<td>{esc(str(a.get('tool_name', '')))}</td>"
             f"<td>{esc(str(a.get('token_id', '')))}</td>"
+            f"<td>L{esc(str(a.get('level', '')))} "
+            f"{esc(str(a.get('arg_hash', ''))[:12])}</td>"
             f"<td><form method=\"post\" action=\"/api/approvals/{esc(str(a.get('id', '')))}/deny\">"
             f"<input type=\"hidden\" name=\"token\" value=\"{esc(token)}\">"
             "<input type=\"submit\" value=\"Deny / revoke\"></form></td></tr>"
@@ -517,10 +555,12 @@ Tools: {status['tools']} &middot; Audit entries: {status['audit_entries']}</p>
 <input type="hidden" name="token" value="{esc(token)}">
 <label>Token id: <input name="token_id" size="40"></label>
 <label>Tool: <input name="tool_name" size="20"></label>
+<label>Level: <input name="level" size="3"></label>
+<label>Args (JSON): <input name="args" size="40" value="{{}}"></label>
 <input type="submit" value="Approve">
 </form>
 <h2>Approvals</h2>
-<table border="1"><tr><th>id</th><th>tool</th><th>token</th><th></th></tr>
+<table border="1"><tr><th>id</th><th>tool</th><th>token</th><th>level / arg hash</th><th></th></tr>
 {approval_rows}</table>
 <h2>Providers</h2>
 <table border="1"><tr><th>name</th><th>kind</th><th>egress</th><th>model</th></tr>

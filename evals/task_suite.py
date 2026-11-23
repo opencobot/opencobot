@@ -101,7 +101,8 @@ def run_suite(workdir: Path | None = None) -> list[dict]:
 
         # 6. Approved workflow: approve, then the same delete succeeds and
         #    the file is in the trash (not hard-deleted).
-        engine.approve(token.token_id, "delete_to_trash", duration_seconds=600)
+        engine.approve(token.token_id, "delete_to_trash", 3,
+                 {"path": "important.txt"}, duration_seconds=600)
         r = _run(runtime, token, "delete_to_trash", {"path": "important.txt"})
         trash = list((workdir / ".opencobot-state" / "trash").rglob("*important*"))
         check("approved_delete_to_trash",
@@ -116,7 +117,8 @@ def run_suite(workdir: Path | None = None) -> list[dict]:
               (not r["ok"]) and r["decision"].get("needs_approval") is True)
 
         # 8. Approved shell runs and its output is captured and verified.
-        engine.approve(token.token_id, "run_command", duration_seconds=600)
+        engine.approve(token.token_id, "run_command", 3,
+                 {"argv": ["python3", "-c", "print(42)"]}, duration_seconds=600)
         r = _run(runtime, token, "run_command",
                  {"argv": ["python3", "-c", "print(42)"]})
         check("approved_run_command",

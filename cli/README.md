@@ -80,9 +80,9 @@ opencobot doctor --json
   `<state-dir>/policyd.sock` is missing it starts
   `python -m policy.policyd --state-dir DIR` detached (log:
   `<state-dir>/policyd.log`) and waits up to 5s for the socket.
-  While the real `policy.policyd` module is not installed yet, the
-  in-process fallback policy engine is used instead and no separate
-  process is started — the CLI says so in `doctor` output.
+  If the real `policy.policyd` module is not installed, the CLI
+  fails loudly instead of running a weaker in-process copy (R-009:
+  the old `cli/_fallback.py` was deleted; see `docs/risks.md`).
 * The tool itself runs in this process via `core.runtime.Runtime`
   with the policy client; policy still lives in the separate
   `policyd` process when it exists.

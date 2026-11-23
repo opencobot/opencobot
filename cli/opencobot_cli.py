@@ -48,8 +48,8 @@ from cli._compat import (  # noqa: E402
     normalize_run_result,
     public_token_record,
     token_scope_folders,
+    tool_is_network_call,
 )
-from cli._fallback import FallbackPolicyEngine  # noqa: E402
 
 __version__ = "0.1.0"
 
@@ -99,7 +99,7 @@ def _spec_available(name):
 
 
 def _require_policyd(state_dir):
-    """Ensure policyd (or the in-process fallback) is available.
+    """Ensure the real policyd is available (no fallback, R-009).
 
     Returns a policy client, or raises :class:`PolicyUnavailable`.
     """
@@ -141,22 +141,26 @@ def cmd_tool_run(args):
         return 2
     folders = token_scope_folders(tool_args)
     try:
-        token = call_issue_token(client, folders, [args.name], 600)
+        token = call_issue_token(client, folders, [args.name], 600,
+                                 network=bool(args.network))
     except Exception as exc:
         _err(f"could not issue capability token: {exc}")
         return 2
     if args.approve:
         # The human at this terminal explicitly approves this run.
-        # The approval is bound to the token just issued (the engine
-        # keys approvals by token_id), so it applies to this run only.
+        # R-007: the approval is bound to this token, this tool, its
+        # level and these exact arguments — it applies to this run
+        # only and cannot be replayed for different arguments.
         try:
             token_id = public_token_record(token)["token_id"]
-            call_approve(client, token_id, args.name, 600)
+            call_approve(client, token_id, args.name, tool["level"],
+                         tool_args, 600)
         except Exception as exc:
             _err(f"approval failed: {exc}")
             return 1
     decision = call_check(client, args.name, tool["level"], tool_args,
-                          token=token, tainted=bool(args.tainted))
+                          token=token, tainted=bool(args.tainted),
+                          network_call=tool_is_network_call(args.name, tool_args))
     if not decision.get("allowed"):
         reason = decision.get("reason", "")
         error = f"needs approval: {reason}" if decision.get("needs_approval") \
@@ -366,12 +370,14 @@ def cmd_policy_check(args):
     # in --args-json, this tool only, 600s). Nothing is executed.
     try:
         token = call_issue_token(
-            client, token_scope_folders(tool_args), [args.tool], 600)
+            client, token_scope_folders(tool_args), [args.tool], 600,
+            network=bool(args.network))
     except Exception as exc:
         _err(f"could not issue capability token: {exc}")
         return 2
     decision = call_check(client, args.tool, level, tool_args, token=token,
-                          tainted=False)
+                          tainted=False,
+                          network_call=tool_is_network_call(args.tool, tool_args))
     payload = {"tool": args.tool, "level": level,
                "allowed": bool(decision.get("allowed")),
                "needs_approval": bool(decision.get("needs_approval")),
@@ -391,27 +397,38 @@ def cmd_policy_approve(args):
     except PolicyUnavailable as exc:
         _err(str(exc))
         return 2
-    if get_tool(args.tool) is None:
+    tool = get_tool(args.tool)
+    if tool is None:
         _err(f"unknown tool: {args.tool}")
         return 2
-    # Approvals are bound to a (token_id, tool) pair in the real engine,
-    # so mint the token being approved and report its id: a later
-    # `tool run` mints its own token, so this approval applies to the
-    # token printed here (e.g. a task token held by the UI/phone), not
-    # to future unrelated runs.
+    try:
+        tool_args = _parse_args_json(args.args_json)
+    except ValueError as exc:
+        _err(str(exc))
+        return 2
+    level = int(args.level) if args.level is not None else int(tool["level"])
+    # R-007: approvals are bound to (token_id, tool, level, exact
+    # arguments). Mint the token being approved and report its id: a
+    # later `tool run` mints its own token, so this approval applies
+    # to the token printed here (e.g. a task token held by the
+    # UI/phone) for these exact arguments only, not to future
+    # unrelated runs.
     try:
         token = call_issue_token(
-            client, token_scope_folders({}), [args.tool], int(args.duration))
+            client, token_scope_folders(tool_args), [args.tool],
+            int(args.duration))
         token_id = public_token_record(token)["token_id"]
-        approval_id = call_approve(client, token_id, args.tool, int(args.duration))
+        approval_id = call_approve(client, token_id, args.tool, level,
+                                   tool_args, int(args.duration))
     except Exception as exc:
         _err(f"approval failed: {exc}")
         return 1
-    payload = {"tool": args.tool, "approved": True, "token_id": token_id,
+    payload = {"tool": args.tool, "level": level, "approved": True,
+               "token_id": token_id,
                "approval_id": approval_id if isinstance(approval_id, str) else None,
                "expiry": public_token_record(token)["expiry"]}
     _emit(payload, args.json,
-          [f"approved {args.tool} for token {token_id} "
+          [f"approved {args.tool} (level {level}) for token {token_id} "
            f"(approval {payload['approval_id']}) until {payload['expiry']}"])
     return 0
 
@@ -433,7 +450,8 @@ def cmd_token_issue(args):
         _err(str(exc))
         return 2
     try:
-        token = call_issue_token(client, folders, tools, int(args.duration))
+        token = call_issue_token(client, folders, tools, int(args.duration),
+                                 network=bool(args.network))
     except Exception as exc:
         _err(f"could not issue token: {exc}")
         return 1
@@ -443,7 +461,8 @@ def cmd_token_issue(args):
     lines = [f"token_id: {payload['token_id']}",
              f"expiry:   {payload['expiry']}",
              f"folders:  {', '.join(payload['folders'])}",
-             f"tools:    {', '.join(payload['tools'])}"]
+             f"tools:    {', '.join(payload['tools'])}",
+             f"network:  {'yes' if payload.get('network') else 'no'}"]
     _emit(payload, args.json, lines)
     return 0
 
@@ -763,22 +782,70 @@ def cmd_doctor(args):
     except OSError as exc:
         checks.append(("state dir", "FAIL", f"{state_dir} not writable: {exc}", True))
 
-    # policyd: real process if installed, else the in-process fallback
-    # engine (weaker isolation — reported as such, still a PASS for the
-    # essential "can I get a policy decision?" check).
-    if _spec_available("policy.policyd"):
+    # R-006: permission bits on the state dir and private files.
+    # Tighten any that are wider; report what cannot be tightened.
+    import stat as _stat
+
+    for name, want in ((".", 0o700), ("policyd.auth", 0o600),
+                       ("daemon.auth", 0o600), ("audit.jsonl", 0o600),
+                       ("approvals.json", 0o600), ("policyd.sock", 0o600),
+                       ("daemon.sock", 0o600)):
+        path = state_dir if name == "." else state_dir / name
+        label = "state dir perms" if name == "." else f"{name} perms"
+        if not path.exists():
+            checks.append((label, "INFO", "not created yet", False))
+            continue
+        try:
+            mode = _stat.S_IMODE(path.stat().st_mode)
+        except OSError as exc:
+            checks.append((label, "FAIL", f"cannot stat: {exc}", True))
+            continue
+        if mode == want:
+            checks.append((label, "PASS", f"{oct(mode)}", True))
+        else:
+            try:
+                os.chmod(path, want)
+                checks.append((label, "PASS",
+                               f"was {oct(mode)}, tightened to {oct(want)}",
+                               True))
+            except OSError as exc:
+                checks.append((label, "FAIL",
+                               f"{oct(mode)} (want {oct(want)}): {exc}", True))
+
+    # R-006: the boundary is a same-user boundary, not a real OS
+    # boundary. policyd and the daemon run as the same UID as the
+    # CLI, so a process running as this user can read the state dir
+    # (which is why the 0700/0600 bits above matter). A real OS
+    # boundary needs policyd under a separate OS user — see the
+    # README section "Running policyd as a separate user".
+    try:
+        owner = state_dir.stat().st_uid
+        same_user = owner == os.getuid()
+    except OSError:
+        same_user = True
+    if same_user:
+        checks.append(("policy boundary", "WARN",
+                       "same-user boundary, not a real OS boundary: "
+                       "policyd/daemon run as your UID; run policyd as "
+                       "a separate OS user for a real boundary "
+                       "(README: 'Running policyd as a separate user')",
+                       False))
+    else:
+        checks.append(("policy boundary", "PASS",
+                       "state dir owned by a different UID than this "
+                       "process (separate-user policyd)", False))
+
+    # policyd: the real separate process. There is no in-process
+    # fallback any more (R-009) — if policyd is not installed or
+    # cannot start, this is a FAIL, not a downgrade.
+    try:
         status, _proc = ensure_policyd(state_dir)
         if status == "running":
             checks.append(("policyd", "PASS", "reachable (socket)", True))
         else:
             checks.append(("policyd", "FAIL", "could not start; see policyd.log", True))
-    else:
-        try:
-            FallbackPolicyEngine(state_dir).status()
-            checks.append(("policyd", "PASS",
-                           "in-process fallback engine (policyd module not installed yet)", True))
-        except Exception as exc:
-            checks.append(("policyd", "FAIL", f"fallback engine failed: {exc}", True))
+    except PolicyUnavailable as exc:
+        checks.append(("policyd", "FAIL", str(exc), True))
 
     sock = state_dir / "daemon.sock"
     if sock.exists() and _query_daemon(state_dir, "status") is not None:
@@ -840,6 +907,10 @@ def build_parser():
                        help='JSON object of arguments, e.g. \'{"path": "/tmp"}\'')
     p_run.add_argument("--tainted", action="store_true",
                        help="mark the call as tainted (untrusted context)")
+    p_run.add_argument("--network", action="store_true",
+                       help="issue this run's token with network access "
+                            "(needed for network calls such as curl; "
+                            "default: no network)")
     p_run.add_argument("--approve", action="store_true",
                        help="explicitly approve this run (human at the terminal; "
                             "needed for level 3+ tools, applies to this run only)")
@@ -865,10 +936,18 @@ def build_parser():
     p_check.add_argument("--level", type=int, default=None,
                          help="permission level (default: the tool's registered level)")
     p_check.add_argument("--args-json", default=None, help="JSON object of arguments")
+    p_check.add_argument("--network", action="store_true",
+                         help="issue the check token with network access")
     p_check.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     p_check.set_defaults(func=cmd_policy_check)
-    p_approve = policy_sub.add_parser("approve", help="approve a tool for a limited time")
+    p_approve = policy_sub.add_parser("approve", help="approve one exact tool call for a limited time")
     p_approve.add_argument("--tool", required=True, help="tool name")
+    p_approve.add_argument("--args-json", default=None,
+                           help="JSON object of the exact arguments being approved "
+                                "(default {} — the approval then only matches "
+                                "calls with no arguments)")
+    p_approve.add_argument("--level", type=int, default=None,
+                           help="permission level (default: the tool's registered level)")
     p_approve.add_argument("--duration", type=int, default=600,
                            help="approval lifetime in seconds (default 600)")
     p_approve.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
@@ -880,6 +959,9 @@ def build_parser():
     p_issue = token_sub.add_parser("issue", help="issue a scoped capability token")
     p_issue.add_argument("--folders", default="", help="comma-separated folders, e.g. /home/u/work,/tmp")
     p_issue.add_argument("--tools", default="", help="comma-separated tools, e.g. list_dir,read_file")
+    p_issue.add_argument("--network", action="store_true",
+                         help="allow network calls under this token "
+                              "(default: no network — fail closed)")
     p_issue.add_argument("--duration", type=int, default=600,
                          help="lifetime in seconds (default 600)")
     p_issue.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
