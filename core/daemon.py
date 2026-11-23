@@ -142,6 +142,47 @@ class Daemon:
                 return False
         return False
 
+    # -- read-only mode (Phase 2) ----------------------------------------
+    def _readonly_engine(self):
+        """A PolicyEngine over this state dir, or None if unavailable.
+
+        The engine reads the persisted flag from disk on every check,
+        so this is always the live value -- no caching.
+        """
+        try:
+            from policy.engine import PolicyEngine  # type: ignore[import-not-found]
+
+            return PolicyEngine(self.state_dir)
+        except Exception:
+            return None
+
+    def is_readonly(self) -> bool:
+        """Effective read-only state (env override wins, else persisted)."""
+        engine = self._readonly_engine()
+        if engine is not None:
+            return bool(engine.is_readonly())
+        try:
+            data = json.loads((self.state_dir / "readonly.json").read_text())
+            return bool(data.get("readonly", False))
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def set_readonly(self, enabled: bool) -> bool:
+        """Persist the read-only flag; returns the new persisted value."""
+        engine = self._readonly_engine()
+        if engine is not None:
+            return bool(engine.set_readonly(bool(enabled)))
+        path = self.state_dir / "readonly.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"readonly": bool(enabled)}), encoding="utf-8"
+        )
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return bool(enabled)
+
     # -- request handling -------------------------------------------------
 
     def handle_request(self, request: Any) -> dict:
@@ -158,7 +199,17 @@ class Daemon:
                 "tools": len(self.registry),
                 "killed": self._policyd_killed() if reachable else False,
                 "policyd_reachable": reachable,
+                "readonly": self.is_readonly(),
             }
+        if op == "readonly_get":
+            return {"ok": True, "readonly": self.is_readonly()}
+        if op == "readonly_set":
+            enabled = request.get("enabled")
+            if enabled is None:
+                enabled = request.get("readonly")
+            if not isinstance(enabled, bool):
+                return {"ok": False, "error": "readonly_set needs enabled: true/false"}
+            return {"ok": True, "readonly": self.set_readonly(enabled)}
         if op == "list_tools":
             return {"ok": True, "tools": Runtime(self.state_dir, None, self.registry).list_tools()}
         if op == "run_tool":
@@ -174,7 +225,10 @@ class Daemon:
                     "result": {},
                     "evidence": "",
                 }
-            runtime = Runtime(self.state_dir, self._policy_client(), self.registry)
+            runtime = Runtime(
+                self.state_dir, self._policy_client(), self.registry,
+                gateway=self.gateway,
+            )
             return runtime.run_tool(
                 request.get("token"),
                 str(request.get("tool_name", "")),

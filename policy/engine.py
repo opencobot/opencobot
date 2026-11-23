@@ -29,6 +29,26 @@ PATH_ARG_KEYS = frozenset(
     {"path", "source", "destination", "directory", "folder", "file", "cwd"}
 )
 
+# Env var that overrides the persisted read-only flag (Phase 2).
+# Accepted true values: 1/true/yes/on; false values: 0/false/no/off.
+# Anything else is ignored and the persisted flag wins.
+READONLY_ENV_VAR = "OPENCOBOT_READONLY"
+_READONLY_TRUE = frozenset({"1", "true", "yes", "on"})
+_READONLY_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def _env_readonly_override() -> bool | None:
+    """Read-only override from the environment, or None when unset."""
+    raw = os.environ.get(READONLY_ENV_VAR)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _READONLY_TRUE:
+        return True
+    if value in _READONLY_FALSE:
+        return False
+    return None
+
 
 @dataclass
 class Decision:
@@ -89,6 +109,41 @@ class PolicyEngine:
     @property
     def _killswitch_path(self) -> Path:
         return self.state_dir / "killswitch"
+
+    @property
+    def _readonly_path(self) -> Path:
+        return self.state_dir / "readonly.json"
+
+    # -- read-only mode (Phase 2) --------------------------------------
+    def set_readonly(self, enabled: bool) -> bool:
+        """Persist the read-only flag (0600 JSON, like approvals/taint).
+
+        The flag is read from disk on every check, so a change made here
+        (CLI, web UI, daemon) takes effect for the separate policyd
+        process immediately, and survives daemon/policyd restarts.
+        Returns the new effective persisted value.
+        """
+        enabled = bool(enabled)
+        _write_json_0600(self._readonly_path, {"readonly": enabled})
+        self.audit.append(
+            {"type": "readonly_changed", "readonly": enabled}
+        )
+        return enabled
+
+    def is_readonly(self) -> bool:
+        """Effective read-only state: env var override wins, else the
+        persisted flag. Default OFF."""
+        override = _env_readonly_override()
+        if override is not None:
+            return override
+        data = _read_json(self._readonly_path, {})
+        if isinstance(data, dict):
+            return bool(data.get("readonly", False))
+        return False
+
+    def readonly_source(self) -> str:
+        """Where the effective value comes from: "env" or "file"."""
+        return "env" if _env_readonly_override() is not None else "file"
 
     # -- tokens --------------------------------------------------------
     def issue_token(
@@ -215,10 +270,11 @@ class PolicyEngine:
     ) -> Decision:
         """Decide whether ``tool_name`` at ``level`` may run under ``token``.
 
-        Rules, in order: kill switch; token present and unexpired; tool
-        in token; every path-like argument inside token scope; tainted
-        context locks level 3+; levels 3 and 4 need a live approval;
-        levels 0-2 are allowed in scope.
+        Rules, in order: kill switch; read-only mode (level 1+ denied);
+        token present and unexpired; tool in token; every path-like
+        argument inside token scope; tainted context locks level 3+;
+        levels 3 and 4 need a live approval; levels 0-2 are allowed in
+        scope.
         """
         args = args or {}
         effective_tainted = bool(tainted) or (
@@ -227,6 +283,8 @@ class PolicyEngine:
 
         if self.is_killed():
             decision = Decision(False, "kill switch active")
+        elif self.is_readonly() and level >= 1:
+            decision = Decision(False, "read-only mode")
         elif token is None:
             decision = Decision(False, "no capability token")
         elif token.is_expired():
