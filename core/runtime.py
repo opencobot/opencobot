@@ -171,20 +171,312 @@ def _split_verify(outcome: Any) -> tuple[bool, str]:
 
 
 class Runtime:
-    """Execute tools through policy checks and real-state verification."""
+    """Execute tools through policy checks and real-state verification.
+
+    Phase 2: when a ``gateway`` is supplied *and* it has providers
+    configured, :meth:`run_task` plans through the gateway roles
+    (PLANNER, then VERIFIER on failure) and escalates once on a
+    verification failure before reporting. When no gateway is
+    configured, ``run_task`` runs caller-supplied steps directly --
+    Phase 1 behaviour, no model needed. :meth:`run_tool` is unchanged
+    either way: it always goes through the policy check, execution and
+    verification, gateway or not.
+    """
 
     def __init__(
         self,
         state_dir: str | Path | None = None,
         policy: Any = None,
         registry: dict | None = None,
+        gateway: Any = None,
     ):
         self.state_dir = Path(state_dir) if state_dir is not None else default_state_dir()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.policy = policy
+        self.gateway = gateway
         if registry is None:
             registry = self._load_registry()
         self.registry: dict = dict(registry)
+
+    # -- gateway helpers (Phase 2 contracts, Phase 1 fallback) ---------
+    def _gateway_configured(self) -> bool:
+        """True when a gateway with at least one provider is attached."""
+        if self.gateway is None:
+            return False
+        configs = getattr(self.gateway, "configs", None)
+        return bool(configs)
+
+    def _gateway_complete(
+        self, role: str, prompt: str, sensitivity: str = "public"
+    ) -> dict:
+        """One gateway call, normalized.
+
+        Prefers the Phase 2 contract ``Gateway.complete(role, prompt,
+        sensitivity)`` -> {"text","provider","role","escalated",
+        "needs_approval",...}; falls back to the Phase 1
+        ``Gateway.chat(role, messages, sensitivity)`` shape. Returns a
+        dict with "ok", "text", "provider", "escalated", "needs_approval"
+        and "error" (None on success).
+        """
+        if not self._gateway_configured():
+            return {"ok": False, "text": None, "provider": None,
+                    "escalated": False, "needs_approval": False,
+                    "error": "no gateway configured"}
+        complete = getattr(self.gateway, "complete", None)
+        try:
+            if callable(complete):
+                raw = complete(role, prompt, sensitivity)
+            else:
+                chat = getattr(self.gateway, "chat", None)
+                if not callable(chat):
+                    return {"ok": False, "text": None, "provider": None,
+                            "escalated": False, "needs_approval": False,
+                            "error": "gateway has no complete() or chat()"}
+                raw = chat(role, [{"role": "user", "content": prompt}],
+                           sensitivity)
+        except ValueError as exc:
+            # Secret routing failure etc: fail closed, do not retry.
+            return {"ok": False, "text": None, "provider": None,
+                    "escalated": False, "needs_approval": False,
+                    "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "text": None, "provider": None,
+                    "escalated": False, "needs_approval": False,
+                    "error": f"gateway call failed: {exc}"}
+        if not isinstance(raw, dict):
+            return {"ok": False, "text": None, "provider": None,
+                    "escalated": False, "needs_approval": False,
+                    "error": "gateway returned an unexpected response"}
+        if raw.get("needs_approval"):
+            return {"ok": False, "text": raw.get("text"),
+                    "provider": raw.get("provider"),
+                    "escalated": bool(raw.get("escalated", False)),
+                    "needs_approval": True,
+                    "error": "gateway call needs approval"}
+        if raw.get("ok") is False:
+            return {"ok": False, "text": raw.get("text"),
+                    "provider": raw.get("provider"),
+                    "escalated": bool(raw.get("escalated", False)),
+                    "needs_approval": False,
+                    "error": raw.get("error") or "gateway call failed"}
+        text = raw.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "text": None,
+                    "provider": raw.get("provider"),
+                    "escalated": bool(raw.get("escalated", False)),
+                    "needs_approval": False,
+                    "error": "gateway returned no text"}
+        return {"ok": True, "text": text, "provider": raw.get("provider"),
+                "role": raw.get("role", role),
+                "escalated": bool(raw.get("escalated", False)),
+                "needs_approval": False, "error": None}
+
+    def _gateway_escalate(
+        self, role: str, prompt: str, sensitivity: str, reason: str
+    ) -> dict:
+        """Escalate once to the next provider in the role chain.
+
+        Prefers the Phase 2 contract ``Gateway.escalate(role, prompt,
+        sensitivity, reason)``. Falls back to asking the next provider
+        in ``fallback_chain(role, sensitivity)`` via ``complete``/``chat``
+        (Phase 1 gateways have no escalate and route a single provider,
+        so the fallback re-routes and reports the hop explicitly).
+        The returned dict is the normalized ``_gateway_complete`` shape
+        with "escalated": True when a different provider answered.
+        """
+        if not self._gateway_configured():
+            return {"ok": False, "text": None, "provider": None,
+                    "escalated": False, "needs_approval": False,
+                    "error": "no gateway configured"}
+        escalate = getattr(self.gateway, "escalate", None)
+        if callable(escalate):
+            try:
+                raw = escalate(role, prompt, sensitivity, reason)
+            except Exception as exc:
+                return {"ok": False, "text": None, "provider": None,
+                        "escalated": False, "needs_approval": False,
+                        "error": f"escalation failed: {exc}"}
+            if not isinstance(raw, dict):
+                return {"ok": False, "text": None, "provider": None,
+                        "escalated": False, "needs_approval": False,
+                        "error": "escalation returned an unexpected response"}
+            if raw.get("needs_approval"):
+                return {"ok": False, "text": raw.get("text"),
+                        "provider": raw.get("provider"),
+                        "escalated": bool(raw.get("escalated", False)),
+                        "needs_approval": True,
+                        "error": "escalated call needs approval"}
+            text = raw.get("text")
+            if raw.get("ok") is False or not isinstance(text, str) or not text.strip():
+                return {"ok": False, "text": None,
+                        "provider": raw.get("provider"),
+                        "escalated": bool(raw.get("escalated", False)),
+                        "needs_approval": False,
+                        "error": raw.get("error") or "escalation failed"}
+            return {"ok": True, "text": text,
+                    "provider": raw.get("provider"), "role": raw.get("role", role),
+                    "escalated": True, "needs_approval": False, "error": None}
+        # Phase 1 fallback: the Phase 1 gateway has no escalate() and its
+        # route() always picks the head of the chain, so there is no way
+        # to address the *next* provider directly. Report that honestly
+        # instead of re-calling the same provider and pretending the
+        # call escalated. (Phase 2 gateways implement escalate().)
+        chain = []
+        fallback_chain = getattr(self.gateway, "fallback_chain", None)
+        if callable(fallback_chain):
+            try:
+                chain = list(fallback_chain(role, sensitivity) or [])
+            except Exception:
+                chain = []
+        if len(chain) < 2:
+            return {"ok": False, "text": None, "provider": None,
+                    "escalated": False, "needs_approval": False,
+                    "error": "no further provider to escalate to"}
+        return {"ok": False, "text": None, "provider": None,
+                "escalated": False, "needs_approval": False,
+                "error": ("gateway does not support escalation "
+                          "(no escalate(); single-provider routing)")}
+
+    @staticmethod
+    def _parse_plan(text: str) -> list[dict] | None:
+        """Parse gateway plan text into [{"tool","args"}] steps.
+
+        Accepts a bare JSON list, or {"steps": [...]} / {"plan": [...]}.
+        Returns None when the text is not a usable plan (caller decides
+        whether to fall back to caller-supplied steps or fail).
+        """
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            parsed = parsed.get("steps", parsed.get("plan"))
+        if not isinstance(parsed, list):
+            return None
+        steps: list[dict] = []
+        for item in parsed:
+            if not isinstance(item, dict) or not item.get("tool"):
+                return None
+            args = item.get("args", {})
+            if not isinstance(args, dict):
+                return None
+            steps.append({"tool": str(item["tool"]), "args": args})
+        return steps
+
+    def run_task(
+        self,
+        task: str,
+        token: Any,
+        steps: list[dict] | None = None,
+        sensitivity: str = "public",
+    ) -> dict:
+        """Plan (via gateway when configured) and execute a task.
+
+        ``steps`` is a caller-supplied plan of {"tool","args"} dicts.
+        With a gateway, the PLANNER role produces the plan; if its
+        output is unusable and caller steps were given, those are used
+        instead (recorded in "plan_source"); if neither yields a plan,
+        the task fails without executing anything. Every step runs
+        through :meth:`run_tool` (policy + verify). On a step whose
+        execution or verification fails, the VERIFIER role is escalated
+        to once via the gateway and the step is retried once; a second
+        failure stops the task and is reported. Returns
+        {"ok","verified","steps","escalated","plan_source","error"}.
+        """
+        escalated = False
+        plan_source = "direct"
+        plan_steps: list[dict] = list(steps or [])
+        if self._gateway_configured():
+            plan = self._gateway_complete(
+                "PLANNER",
+                "Plan this task as a JSON list of {\"tool\",\"args\"} steps "
+                f"using only tools from the registry. Task: {task}",
+                sensitivity,
+            )
+            parsed = self._parse_plan(plan["text"]) if plan.get("ok") else None
+            if parsed is not None:
+                plan_steps = parsed
+                plan_source = "gateway"
+            elif plan_steps:
+                plan_source = "direct (gateway plan unusable)"
+            else:
+                error = plan.get("error") or "gateway returned unusable plan"
+                out = {"ok": False, "verified": False, "steps": [],
+                       "escalated": False, "plan_source": "gateway",
+                       "error": error}
+                self._audit({"type": "task", "task": task, "ok": False,
+                             "escalated": False, "plan_source": "gateway",
+                             "error": error})
+                return out
+        if not plan_steps:
+            error = ("no gateway configured and no steps provided"
+                     if not self._gateway_configured()
+                     else "empty plan")
+            out = {"ok": False, "verified": False, "steps": [],
+                   "escalated": False, "plan_source": plan_source,
+                   "error": error}
+            self._audit({"type": "task", "task": task, "ok": False,
+                         "escalated": False, "plan_source": plan_source,
+                         "error": error})
+            return out
+
+        results: list[dict] = []
+        all_ok = True
+        all_verified = True
+        error: str | None = None
+        for step in plan_steps:
+            tool_name = step.get("tool", "")
+            args = step.get("args", {})
+            outcome = self.run_tool(token, tool_name, args)
+            step_record: dict = {"tool": tool_name, "args": _redact_args(args),
+                                 "ok": outcome.get("ok"),
+                                 "verified": outcome.get("verified"),
+                                 "decision": outcome.get("decision"),
+                                 "escalated": False}
+            if not outcome.get("ok") or not outcome.get("verified"):
+                # Verification/execution failure: escalate once, retry once.
+                if self._gateway_configured():
+                    esc = self._gateway_escalate(
+                        "VERIFIER",
+                        f"Tool {tool_name} failed verification for task: {task}. "
+                        f"Evidence: {outcome.get('evidence') or outcome.get('decision', {}).get('reason', '')}. "
+                        "Confirm whether the step should be retried and why.",
+                        sensitivity,
+                        reason="verification failed",
+                    )
+                    step_record["escalated"] = True
+                    step_record["escalation"] = {
+                        "ok": esc.get("ok"), "provider": esc.get("provider"),
+                        "needs_approval": esc.get("needs_approval"),
+                        "error": esc.get("error"),
+                    }
+                    escalated = True
+                    if esc.get("ok") and not esc.get("needs_approval"):
+                        retry = self.run_tool(token, tool_name, args)
+                        step_record["retry"] = {
+                            "ok": retry.get("ok"),
+                            "verified": retry.get("verified"),
+                            "decision": retry.get("decision"),
+                        }
+                        outcome = retry
+                        step_record["ok"] = retry.get("ok")
+                        step_record["verified"] = retry.get("verified")
+                        step_record["decision"] = retry.get("decision")
+            results.append(step_record)
+            if not outcome.get("ok") or not outcome.get("verified"):
+                all_ok = False
+                all_verified = False
+                decision = outcome.get("decision") or {}
+                error = (f"step {tool_name!r} failed: "
+                         f"{decision.get('reason') or outcome.get('evidence') or 'not verified'}")
+                break
+        out = {"ok": all_ok, "verified": all_verified, "steps": results,
+               "escalated": escalated, "plan_source": plan_source,
+               "error": error}
+        self._audit({"type": "task", "task": task, "ok": all_ok,
+                     "verified": all_verified, "escalated": escalated,
+                     "plan_source": plan_source, "error": error})
+        return out
 
     @staticmethod
     def _load_registry() -> dict:

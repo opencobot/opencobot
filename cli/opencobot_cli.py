@@ -501,6 +501,244 @@ def cmd_unkill(args):
     return 0
 
 
+def _readonly_engine(state_dir):
+    """PolicyEngine for the read-only flag (file-backed, shared with policyd)."""
+    try:
+        from policy.engine import PolicyEngine
+    except ImportError:
+        return None
+    try:
+        return PolicyEngine(state_dir)
+    except Exception:
+        return None
+
+
+def cmd_readonly(args):
+    state_dir = _state_dir(args)
+    engine = _readonly_engine(state_dir)
+    if engine is None:
+        _err("policy engine is not installed yet; cannot read the read-only flag")
+        return 2
+    action = args.readonly_command
+    if action == "status":
+        effective = bool(engine.is_readonly())
+        payload = {"readonly": effective, "source": engine.readonly_source()}
+        lines = [f"read-only mode: {'ON' if effective else 'OFF'}",
+                 f"source: {payload['source']} "
+                 "(env OPENCOBOT_READONLY overrides the persisted flag)"]
+        _emit(payload, args.json, lines)
+        return 0
+    enabled = action == "on"
+    engine.set_readonly(enabled)
+    payload = {"readonly": enabled}
+    lines = [f"read-only mode {'ON' if enabled else 'OFF'}"
+             + (" — level 1+ tools are now denied" if enabled
+                else " — level 1+ tools are allowed again")]
+    _emit(payload, args.json, lines)
+    return 0
+
+
+def _gateway_configs():
+    """Configured gateway providers (defaults when nothing is configured)."""
+    from core.model_gateway import Gateway
+
+    return Gateway().configs
+
+
+def _provider_egress(config):
+    egress = getattr(config, "egress", None)
+    if isinstance(egress, str) and egress:
+        return egress
+    if getattr(config, "kind", "") in ("ollama", "openai-compatible", "cli"):
+        return "local-only"
+    return "cloud-backed"
+
+
+def cmd_gateway_providers(args):
+    try:
+        configs = _gateway_configs()
+    except Exception as exc:
+        _err(f"could not load gateway config: {exc}")
+        return 2
+    providers = []
+    for config in configs:
+        record = {"name": config.name, "kind": config.kind,
+                  "egress": _provider_egress(config),
+                  "model": config.model, "base_url": config.base_url}
+        if getattr(args, "ping", False):
+            try:
+                from core.model_gateway import Gateway
+
+                record["available"] = bool(Gateway().ping(config))
+            except Exception:
+                record["available"] = False
+        providers.append(record)
+    payload = {"providers": providers, "count": len(providers)}
+    lines = [f"{p['name']:<20} {p['kind']:<18} {p['egress']:<12} "
+             f"{p['model']} ({p['base_url']})"
+             + (f" available={p['available']}" if "available" in p else "")
+             for p in providers] or ["(no gateway providers configured)"]
+    _emit(payload, args.json, lines)
+    return 0
+
+
+def cmd_benchmark(args):
+    provider_name = args.provider
+    try:
+        configs = _gateway_configs()
+    except Exception as exc:
+        _err(f"could not load gateway config: {exc}")
+        return 2
+    names = [c.name for c in configs]
+    if provider_name not in names:
+        _err(f"provider {provider_name!r} is not configured "
+             f"(configured: {', '.join(names) or 'none'}; "
+             "see `opencobot gateway providers`)")
+        return 2
+    try:
+        from core.benchmark import run_benchmark
+    except ImportError:
+        _err("benchmark support is not installed yet "
+             "(core.benchmark, Phase 2 Worker B)")
+        return 1
+    from core.model_gateway import Gateway
+
+    gateway = Gateway(configs=configs)
+
+    def call(prompt):
+        complete = getattr(gateway, "complete", None)
+        if callable(complete):
+            result = complete("EXECUTOR", prompt, "public")
+        else:
+            result = gateway.chat(
+                "EXECUTOR", [{"role": "user", "content": prompt}], "public")
+        if isinstance(result, dict):
+            if result.get("ok") is False:
+                raise RuntimeError(result.get("error") or "gateway call failed")
+            return str(result.get("text") or "")
+        return str(result or "")
+
+    try:
+        report = run_benchmark(call, name=provider_name)
+    except Exception as exc:
+        _err(f"benchmark failed: {exc}")
+        return 1
+    if args.json:
+        to_json = getattr(report, "to_json", None)
+        if callable(to_json):
+            data = to_json()
+            print(data if isinstance(data, str) else json.dumps(data, indent=2))
+        else:
+            print(json.dumps({"report": str(report)}, indent=2))
+        return 0
+    to_text = getattr(report, "to_text", None)
+    print(to_text() if callable(to_text) else str(report))
+    return 0
+
+
+def _ui_pid_path(state_dir):
+    return Path(state_dir) / "ui.pid"
+
+
+def _ui_port_open(port, timeout=0.2):
+    try:
+        conn = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        conn.close()
+        return True
+    except OSError:
+        return False
+
+
+def cmd_ui_start(args):
+    state_dir = _state_dir(args)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    host = getattr(args, "host", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost"):
+        _err(f"refusing non-localhost bind: {host!r} (web UI binds 127.0.0.1 only)")
+        return 2
+    port = int(args.port)
+    pid_path = _ui_pid_path(state_dir)
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            if _pid_alive(pid):
+                _emit({"running": True, "pid": pid},
+                      args.json, [f"web UI already running (pid {pid})"])
+                return 0
+        except ValueError:
+            pass
+        pid_path.unlink(missing_ok=True)
+    if not _spec_available("ui.web"):
+        _err("ui.web is not installed yet; cannot start the web UI")
+        return 1
+    log_path = state_dir / "ui.log"
+    log_fh = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ui.web", "--state-dir", str(state_dir),
+             "--host", "127.0.0.1", "--port", str(port)],
+            stdin=subprocess.DEVNULL, stdout=log_fh, stderr=log_fh,
+            start_new_session=True, close_fds=True)
+    finally:
+        log_fh.close()
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if _ui_port_open(port):
+            break
+        if proc.poll() is not None:
+            _err(f"web UI exited immediately (see {log_path})")
+            pid_path.unlink(missing_ok=True)
+            return 1
+        time.sleep(0.1)
+    payload = {"running": True, "pid": proc.pid,
+               "url": f"http://127.0.0.1:{port}/"}
+    lines = [f"web UI started (pid {proc.pid}) at http://127.0.0.1:{port}/",
+             f"auth token: see {state_dir / 'daemon.auth'} (never printed)"]
+    _emit(payload, args.json, lines)
+    return 0
+
+
+def cmd_ui_stop(args):
+    state_dir = _state_dir(args)
+    pid_path = _ui_pid_path(state_dir)
+    if not pid_path.exists():
+        _emit({"running": False}, args.json, ["web UI not running"])
+        return 1
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        _err(f"corrupt PID file {pid_path}")
+        return 1
+    if _pid_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and _pid_alive(pid):
+            time.sleep(0.1)
+        if _pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    pid_path.unlink(missing_ok=True)
+    _emit({"running": False, "pid": pid}, args.json,
+          [f"web UI stopped (pid {pid})"])
+    return 0
+
+
+def cmd_ui_status(args):
+    state_dir = _state_dir(args)
+    pid, running = None, False
+    pid_path = _ui_pid_path(state_dir)
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            running = _pid_alive(pid)
+        except ValueError:
+            pid = None
+    payload = {"running": running, "pid": pid}
+    lines = [f"web UI running (pid {pid})" if running else "web UI not running"]
+    _emit(payload, args.json, lines)
+    return 0 if running else 1
+
+
 def cmd_doctor(args):
     state_dir = _state_dir(args)
     checks = []  # (name, status, detail, essential) status in PASS/FAIL/INFO
@@ -665,6 +903,52 @@ def build_parser():
     p_unkill = sub.add_parser("unkill", help="release the kill switch")
     p_unkill.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     p_unkill.set_defaults(func=cmd_unkill)
+
+    # readonly (Phase 2)
+    p_readonly = sub.add_parser("readonly", help="read-only mode: deny level 1+ tools")
+    readonly_sub = p_readonly.add_subparsers(dest="readonly_command", required=True)
+    for name, help_text in (
+            ("on", "turn read-only mode ON (level 1+ tools denied)"),
+            ("off", "turn read-only mode OFF"),
+            ("status", "show the effective read-only state")):
+        p = readonly_sub.add_parser(name, help=help_text)
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        p.set_defaults(func=cmd_readonly)
+
+    # gateway (Phase 2)
+    p_gateway = sub.add_parser("gateway", help="model gateway providers")
+    gateway_sub = p_gateway.add_subparsers(dest="gateway_command", required=True)
+    p_providers = gateway_sub.add_parser("providers", help="list configured providers")
+    p_providers.add_argument("--ping", action="store_true",
+                             help="probe each provider (localhost only, may take a moment)")
+    p_providers.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    p_providers.set_defaults(func=cmd_gateway_providers)
+
+    # benchmark (Phase 2; wired to core.benchmark when installed)
+    p_benchmark = sub.add_parser("benchmark", help="benchmark a gateway provider")
+    p_benchmark.add_argument("--provider", required=True,
+                             help="provider name (see `opencobot gateway providers`)")
+    p_benchmark.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    p_benchmark.set_defaults(func=cmd_benchmark)
+
+    # web UI (Phase 2) — `ui` and `web` are the same command
+    for ui_name in ("ui", "web"):
+        p_ui = sub.add_parser(ui_name, help="manage the local web UI (127.0.0.1 only)")
+        ui_sub = p_ui.add_subparsers(dest="ui_command", required=True)
+        p_start = ui_sub.add_parser("start", help="start the web UI (detached)")
+        p_start.add_argument("--port", type=int, default=8765,
+                             help="port (default 8765)")
+        p_start.add_argument("--host", default="127.0.0.1",
+                             help="bind host; only 127.0.0.1/localhost allowed")
+        p_start.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        p_start.set_defaults(func=cmd_ui_start)
+        p_stop = ui_sub.add_parser("stop", help="stop the web UI")
+        p_stop.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        p_stop.set_defaults(func=cmd_ui_stop)
+        p_status = ui_sub.add_parser("status", help="report web UI status")
+        p_status.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        p_status.set_defaults(func=cmd_ui_status)
+
     p_doctor = sub.add_parser("doctor", help="environment check")
     p_doctor.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     p_doctor.set_defaults(func=cmd_doctor)
