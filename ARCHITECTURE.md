@@ -1,6 +1,6 @@
 # OpenCobot Architecture
 
-Status: Draft v0.1. Phase 1 (Linux MVP) is merged per ADR-001 (Linux-first; the §4 note "Windows is the suggested MVP target" is superseded for Phase 1) and ADR-002 (Python-only policy engine; Rust deferred). Phase 2 (gateway roles, hybrid local/cloud routing, CLI-model providers, capability benchmark, read-only mode, simple web UI) is implemented on branch `agent/phase2-gateway` per ADR-003 (Tauri deferred, web UI first) and ADR-004 (CLI providers + hybrid routing division). This document remains the design source of truth; if code and this document disagree, add an ADR entry in [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) before changing either.
+Status: Draft v0.1. Phase 1 (Linux MVP) is merged per ADR-001 (Linux-first; the §4 note "Windows is the suggested MVP target" is superseded for Phase 1) and ADR-002 (Python-only policy engine; Rust deferred). Phase 2 (gateway roles, hybrid local/cloud routing, CLI-model providers, capability benchmark, read-only mode, simple web UI) is merged per ADR-003 (Tauri deferred, web UI first) and ADR-004 (CLI providers + hybrid routing division). Phase 3 (Windows adapter: PowerShell shell, named-pipe transport, UI Automation deferred) is implemented on branch `agent/windows-adapter` per ADR-008 — mock-verified on Linux (80 Windows tests), live verification on a Windows laptop still pending ([docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md)); the named-pipe server fails closed until a `ctypes` ACL listener lands, so `policyd` refuses to serve on Windows this round. This document remains the design source of truth; if code and this document disagree, add an ADR entry in [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) before changing either.
 
 ## 1. Goals and non-goals
 
@@ -43,7 +43,7 @@ Action hierarchy (try in order):
 
 Every tool declares `execute()` and `verify()`. Verification reads actual state (file hash, process list, command output, window title), never the model's claim.
 
-Platform notes: Windows is the suggested MVP target. macOS needs Accessibility and Screen Recording permissions granted per binary. Linux X11 is straightforward; Wayland needs xdg-desktop-portal with a one-time user prompt and not every compositor supports it, so publish a supported-desktop matrix.
+Platform notes: Windows is the suggested MVP target. The Windows adapter landed in Phase 3 (ADR-008): PowerShell shell, `tasklist` / PowerShell window listing, named-pipe client transport with a fail-closed server — mock-verified on Linux, live verification pending on a Windows laptop; screenshots / UI Automation are deferred. macOS needs Accessibility and Screen Recording permissions granted per binary. Linux X11 is straightforward; Wayland needs xdg-desktop-portal with a one-time user prompt and not every compositor supports it, so publish a supported-desktop matrix.
 
 ## 5. Safety architecture
 

@@ -1,18 +1,32 @@
 """Client for policyd, the separate policy process.
 
-Mirrors the :class:`policy.engine.PolicyEngine` API over the Unix socket
-so callers use the same calls whether they talk to the engine in-process
-or to the daemon. Raises :class:`PolicyUnavailable` when the socket is
-missing (daemon not running) and :class:`PolicyAuthError` when the
-daemon rejects the auth token.
+Mirrors the :class:`policy.engine.PolicyEngine` API over the IPC
+transport so callers use the same calls whether they talk to the
+engine in-process or to the daemon. Raises :class:`PolicyUnavailable`
+when the transport is missing (daemon not running) and
+:class:`PolicyAuthError` when the daemon rejects the auth token.
+
+Transport selection (see :mod:`core.transport`): a Unix-domain socket
+(``AF_UNIX``, current behaviour, unchanged on Linux) on POSIX, and a
+Windows named pipe (``\\\\.\\pipe\\opencobot-policyd``) on Windows.
+Both transports speak the identical JSON-lines protocol — one JSON
+object per line, with the ``auth`` token field — so a request encodes
+to the same bytes whichever transport carries it.
 """
 
 from __future__ import annotations
 
-import json
-import socket
 from pathlib import Path
 
+from core.transport import (
+    POLICYD_PIPE_PATH,
+    NamedPipeTransport,
+    TransportNotAvailableError,
+    UnixSocketTransport,
+    decode_message,
+    is_windows,
+    send_message,
+)
 from .engine import Decision, _default_state_dir
 from .tokens import CapabilityToken
 
@@ -30,14 +44,30 @@ class PolicyAuthError(PermissionError):
 
 
 class PolicyClient:
-    """Talk to policyd over its Unix socket."""
+    """Talk to policyd over its IPC transport (Unix socket / named pipe)."""
 
-    def __init__(self, state_dir: Path | str | None = None):
+    def __init__(self, state_dir: Path | str | None = None, transport=None):
         self.state_dir = (
             Path(state_dir) if state_dir is not None else _default_state_dir()
         )
-        self.sock_path = self.state_dir / "policyd.sock"
+        # On POSIX the address is the socket file; on Windows there is
+        # no socket file — the address is the named pipe. ``sock_path``
+        # is None on Windows so callers that probe it (e.g. the daemon's
+        # "is policyd reachable" check) do not mistake a missing socket
+        # file for a down policyd when the pipe is the live transport.
+        self.sock_path: Path | None = (
+            None if is_windows() else self.state_dir / "policyd.sock"
+        )
+        self.pipe_path = POLICYD_PIPE_PATH
         self._auth = self._read_auth()
+        self._transport = transport if transport is not None \
+            else self._default_transport()
+
+    def _default_transport(self):
+        """Unix socket on POSIX, named pipe on Windows."""
+        if is_windows():
+            return NamedPipeTransport(self.pipe_path)
+        return UnixSocketTransport(self.sock_path)
 
     def _read_auth(self) -> str:
         auth_path = self.state_dir / "policyd.auth"
@@ -49,25 +79,30 @@ class PolicyClient:
         return token
 
     def _request(self, op: str, **fields: object) -> dict:
-        if not self.sock_path.exists():
-            raise PolicyUnavailable(f"policyd socket missing: {self.sock_path}")
+        """One request/response round-trip over the selected transport.
+
+        The framing (JSON-lines, ``auth`` field) is identical on both
+        transports — see :mod:`core.transport`. Only the connection
+        itself differs.
+        """
         payload = {"op": op, "auth": self._auth, **fields}
         try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
-            sock.connect(str(self.sock_path))
+            stream = self._transport.connect()
+        except TransportNotAvailableError as exc:
+            raise PolicyUnavailable(str(exc)) from exc
         except OSError as exc:
             raise PolicyUnavailable(
-                f"cannot connect to policyd socket: {self.sock_path}"
+                f"cannot connect to policyd: {exc}"
             ) from exc
-        with sock:
-            with sock.makefile("rwb") as f:
-                f.write((json.dumps(payload) + "\n").encode("utf-8"))
-                f.flush()
-                raw = f.readline()
-            if not raw:
-                raise PolicyError("policyd closed the connection")
-            reply = json.loads(raw.decode("utf-8"))
+        with stream:
+            send_message(stream, payload)
+            raw = stream.readline()
+        if not raw:
+            raise PolicyError("policyd closed the connection")
+        try:
+            reply = decode_message(raw)
+        except ValueError as exc:
+            raise PolicyError(f"policyd sent an invalid reply: {exc}") from exc
         if not reply.get("ok", False):
             if reply.get("code") == "auth_failed" or reply.get("error") == "auth failed":
                 raise PolicyAuthError("policyd rejected the auth token")

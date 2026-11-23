@@ -1,11 +1,20 @@
 """policyd: the policy engine as a separate process (SECURITY.md inv. 2).
 
-Listens on a Unix socket at ``<state-dir>/policyd.sock`` and speaks
-newline-delimited JSON: one JSON request object per line, one JSON reply
-per line. Every request must carry the ``auth`` token from
-``<state-dir>/policyd.auth`` (mode 0600, generated once and reused);
-requests with a missing or wrong token are rejected without being acted
-on. Handles one connection at a time. Logs to stderr only.
+Listens on a Unix socket at ``<state-dir>/policyd.sock`` on POSIX and
+(on Windows, once the named-pipe listener lands) on the named pipe
+``\\\\.\\pipe\\opencobot-policyd``. Speaks newline-delimited JSON: one
+JSON request object per line, one JSON reply per line (see
+:mod:`core.transport` for the shared framing). Every request must
+carry the ``auth`` token from ``<state-dir>/policyd.auth`` (mode 0600,
+generated once and reused); requests with a missing or wrong token
+are rejected without being acted on. Handles one connection at a
+time. Logs to stderr only.
+
+Windows note: the named-pipe server is shape-only this round — the
+stdlib cannot create a pipe with a current-user-only ACL, so
+:func:`serve` refuses to start on Windows until the ``ctypes``
+listener (``core.transport.NamedPipeListener``) is implemented and
+verified on a Windows host.
 
 Run: ``python -m policy.policyd --state-dir DIR``
 """
@@ -13,7 +22,6 @@ Run: ``python -m policy.policyd --state-dir DIR``
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import secrets
 import socket
@@ -24,6 +32,13 @@ from pathlib import Path
 from .audit import PRIVATE_FILE_MODE, enforce_state_permissions
 from .engine import PolicyEngine, _default_state_dir
 from .tokens import CapabilityToken
+from core.transport import (
+    POLICYD_PIPE_PATH,
+    NamedPipeListener,
+    decode_message,
+    is_windows,
+    send_message,
+)
 
 
 def _load_or_create_auth(state_dir: Path) -> str:
@@ -140,7 +155,11 @@ def handle_request(
             return {
                 "ok": True,
                 "killed": engine.is_killed(),
-                "socket": str(engine.state_dir / "policyd.sock"),
+                "socket": (
+                    POLICYD_PIPE_PATH
+                    if is_windows()
+                    else str(engine.state_dir / "policyd.sock")
+                ),
                 "audit_entries": len(engine.audit.read_all()),
             }
         if op == "audit_verify":
@@ -152,12 +171,20 @@ def handle_request(
 
 
 def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
-    """Serve policyd on ``state_dir/policyd.sock`` until ``stop`` is set."""
+    """Serve policyd on ``state_dir/policyd.sock`` until ``stop`` is set.
+
+    On Windows the named-pipe listener is shape-only this round (its
+    ACL + ``ctypes`` implementation is deferred to laptop
+    verification), so serving refuses to start there instead of
+    listening on an ACL-less pipe.
+    """
     state_dir = Path(state_dir)
     # R-006: tighten state-dir permissions before anything is created.
     enforce_state_permissions(state_dir)
     auth_token = _load_or_create_auth(state_dir)
     engine = PolicyEngine(state_dir)
+    if is_windows():
+        NamedPipeListener(POLICYD_PIPE_PATH).listen()
     sock_path = state_dir / "policyd.sock"
     if sock_path.exists():
         # Stale socket from a previous run; remove it before binding.
@@ -187,20 +214,24 @@ def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
 def handle_connection(
     conn: socket.socket, engine: PolicyEngine, auth_token: str
 ) -> None:
-    """Serve one connection: one JSON request per line, one reply per line."""
+    """Serve one connection: one JSON request per line, one reply per line.
+
+    Framing (encode/decode) is shared with the client and the daemon
+    via :mod:`core.transport`, so the bytes are identical on the Unix
+    socket and on the Windows named pipe.
+    """
     with conn.makefile("rwb") as f:
         for raw in f:
             line = raw.strip()
             if not line:
                 continue
             try:
-                request = json.loads(line.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                request = decode_message(line)
+            except ValueError:
                 reply = {"ok": False, "error": "invalid JSON"}
             else:
                 reply = handle_request(engine, auth_token, request)
-            f.write((json.dumps(reply) + "\n").encode("utf-8"))
-            f.flush()
+            send_message(f, reply)
 
 
 def main(argv: list[str] | None = None) -> int:

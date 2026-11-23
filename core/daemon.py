@@ -1,11 +1,20 @@
 """Daemon: authenticated Unix-socket JSON-lines server for the core.
 
-Listens on ``state_dir/daemon.sock``; every request line must carry the
-token from ``state_dir/daemon.auth`` (0600, generated once and reused).
-The daemon owns the Runtime and the Model Gateway, but policy decisions
-always go through a PolicyClient talking to the separate ``policyd``
-process -- if policyd is unreachable, ``run_tool`` is refused rather
-than falling back to an in-process policy (ARCHITECTURE.md section 2).
+Listens on ``state_dir/daemon.sock`` (POSIX) and, once the named-pipe
+listener lands, on ``\\\\.\\pipe\\opencobot-daemon`` (Windows); every
+request line must carry the token from ``state_dir/daemon.auth``
+(0600, generated once and reused). The daemon owns the Runtime and
+the Model Gateway, but policy decisions always go through a
+PolicyClient talking to the separate ``policyd`` process -- if
+policyd is unreachable, ``run_tool`` is refused rather than falling
+back to an in-process policy (ARCHITECTURE.md section 2).
+
+Windows note: serving on a named pipe is shape-only this round (see
+:mod:`core.transport` — the pipe needs a current-user-only ACL the
+stdlib cannot set), so ``serve_forever`` refuses to start on Windows
+until the ``ctypes`` listener is implemented and verified on a
+Windows host. The JSON-lines protocol is shared with policyd via
+:mod:`core.transport`.
 
 Run: ``python -m core.daemon --state-dir DIR`` (or ``python -m core``).
 """
@@ -25,6 +34,13 @@ from typing import Any
 from .memory import default_state_dir
 from .model_gateway import Gateway
 from .runtime import Runtime
+from .transport import (
+    DAEMON_PIPE_PATH,
+    NamedPipeListener,
+    decode_message,
+    is_windows,
+    send_message,
+)
 
 
 def _load_registry() -> dict:
@@ -74,6 +90,10 @@ class Daemon:
         self.state_dir = Path(state_dir) if state_dir is not None else default_state_dir()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.sock_path = self.state_dir / "daemon.sock"
+        # Windows address (unused on POSIX; the live transport there is
+        # the socket above). Kept as the pipe path so callers can tell
+        # which transport this platform would use.
+        self.pipe_path = DAEMON_PIPE_PATH
         self.auth_token = _load_auth_token(self.state_dir)
         self.registry = dict(registry) if registry is not None else _load_registry()
         self.gateway = gateway if gateway is not None else Gateway()
@@ -103,8 +123,13 @@ class Daemon:
         if client is None:
             return False
         # A configured socket path that does not exist means policyd is down.
+        # Named-pipe addresses (``\\.\pipe\...``) are not files: never
+        # probe them with Path.exists() — liveness is decided by the
+        # status() call below, not by the filesystem.
         for attr in ("socket_path", "sock_path", "policyd_socket", "socket"):
             path = getattr(client, attr, None)
+            if isinstance(path, str) and path.startswith("\\\\.\\pipe\\"):
+                continue
             if isinstance(path, (str, Path)) and path:
                 if not Path(path).exists():
                     return False
@@ -269,6 +294,9 @@ class Daemon:
     # -- serving ----------------------------------------------------------
 
     def _remove_stale_socket(self) -> None:
+        if is_windows():
+            # Named pipes have no socket file to go stale.
+            return
         if not self.sock_path.exists():
             return
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -283,6 +311,8 @@ class Daemon:
             probe.close()
 
     def _handle_connection(self, conn: socket.socket) -> None:
+        # Framing is shared with policyd via core.transport, so the
+        # bytes are identical on the Unix socket and the named pipe.
         try:
             with conn, conn.makefile("rwb", buffering=0) as stream:
                 for raw in stream:
@@ -290,15 +320,15 @@ class Daemon:
                     if not line:
                         continue
                     try:
-                        request = json.loads(line.decode("utf-8"))
-                    except (ValueError, UnicodeDecodeError):
+                        request = decode_message(line)
+                    except ValueError:
                         response = {"ok": False, "error": "invalid request"}
                     else:
                         try:
                             response = self.handle_request(request)
                         except Exception as exc:
                             response = {"ok": False, "error": f"handler error: {exc}"}
-                    stream.write((json.dumps(response) + "\n").encode("utf-8"))
+                    send_message(stream, response)
         except OSError:
             pass
 
@@ -308,6 +338,12 @@ class Daemon:
         from policy.audit import PRIVATE_FILE_MODE, enforce_state_permissions
 
         enforce_state_permissions(self.state_dir)
+        if is_windows():
+            # Named-pipe server is shape-only this round (current-user
+            # ACL + ctypes implementation deferred to laptop
+            # verification); refuse to serve rather than listen on an
+            # ACL-less pipe.
+            NamedPipeListener(DAEMON_PIPE_PATH).listen()
         self._remove_stale_socket()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(self.sock_path))

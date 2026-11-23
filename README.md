@@ -2,8 +2,8 @@
 
 **Local-first, model-agnostic computer control for AI. Safe by design, verified by default.**
 
-> **Status: Phase 2 — in progress on branch `agent/phase2-gateway`, not merged. Phase 1 (Linux MVP) is merged.**
-> The Phase 0 spec and design are complete. Phase 1 adds runnable Linux code: a headless daemon, a separate policy process (`policyd`), 22 tools with `execute()` + `verify()`, capability tokens, a hash-chained audit log, a kill switch, an MCP server and a CLI. Phase 2 adds a policy-aware model gateway (roles, hybrid local/cloud routing, budgets, circuit breakers), generic CLI-model providers (opencode, kiro-cli, gpt cli, Amazon Q CLI, OpenCode, …), a capability benchmark, read-only mode and a simple localhost web UI. There is still no tagged release — do not use anything here to control a real machine until a tagged release says it is ready. See [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) (ADR-001 Linux-first, ADR-002 Python-only policy, ADR-003 Tauri deferred / web UI first, ADR-004 CLI providers + hybrid routing) and [docs/GATEWAY.md](docs/GATEWAY.md) for the routing matrix.
+> **Status: Phase 3 — Windows adapter landed on branch `agent/windows-adapter`, not merged. Phase 2 (gateway, CLI-model providers, benchmark, read-only mode, web UI) is merged. Phase 1 (Linux MVP) is merged.**
+> The Phase 0 spec and design are complete. Phase 1 adds runnable Linux code: a headless daemon, a separate policy process (`policyd`), 22 tools with `execute()` + `verify()`, capability tokens, a hash-chained audit log, a kill switch, an MCP server and a CLI. Phase 2 adds a policy-aware model gateway (roles, hybrid local/cloud routing, budgets, circuit breakers), generic CLI-model providers (opencode, kiro-cli, gpt cli, Amazon Q CLI, OpenCode, …), a capability benchmark, read-only mode and a simple localhost web UI. Phase 3 adds the Windows adapter (`adapters/windows/windows.py`, mirroring the Linux adapter function for function, per-call dispatch in `tools/definitions.py`): PowerShell `run_command`, `tasklist` process listing, PowerShell window listing, Windows path handling — **mock-verified on Linux only (80 Windows tests); live verification on a Windows laptop is still pending, see [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md)**. Deferred this round: screenshots / UI Automation (honestly unavailable), Recycle Bin (state-dir trash instead), Windows Credential Manager secrets, and the named-pipe server — the pipe listener fails closed until a `ctypes` ACL implementation lands, so `policyd` refuses to serve on Windows and end-to-end `tool run` / `daemon start` / `doctor` are blocked until then (ADR-008, risks R-015–R-019). There is still no tagged release — do not use anything here to control a real machine until a tagged release says it is ready. See [docs/DECISIONS_LOG.md](docs/DECISIONS_LOG.md) (ADR-001 Linux-first, ADR-002 Python-only policy, ADR-003 Tauri deferred / web UI first, ADR-004 CLI providers + hybrid routing, ADR-008 Windows adapter) and [docs/GATEWAY.md](docs/GATEWAY.md) for the routing matrix.
 
 ## Quick start (Linux, Phase 1)
 
@@ -33,7 +33,7 @@ MCP server (stdio, for MCP-compatible clients):
 .venv-opencobot/bin/python mcp-server/server.py
 ```
 
-Level 3 tools (for example `run_command`, `delete_to_trash`) need an explicit human approval — use `policy check` / the CLI approval flow; approvals never come from model output. Each approval is bound to one exact call — the same tool, the same permission level and the same arguments (ADR-005) — so an approval for `echo 42` cannot be replayed for a different command. Capability tokens also carry a `network` flag (default off): a network call such as `run_command` with `curl` is denied unless the token was issued with `--network` (ADR-006). `delete_to_trash` never hard-deletes. On a headless server `screenshot` and `list_windows` honestly report "unavailable" instead of faking success. The Windows adapter is a stub in Phase 1 (ADR-001).
+Level 3 tools (for example `run_command`, `delete_to_trash`) need an explicit human approval — use `policy check` / the CLI approval flow; approvals never come from model output. Each approval is bound to one exact call — the same tool, the same permission level and the same arguments (ADR-005) — so an approval for `echo 42` cannot be replayed for a different command. Capability tokens also carry a `network` flag (default off): a network call such as `run_command` with `curl` is denied unless the token was issued with `--network` (ADR-006). `delete_to_trash` never hard-deletes. On a headless server `screenshot` and `list_windows` honestly report "unavailable" instead of faking success. The Windows adapter was a stub in Phase 1 (ADR-001); the real adapter landed in Phase 3 (ADR-008) — mock-verified on Linux, live verification pending on a Windows laptop.
 
 ## Running policyd as a separate user
 
@@ -74,6 +74,26 @@ The web UI (localhost only, daemon token required) shows status, tools,
 approvals, the audit log, gateway providers, benchmark reports, a read-only
 toggle and the kill switch. The Tauri desktop app is deferred to a later
 phase (ADR-003).
+
+## Phase 3 — Windows adapter (mock-verified on Linux; live verification pending)
+
+The Windows adapter is implemented (`adapters/windows/windows.py`) and
+wired in via per-call dispatch in `tools/definitions.py`, so the same
+22 tools run on Windows: PowerShell `run_command` (argv-only,
+single-quote doubling, blocklist), `tasklist` process listing,
+PowerShell window listing, Windows path handling (`safe_resolve` with
+drive letters, UNC paths, case-insensitive containment). The named-pipe
+client transport exists (`core/transport.py`); the pipe **server**
+fails closed until a `ctypes` listener with a current-user-only ACL
+lands, so `policyd` refuses to serve on Windows and end-to-end
+`tool run` / `daemon start` / `doctor` are blocked this round.
+Deferred: screenshots / UI Automation (honestly unavailable), Recycle
+Bin (state-dir trash), Windows Credential Manager secrets,
+`process_info` / `launch_app` (still Linux-shaped). Full status,
+install steps and the laptop verification checklist:
+[docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md) and
+[adapters/windows/README.md](adapters/windows/README.md); decision
+record ADR-008, risks R-015–R-019.
 
 ## What is OpenCobot?
 
@@ -125,8 +145,8 @@ Details: [ARCHITECTURE.md](ARCHITECTURE.md). Decisions: [DECISIONS_LOG.md](docs/
 |---|---|
 | 0 | Threat model, permission spec, tool schema spec, audit log format, repo scaffolding and CI (docs only) |
 | 1 | MVP on one OS: headless daemon, 20-30 core tools, separate policy process, capability tokens, audit log, kill switch, MCP server and CLI — **merged (Linux)** |
-| 2 | Model gateway (roles, escalation, budgets, privacy labels), capability benchmark, desktop UI, approval UI — **in progress; Tauri desktop UI deferred (ADR-003), simple web UI + CLI-model providers instead (ADR-004)** |
-| 3 | Phone remote (task mode), signed skills, scheduler, workflow-to-script compiler |
+| 2 | Model gateway (roles, escalation, budgets, privacy labels), capability benchmark, desktop UI, approval UI — **merged; Tauri desktop UI deferred (ADR-003), simple web UI + CLI-model providers instead (ADR-004)** |
+| 3 | **Windows adapter — landed on branch `agent/windows-adapter`, mock-verified on Linux (80 tests), live verification pending on a Windows laptop ([docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md), ADR-008)**; phone remote (task mode), signed skills, scheduler, workflow-to-script compiler — not started |
 | 4 | Live view, voice (English, then Hindi and Hinglish), macOS and Linux adapters |
 | 5 | Public skill registry, SDK, published red-team benchmark |
 
