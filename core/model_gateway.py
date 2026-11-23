@@ -178,6 +178,11 @@ class ProviderConfig:
     cli_prompt_via: str = "arg"
     cli_output: str = "stdout"
     cli_output_field: str = "text"
+    # R-012: pinned directories a bare cli_binary name may resolve
+    # from (in order). None means core.cli_providers._pinned_bin_dirs
+    # defaults (OPENCOBOT_CLI_BIN_DIRS env var, else /usr/local/bin,
+    # /usr/bin, /bin). The ambient PATH is never consulted.
+    cli_binary_dirs: tuple[str, ...] | list[str] | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in ("ollama", "openai-compatible", "cloud", "cli"):
@@ -539,11 +544,15 @@ class Gateway:
         if config is None:
             return False
         if config.kind == "cli":
-            # A CLI provider is "available" when its binary resolves.
-            from .cli_providers import _resolve_binary
+            # A CLI provider is "available" when its binary resolves
+            # against the pinned dirs (R-012), never the ambient PATH.
+            from .cli_providers import _pinned_bin_dirs, _resolve_binary
 
             try:
-                _resolve_binary(config.cli_binary or "")
+                _resolve_binary(
+                    config.cli_binary or "",
+                    bin_dirs=_pinned_bin_dirs(config.cli_binary_dirs),
+                )
                 return True
             except Exception:
                 return False

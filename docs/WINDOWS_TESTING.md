@@ -29,10 +29,10 @@ inside the venv reports 3.12.x.
 ## 2. Windows tests (must pass)
 
 ```powershell
-.\.venv-opencobot\Scripts\python.exe -m pytest tests/test_windows_adapter.py tests/test_windows_transport.py tests/test_windows_wiring.py -q
+.\.venv-opencobot\Scripts\python.exe -m pytest tests/test_windows_adapter.py tests/test_windows_transport.py tests/test_windows_wiring.py tests/test_windows_pipe_server.py tests/test_doctor_windows.py -q
 ```
 
-**Pass:** 80 passed. These are the mock-based Windows tests; they
+**Pass:** 102 passed (46 adapter + 17 transport + 17 wiring + 20 pipe-server + 2 doctor). These are the mock-based Windows tests; they
 must be green on Windows too.
 
 ## 3. Full test suite (report, don't fix)
@@ -93,25 +93,69 @@ And the blocklist check:
 
 **Pass:** `ValueError: blocked command: 'format'`.
 
-## 6. Named-pipe smoke test (fail-closed proof)
+## 6. Named-pipe server (ACL listener — live verification)
 
-```powershell
-.\.venv-opencobot\Scripts\python.exe -c "from core.transport import NamedPipeListener, POLICYD_PIPE_PATH; NamedPipeListener(POLICYD_PIPE_PATH).listen()"
-```
+The `ctypes` listener with a current-user + Administrators DACL
+landed in ADR-010 (R-017) and is mock-verified on Linux — this
+section is what proves it on a real Windows host. Until this
+section passes, the listener counts as implemented-but-unverified.
 
-**Pass:** `NotImplementedError: named-pipe listener is not
-implemented yet ...` — refusing to serve without the ACL is the
-correct behaviour (R-017). `policyd` refusing to start on Windows
-follows from this:
+### 6a. `policyd` starts and stays up on the pipe
 
 ```powershell
 .\.venv-opencobot\Scripts\python.exe -m policy.policyd --state-dir $env:USERPROFILE\.opencobot
 ```
 
-**Pass:** the process exits with that same `NotImplementedError`
-in `policyd.log` / stderr. **Fail:** if it claims to be listening
-on a pipe, stop and paste the output — that would mean an ACL-less
-server is running.
+**Pass:** stderr shows `listening on named pipe
+\\.\pipe\opencobot-policyd` and the process **stays running**
+(it used to exit immediately with `NotImplementedError` — that
+was the old fail-closed behaviour, ADR-008). **Fail:** if it
+exits at once, paste the full traceback — an ACL-build or
+`CreateNamedPipeW` failure must refuse to start, never serve an
+unprotected pipe, so the exact error matters. Leave this
+`policyd` running for 6b; stop it with Ctrl+C afterwards.
+
+### 6b. Same-user client connects; another user cannot
+
+With `policyd` still running from 6a, in a second PowerShell
+window from the repo root:
+
+```powershell
+.\.venv-opencobot\Scripts\python.exe -c "from policy.client import PolicyClient; from pathlib import Path; c = PolicyClient(Path($env:USERPROFILE) / '.opencobot'); print(c.status())"
+```
+
+**Pass:** prints a status dict (`{'ok': True, 'killed': False,
+...}`) — the pipe, the DACL and the JSON-lines protocol all work
+end to end for the user who started `policyd`.
+
+Then the negative check (the DACL proof). If you have a second
+local account on this machine, run the same one-liner as that
+user (e.g. `runas /user:<other-user> ...` from an elevated
+prompt, or Shift + right-click → "Run as different user" on a
+PowerShell shortcut and paste the command there):
+
+**Pass:** the connect fails with `cannot connect to named pipe`
+(or an access-denied error) — the DACL grants only the user who
+started `policyd` plus local Administrators, so any other
+account gets no access. **Fail:** if the other user connects
+successfully, stop and paste the output — that would mean the
+pipe is effectively ACL-less. If you have no second account,
+say so in your report and skip this check; the same-user
+connect above plus the unit tests are the fallback evidence.
+
+### 6c. Stopping `policyd` removes the pipe
+
+Stop the `policyd` from 6a (Ctrl+C), then re-run the 6b
+one-liner.
+
+**Pass:** it fails with `cannot connect to named pipe` — no
+stale pipe is left listening after the server stops.
+
+> Note on step 9 below: it still says "expected to fail" — that
+> was written when the pipe server was fail-closed (ADR-008).
+> Now that the listener exists, re-run step 9 expecting success:
+> `tool run` should complete instead of failing at the policyd
+> step. If it still fails there, paste the exact error.
 
 ## 7. Ollama + gateway ping + benchmark
 
@@ -144,19 +188,21 @@ different model without code changes, create
 [docs/GATEWAY.md](GATEWAY.md) §"Gateway config file". The CLI
 also takes a one-run `--model` override.
 
-## 8. `opencobot doctor` (expected to fail this round)
+## 8. `opencobot doctor`
 
 ```powershell
 .\.venv-opencobot\Scripts\python.exe -m cli.opencobot_cli doctor
 ```
 
-**Expected:** the python / pytest / state-dir checks print PASS,
-then `doctor` crashes with an `AttributeError` traceback
-(`os.getuid` has no Windows equivalent) and `policyd` is reported
-FAIL — both are known gaps of this round, not a setup mistake on
-your side. **Paste the traceback** so the fix can be tracked.
-Do not treat this as "the install is broken": steps 2, 4, 5 and 7
-above are the real verification.
+**Expected:** the python / pytest / state-dir checks print PASS, and
+the `policy boundary` check reports INFO — "unavailable on Windows
+(no os.getuid): same-user identity check skipped". `doctor` no longer
+crashes on Windows: the identity check is skipped there because
+`os.getuid` has no Windows equivalent. `policyd` is still reported
+FAIL — that is the known gap of this round (named-pipe server,
+step 6), not a setup mistake on your side — so expect exit code 1
+until policyd starts. Do not treat this as "the install is broken":
+steps 2, 4, 5 and 7 above are the real verification.
 
 ## 9. Live task via the CLI (expected to fail this round)
 
@@ -185,8 +231,9 @@ from the repo root.
 ## What to report back
 
 For each step: step number, PASS/FAIL, and the pasted output for
-anything unexpected — especially the `doctor` traceback (step 8),
-the `tool run` error (step 9), the execution-policy table (step 4),
+anything unexpected — especially the `doctor` output if the
+policy-boundary check is anything other than the expected INFO skip
+(step 8), the `tool run` error (step 9), the execution-policy table (step 4),
 and any full-suite failures (step 3). Also report: Windows
 version/edition, Python version, Ollama model used, and available
 RAM.

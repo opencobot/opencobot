@@ -33,7 +33,10 @@ def write_script(bin_dir: Path, name: str, body: str) -> Path:
 def bin_dir(tmp_path, monkeypatch):
     d = tmp_path / "bin"
     d.mkdir()
-    monkeypatch.setenv("PATH", str(d) + os.pathsep + os.environ.get("PATH", ""))
+    # R-012: bare CLI names resolve only against pinned dirs, never the
+    # ambient PATH -- tests point the pinned dirs at the fake scripts
+    # via OPENCOBOT_CLI_BIN_DIRS (operator override, same as production).
+    monkeypatch.setenv("OPENCOBOT_CLI_BIN_DIRS", str(d))
     return d
 
 
@@ -157,9 +160,12 @@ def test_binary_not_in_allowlist_rejected(bin_dir):
         run_cli_provider(cfg, "hi")
 
 
-def test_binary_not_on_path_raises(monkeypatch):
+def test_binary_not_in_pinned_dirs_raises(monkeypatch):
+    # R-012: the ambient PATH is never consulted -- even a fake binary
+    # sitting on PATH is ignored when it is not in the pinned dirs.
+    monkeypatch.delenv("OPENCOBOT_CLI_BIN_DIRS", raising=False)
     monkeypatch.setenv("PATH", "/nonexistent-dir")
-    with pytest.raises(CliProviderError, match="not found on PATH"):
+    with pytest.raises(CliProviderError, match="not found in pinned binary dirs"):
         run_cli_provider(cli_config(), "hi")
 
 
