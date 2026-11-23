@@ -320,11 +320,10 @@ def test_cli_gateway_providers_and_benchmark_errors(ui_state):
     proc = run_cli(ui_state, "benchmark", "--provider", "no-such-provider")
     assert proc.returncode != 0
     assert "not configured" in proc.stderr
-    # core.benchmark landed with the benchmark slice, so benchmarking a
-    # configured provider now runs a real report (ollama-local is not
-    # running here, so the score is 0 — still a successful run, exit 0).
+    # Benchmarking a configured provider whose model is not installed
+    # fails fast with a clear error (exit 2) instead of scoring 0.00
+    # on all 7 tests with empty outputs -- see ADR-007.
     proc = run_cli(ui_state, "benchmark", "--provider", "ollama-local")
-    assert proc.returncode == 0
-    assert "Benchmark report: ollama-local" in proc.stdout
-    assert "Total score:" in proc.stdout
-    assert "Recommended profile:" in proc.stdout
+    assert proc.returncode == 2
+    assert "llama3.1" in proc.stderr
+    assert "failed before benchmark" in proc.stderr
