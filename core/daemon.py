@@ -303,9 +303,15 @@ class Daemon:
             pass
 
     def serve_forever(self) -> None:
+        # R-006: tighten the state dir and the daemon auth file, then
+        # bind the socket owner-only (0600) regardless of umask.
+        from policy.audit import PRIVATE_FILE_MODE, enforce_state_permissions
+
+        enforce_state_permissions(self.state_dir)
         self._remove_stale_socket()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(self.sock_path))
+        os.chmod(self.sock_path, PRIVATE_FILE_MODE)
         listener.listen(16)
         listener.settimeout(0.5)
         self._listener = listener

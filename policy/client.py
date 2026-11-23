@@ -90,8 +90,14 @@ class PolicyClient:
         level: int,
         args: dict | None = None,
         tainted: bool = False,
+        network_call: bool = False,
     ) -> Decision:
-        """Ask policyd for a decision; returns an engine-compatible Decision."""
+        """Ask policyd for a decision; returns an engine-compatible Decision.
+
+        ``network_call`` says whether this exact call performs network
+        access; policyd re-classifies the call itself when it is not
+        supplied, so omitting it is safe but explicit is preferred.
+        """
         reply = self._request(
             "check",
             token=self._token_dict(token),
@@ -99,6 +105,7 @@ class PolicyClient:
             level=level,
             args=args or {},
             tainted=bool(tainted),
+            network_call=bool(network_call),
         )
         return Decision(
             allowed=bool(reply["allowed"]),
@@ -123,12 +130,24 @@ class PolicyClient:
         return CapabilityToken.from_dict(reply["token"])
 
     def approve(
-        self, token_id: str, tool_name: str, duration_seconds: int = 600
+        self,
+        token_id: str,
+        tool_name: str,
+        level: int | None = None,
+        args: dict | None = None,
+        duration_seconds: int = 600,
     ) -> str:
+        """Approve exactly one call (R-007): (token, tool, level, args).
+
+        ``level`` and ``args`` must match the call that will run; an
+        approval without them can never match a policy check.
+        """
         reply = self._request(
             "approve",
             token_id=token_id,
             tool_name=tool_name,
+            level=level,
+            args=args or {},
             duration_seconds=duration_seconds,
         )
         return str(reply["approval_id"])

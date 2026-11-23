@@ -185,7 +185,7 @@ def test_kill_through_ui(server):
 
 def test_approvals_list_approve_deny(server):
     engine = PolicyEngine(server["state_dir"])
-    approval_id = engine.approve("tok-1", "run_command", 600)
+    approval_id = engine.approve("tok-1", "run_command", 3, {}, 600)
     _, body = fetch_auth(server, "/api/approvals")
     approvals = json.loads(body)["approvals"]
     assert any(a["id"] == approval_id and a["tool_name"] == "run_command"
@@ -195,7 +195,7 @@ def test_approvals_list_approve_deny(server):
                               method="POST", data={})
     assert status == 200
     assert json.loads(body) == {"ok": True, "revoked": approval_id}
-    assert engine.has_approval("tok-1", "run_command") is False
+    assert engine.has_approval("tok-1", "run_command", 3, {}) is False
     # Denying an unknown id is a 404.
     status, _ = fetch_auth(server, "/api/approvals/nope/deny",
                            method="POST", data={})
@@ -206,7 +206,7 @@ def test_approvals_list_approve_deny(server):
                               data={"token_id": "tok-2", "tool_name": "read_file"})
     assert status == 200
     new_id = json.loads(body)["approval_id"]
-    assert engine.has_approval("tok-2", "read_file") is True
+    assert engine.has_approval("tok-2", "read_file", 0, {}) is True
     # Approving with no body and an unknown id is a 400.
     status, _ = fetch_auth(server, "/api/approvals/nope/approve",
                            method="POST", data={})

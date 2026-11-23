@@ -1,12 +1,14 @@
-"""Compatibility layer: prefer the real policy/tools/core slices, fall back.
+"""Compatibility layer: load the real policy/tools/core slices.
 
-Every loader here tries the real module first and uses the standalone
-fallback in :mod:`cli._fallback` only on ``ImportError`` (module not
-installed yet — the sibling slices are built in parallel). Any other
-error (e.g. the real module exists but cannot connect) is propagated
-as :class:`PolicyUnavailable` / :class:`RuntimeUnavailable` instead of
-silently downgrading to the weaker in-process fallback, because a
-silent downgrade would bypass the separate ``policyd`` process.
+R-009: there is no fallback any more. ``cli/_fallback.py`` (the
+duplicate in-process policy engine and tool registry) was deleted,
+and every loader here FAILS LOUDLY — :class:`PolicyUnavailable` /
+:class:`RuntimeUnavailable` with a clear message — when the real
+module is missing, instead of silently running a weaker in-process
+copy. The real modules are guaranteed installed by ``pyproject.toml``
+(``packages`` lists ``core``, ``policy``, ``tools``, ``adapters``,
+``cli``), so a missing module means a broken install, not a mode to
+work around.
 """
 
 from __future__ import annotations
@@ -19,17 +21,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-from cli._fallback import (
-    AuditLog as FallbackAuditLog,
-)
-from cli._fallback import (
-    FallbackPolicyClient,
-    FallbackPolicyEngine,
-    FallbackRuntime,
-    get_tool as fallback_get_tool,
-    list_tools as fallback_list_tools,
-)
 
 __all__ = [
     "PolicyUnavailable",
@@ -44,6 +35,7 @@ __all__ = [
     "call_check",
     "call_issue_token",
     "call_approve",
+    "tool_is_network_call",
     "ensure_policyd",
     "token_scope_folders",
     "normalize_check_result",
@@ -116,8 +108,17 @@ def _real_tools():
 
 
 def get_tools():
-    """Tool registry: real ``tools.definitions`` when installed, else fallback."""
-    return _real_tools() or fallback_list_tools()
+    """Tool registry from the real ``tools.definitions``.
+
+    Raises :class:`RuntimeUnavailable` when the real registry cannot
+    be imported — there is no fallback registry (R-009).
+    """
+    tools = _real_tools()
+    if tools is None:
+        raise RuntimeUnavailable(
+            "real tool registry (tools.definitions) is not installed; "
+            "reinstall OpenCobot — the CLI never runs without it")
+    return tools
 
 
 def get_tool(name):
@@ -141,11 +142,14 @@ def _real_registry_object():
 # ---------------------------------------------------------------------------
 
 def get_policy_client(state_dir):
-    """``policy.client.PolicyClient`` when installed, else the fallback."""
+    """``policy.client.PolicyClient``; fails loudly when not installed (R-009)."""
     try:
         from policy.client import PolicyClient
-    except ImportError:
-        return FallbackPolicyClient(state_dir)
+    except ImportError as exc:
+        raise PolicyUnavailable(
+            "real policy client (policy.client) is not installed; "
+            "reinstall OpenCobot — the CLI never runs without it"
+        ) from exc
     try:
         return PolicyClient(state_dir)
     except Exception as exc:
@@ -153,11 +157,14 @@ def get_policy_client(state_dir):
 
 
 def get_policy_engine(state_dir):
-    """``policy.engine.PolicyEngine`` when installed, else the fallback."""
+    """``policy.engine.PolicyEngine``; fails loudly when not installed (R-009)."""
     try:
         from policy.engine import PolicyEngine
-    except ImportError:
-        return FallbackPolicyEngine(state_dir)
+    except ImportError as exc:
+        raise PolicyUnavailable(
+            "real policy engine (policy.engine) is not installed; "
+            "reinstall OpenCobot — the CLI never runs without it"
+        ) from exc
     try:
         return PolicyEngine(state_dir)
     except Exception as exc:
@@ -165,11 +172,14 @@ def get_policy_engine(state_dir):
 
 
 def get_runtime(state_dir, policy=None, registry=None):
-    """``core.runtime.Runtime`` when installed, else the fallback."""
+    """``core.runtime.Runtime``; fails loudly when not installed (R-009)."""
     try:
         from core.runtime import Runtime
-    except ImportError:
-        return FallbackRuntime(state_dir, policy=policy, registry=registry)
+    except ImportError as exc:
+        raise RuntimeUnavailable(
+            "real runtime (core.runtime) is not installed; "
+            "reinstall OpenCobot — the CLI never runs without it"
+        ) from exc
     try:
         return Runtime(state_dir, policy, registry)
     except Exception as exc:
@@ -177,15 +187,17 @@ def get_runtime(state_dir, policy=None, registry=None):
 
 
 def get_audit_log(state_dir):
-    """``policy.audit.AuditLog`` when installed, else the fallback.
+    """``policy.audit.AuditLog`` at ``<state_dir>/audit.jsonl``.
 
-    The real log lives at ``<state_dir>/audit.jsonl`` (shared by the
-    engine, policyd and runtime); the fallback uses the same filename.
+    Fails loudly when the real module is not installed (R-009).
     """
     try:
         from policy.audit import AuditLog
-    except ImportError:
-        return FallbackAuditLog(state_dir)
+    except ImportError as exc:
+        raise PolicyUnavailable(
+            "real audit log (policy.audit) is not installed; "
+            "reinstall OpenCobot — the CLI never runs without it"
+        ) from exc
     return AuditLog(Path(state_dir) / "audit.jsonl")
 
 
@@ -211,9 +223,33 @@ def normalize_check_result(result):
             "level": getattr(result, "level", None)}
 
 
-def call_check(client, tool_name, level, args, token=None, tainted=False):
+def tool_is_network_call(tool_name, args):
+    """Whether this exact call performs network access (tools registry).
+
+    False when the registry is unavailable — callers must not treat
+    that as a licence to run a network call; policyd re-classifies
+    the call itself on its side.
+    """
+    try:
+        from tools.definitions import is_network_call
+    except ImportError:
+        return False
+    try:
+        return bool(is_network_call(tool_name, args or {}))
+    except Exception:
+        return False
+
+
+def call_check(client, tool_name, level, args, token=None, tainted=False,
+               network_call=False):
     """Call ``client.check`` tolerating the likely signature shapes."""
     check = getattr(client, "check")
+    try:
+        return normalize_check_result(
+            check(tool_name=tool_name, level=level, args=args,
+                  token=token, tainted=tainted, network_call=network_call))
+    except TypeError:
+        pass
     try:
         return normalize_check_result(
             check(tool_name=tool_name, level=level, args=args,
@@ -227,15 +263,17 @@ def call_check(client, tool_name, level, args, token=None, tainted=False):
     return normalize_check_result(check(tool_name, level))
 
 
-def call_issue_token(client, folders, tools, duration):
+def call_issue_token(client, folders, tools, duration, network=False):
     """Call ``client.issue_token`` tolerating kwarg/positional shapes.
 
     Real signature (policy.client / policy.engine):
-    ``issue_token(scope_folders, tools, duration_seconds=600)``.
-    Fallback signature: ``issue_token(folders, tools, duration=600)``.
+    ``issue_token(scope_folders, tools, duration_seconds=600,
+    network=False)``. ``network`` defaults False (fail closed).
     """
     issue = getattr(client, "issue_token")
     for kwargs in ({"scope_folders": folders, "tools": tools,
+                    "duration_seconds": duration, "network": bool(network)},
+                   {"scope_folders": folders, "tools": tools,
                     "duration_seconds": duration},
                    {"folders": folders, "tools": tools, "duration": duration}):
         try:
@@ -245,29 +283,23 @@ def call_issue_token(client, folders, tools, duration):
     return issue(folders, tools, duration)
 
 
-def call_approve(client, token_id, tool_name, duration_seconds=600):
-    """Call ``client.approve`` for (token_id, tool).
+def call_approve(client, token_id, tool_name, level=None, args=None,
+                 duration_seconds=600):
+    """Call ``client.approve`` for exactly one call (R-007).
 
     Real signature (policy.client / policy.engine):
-    ``approve(token_id, tool_name, duration_seconds=600)`` -> approval id.
-    Fallback signature: ``approve(tool_name, duration_seconds=600)``.
+    ``approve(token_id, tool_name, level, args, duration_seconds=600)``
+    -> approval id. The approval is bound to (token, tool, level,
+    argument hash); callers must pass the level and the exact
+    arguments of the call being approved.
     """
-    if isinstance(client, (FallbackPolicyClient, FallbackPolicyEngine)):
-        return call_approve_fallback(client, tool_name, duration_seconds)
     approve = getattr(client, "approve")
     try:
-        return approve(token_id, tool_name, duration_seconds)
+        return approve(token_id, tool_name, level, args or {},
+                       duration_seconds)
     except TypeError:
-        return approve(token_id=token_id, tool_name=tool_name,
-                       duration_seconds=duration_seconds)
-
-
-def call_approve_fallback(client, tool_name, duration_seconds=600):
-    approve = getattr(client, "approve")
-    try:
-        return approve(tool_name=tool_name, duration_seconds=duration_seconds)
-    except TypeError:
-        return approve(tool_name, duration_seconds)
+        return approve(token_id=token_id, tool_name=tool_name, level=level,
+                       args=args or {}, duration_seconds=duration_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -291,13 +323,12 @@ def _policyd_module_available():
 def ensure_policyd(state_dir, wait_seconds=5.0):
     """Make sure ``policyd`` is reachable.
 
-    Returns ``(status, proc)`` where status is one of:
-
-    * ``"running"`` — socket exists, or the real ``policyd`` was just started.
-    * ``"fallback"`` — no real ``policyd`` module is installed yet, so the
-      caller should use the in-process fallback policy engine.
-    * ``"failed"`` — the real ``policyd`` was started but its socket did
-      not appear within ``wait_seconds``.
+    Returns ``(status, proc)`` where status is ``"running"`` (socket
+    exists, or the real ``policyd`` was just started) or ``"failed"``
+    (the real ``policyd`` was started but its socket did not appear
+    within ``wait_seconds``). Raises :class:`PolicyUnavailable` when
+    the real ``policyd`` module is not installed — there is no
+    in-process fallback any more (R-009).
     """
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -305,7 +336,9 @@ def ensure_policyd(state_dir, wait_seconds=5.0):
     if sock.exists():
         return "running", None
     if not _policyd_module_available():
-        return "fallback", None
+        raise PolicyUnavailable(
+            "real policyd module (policy.policyd) is not installed; "
+            "reinstall OpenCobot — the CLI never runs without it")
     log_path = state_dir / "policyd.log"
     log_fh = open(log_path, "ab")
     try:
@@ -452,12 +485,14 @@ def public_token_record(token, duration_seconds=None):
         return {"token_id": token.get("token_id"),
                 "expiry": _token_expiry_iso(token),
                 "folders": list(folders), "tools": list(tools),
+                "network": bool(token.get("network", False)),
                 "duration_seconds": duration_seconds}
     folders = list(getattr(token, "scope_folders", []) or [])
     tools = list(getattr(token, "tools", []) or [])
     return {"token_id": _token_id_of(token),
             "expiry": _token_expiry_iso(token),
             "folders": folders, "tools": tools,
+            "network": bool(getattr(token, "network", False)),
             "duration_seconds": duration_seconds}
 
 
@@ -465,8 +500,7 @@ def normalize_run_result(result, tool_name=None):
     """Normalize a runtime result to one flat shape.
 
     Real ``core.runtime.Runtime.run_tool`` returns
-    ``{ok, verified, decision, result: {ok, data, error}, evidence}``;
-    the fallback returns a flat ``{ok, verified, tool, result, error}``.
+    ``{ok, verified, decision, result: {ok, data, error}, evidence}``.
     This returns the flat shape with ``result`` set to the tool's data
     payload and ``error`` always present (``None`` on success). When the
     decision says ``needs_approval``, the error reads ``needs approval:
@@ -505,10 +539,9 @@ def normalize_run_result(result, tool_name=None):
             "evidence": result.get("evidence", "")}
 
 def audit_verify(log):
-    """``(ok, count, errors)`` from either the real or fallback AuditLog.
+    """``(ok, count, errors)`` from the real ``AuditLog``.
 
-    Real ``policy.audit.AuditLog.verify()`` returns ``(bool, [errors])``;
-    the fallback returns ``(bool, count, error_or_None)``.
+    ``policy.audit.AuditLog.verify()`` returns ``(bool, [errors])``.
     """
     verify = getattr(log, "verify", None) or getattr(log, "audit_verify", None)
     result = verify()

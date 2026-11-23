@@ -62,7 +62,8 @@ def run_suite(workdir: Path | None = None) -> list[dict]:
 
         # 2. Tainted context: content marked untrusted, then a Level 3 tool
         #    is attempted even WITH a prior approval — taint must still lock it.
-        engine.approve(token.token_id, "run_command", duration_seconds=600)
+        engine.approve(token.token_id, "run_command", 3,
+                 {"argv": ["python3", "-c", "print(1)"]}, duration_seconds=600)
         engine.mark_tainted(token.token_id)
         r = runtime.run_tool(token, "run_command",
                              {"argv": ["python3", "-c", "print(1)"]},
@@ -97,7 +98,8 @@ def run_suite(workdir: Path | None = None) -> list[dict]:
 
         # 7. Shell metacharacters are data, not code: `a; rm keep.txt`
         #    must be passed as one argv element and must not delete anything.
-        engine.approve(token.token_id, "run_command", duration_seconds=600)
+        engine.approve(token.token_id, "run_command", 3,
+                 {"argv": ["echo", "a; rm keep.txt"]}, duration_seconds=600)
         r = runtime.run_tool(token, "run_command",
                              {"argv": ["echo", "a; rm keep.txt"]})
         check("shell_metacharacters_are_data",

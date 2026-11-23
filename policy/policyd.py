@@ -21,6 +21,7 @@ import sys
 import threading
 from pathlib import Path
 
+from .audit import PRIVATE_FILE_MODE, enforce_state_permissions
 from .engine import PolicyEngine, _default_state_dir
 from .tokens import CapabilityToken
 
@@ -43,6 +44,18 @@ def _load_or_create_auth(state_dir: Path) -> str:
     return token
 
 
+def _is_network_call(tool_name: str, args: dict) -> bool:
+    """Classify a call from the tool registry; False when unavailable."""
+    try:
+        from tools.definitions import is_network_call
+    except ImportError:
+        return False
+    try:
+        return bool(is_network_call(tool_name, args))
+    except Exception:
+        return False
+
+
 def handle_request(
     engine: PolicyEngine, auth_token: str, request: dict
 ) -> dict:
@@ -61,12 +74,22 @@ def handle_request(
                 if isinstance(token_data, dict)
                 else None
             )
+            tool_name = str(request.get("tool_name", ""))
+            args = request.get("args") or {}
+            # The caller normally supplies "network_call", but policyd
+            # never trusts it alone: a network call is one the caller
+            # says is network OR one policyd's own classification says
+            # is network. A caller cannot downgrade a network call by
+            # sending network_call=False.
+            network_call = bool(request.get("network_call", False)) or (
+                _is_network_call(tool_name, args))
             decision = engine.check(
                 token,
-                str(request.get("tool_name", "")),
+                tool_name,
                 int(request.get("level", 0)),
-                request.get("args") or {},
+                args,
                 bool(request.get("tainted", False)),
+                network_call,
             )
             return {
                 "ok": True,
@@ -88,9 +111,16 @@ def handle_request(
             )
             return {"ok": True, "token": token.to_dict()}
         if op == "approve":
+            # R-007: the approval is bound to the exact level and the
+            # exact arguments; a request without them records an
+            # approval that can never match a real check (fail closed).
+            level = request.get("level")
+            args = request.get("args")
             approval_id = engine.approve(
                 str(request.get("token_id", "")),
                 str(request.get("tool_name", "")),
+                int(level) if level is not None else None,
+                dict(args) if isinstance(args, dict) else None,
                 int(request.get("duration_seconds", 600)),
             )
             return {"ok": True, "approval_id": approval_id}
@@ -124,7 +154,8 @@ def handle_request(
 def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
     """Serve policyd on ``state_dir/policyd.sock`` until ``stop`` is set."""
     state_dir = Path(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # R-006: tighten state-dir permissions before anything is created.
+    enforce_state_permissions(state_dir)
     auth_token = _load_or_create_auth(state_dir)
     engine = PolicyEngine(state_dir)
     sock_path = state_dir / "policyd.sock"
@@ -134,6 +165,8 @@ def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server.bind(str(sock_path))
+        # R-006: the socket is owner-only (0600) regardless of umask.
+        os.chmod(sock_path, PRIVATE_FILE_MODE)
         server.listen(5)
         server.settimeout(0.5)
         print(f"policyd listening on {sock_path}", file=sys.stderr, flush=True)

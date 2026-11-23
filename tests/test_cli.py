@@ -195,9 +195,9 @@ def test_token_issue_prints_token_id_but_no_secret(state_dir):
         secret = auth_path.read_text(encoding="utf-8").strip()
         assert secret and secret not in proc.stdout
     # No token secret material may leak either: the output must contain
-    # only the public record (token_id, expiry, folders, tools).
+    # only the public record (token_id, expiry, folders, tools, network).
     assert set(payload) == {"token_id", "expiry", "folders", "tools",
-                           "duration_seconds"}
+                           "network", "duration_seconds"}
 
 
 def test_doctor_exits_zero(state_dir):

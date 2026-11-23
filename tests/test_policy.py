@@ -79,7 +79,7 @@ def test_level3_denied_without_approval_then_allowed_after(engine, token):
     assert d.needs_approval is True
     assert "approval" in d.reason
 
-    engine.approve(token.token_id, "delete_file")
+    engine.approve(token.token_id, "delete_file", 3, {})
     d = check(engine, token, "delete_file", 3)
     assert d.allowed is True
 
@@ -91,26 +91,26 @@ def test_level4_denied_without_approval(engine, token):
 
 
 def test_level4_allowed_after_approval(engine, token):
-    engine.approve(token.token_id, "run_shell")
+    engine.approve(token.token_id, "run_shell", 4, {})
     assert check(engine, token, "run_shell", 4).allowed is True
 
 
 def test_approval_for_other_tool_or_token_does_not_count(engine, token):
-    engine.approve(token.token_id, "write_file")
+    engine.approve(token.token_id, "write_file", 2, {})
     assert check(engine, token, "delete_file", 3).allowed is False
-    engine.approve("some-other-token", "delete_file")
+    engine.approve("some-other-token", "delete_file", 3, {})
     assert check(engine, token, "delete_file", 3).allowed is False
 
 
 def test_expired_approval_does_not_count(engine, token):
-    engine.approve(token.token_id, "delete_file", duration_seconds=-1)
+    engine.approve(token.token_id, "delete_file", 3, {}, duration_seconds=-1)
     d = check(engine, token, "delete_file", 3)
     assert d.allowed is False
     assert d.needs_approval is True
 
 
 def test_revoke_approval(engine, token):
-    approval_id = engine.approve(token.token_id, "delete_file")
+    approval_id = engine.approve(token.token_id, "delete_file", 3, {})
     assert check(engine, token, "delete_file", 3).allowed is True
     assert engine.revoke_approval(approval_id) is True
     assert engine.revoke_approval(approval_id) is False
@@ -118,7 +118,7 @@ def test_revoke_approval(engine, token):
 
 
 def test_approvals_file_is_0600(engine, token):
-    engine.approve(token.token_id, "delete_file")
+    engine.approve(token.token_id, "delete_file", 3, {})
     mode = stat.S_IMODE(os.stat(engine.state_dir / "approvals.json").st_mode)
     assert mode == 0o600
 
@@ -188,7 +188,7 @@ def test_empty_scope_denies_all_paths(engine):
 # -- taint --------------------------------------------------------------
 
 def test_tainted_level3_denied_even_after_approval(engine, token):
-    engine.approve(token.token_id, "delete_file")
+    engine.approve(token.token_id, "delete_file", 3, {})
     assert check(engine, token, "delete_file", 3).allowed is True
     d = check(engine, token, "delete_file", 3, tainted=True)
     assert d.allowed is False
@@ -200,7 +200,7 @@ def test_tainted_level0_still_allowed(engine, token):
 
 
 def test_mark_tainted_blocks_level3_without_flag(engine, token):
-    engine.approve(token.token_id, "delete_file")
+    engine.approve(token.token_id, "delete_file", 3, {})
     engine.mark_tainted(token.token_id)
     assert engine.is_tainted(token.token_id) is True
     assert check(engine, token, "delete_file", 3).allowed is False
@@ -292,7 +292,7 @@ def test_policyd_check_issue_approve_kill_round_trip(policyd_server, tmp_path):
     d = client.check(tok, "delete_file", 3)
     assert d.allowed is False and d.needs_approval is True
 
-    client.approve(tok.token_id, "delete_file")
+    client.approve(tok.token_id, "delete_file", 3, {})
     assert client.check(tok, "delete_file", 3).allowed is True
 
     assert client.kill() is True

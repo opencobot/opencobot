@@ -26,7 +26,7 @@ The model process and `daemon` cannot write to policy files, approvals or audit 
 1. Input (text, voice, phone) reaches the Input Processor.
 2. The Agent Runtime builds a plan using the Model Gateway and available skills.
 3. For each step the runtime asks the Tool Registry for a typed tool call.
-4. `policyd` checks the call against permission level, capability token, taint state and user approval rules.
+4. `policyd` checks the call against permission level, capability token (including the `network` flag — network calls are denied on tokens without it, ADR-006), taint state and user approval rules. Each approval is bound to one exact call: the same tool, the same level and the same arguments (ADR-005).
 5. If allowed, a sandboxed worker executes the tool through an OS adapter.
 6. The tool's `verify()` reads real system state. The result (success, failure, evidence) goes back to the runtime and into the audit log.
 7. The runtime recovers, escalates or reports to the user.
@@ -59,7 +59,7 @@ Platform notes: Windows is the suggested MVP target. macOS needs Accessibility a
 
 ### Mechanisms
 
-- **Capability tokens:** each task gets a short-lived, scoped token (folders, apps, tools, network, duration).
+- **Capability tokens:** each task gets a short-lived, scoped token (folders, apps, tools, network, duration). The `network` flag is enforced, not just carried: a network call on a token without it is denied (ADR-006, R-014).
 - **Taint tracking:** content from outside (web, email, PDF, skill text, tool output derived from them) is untrusted. While untrusted data is in context, Level 3+ tools and outbound network are locked or need approval.
 - **Sandbox option:** run the agent in a separate OS user, container, VM or virtual desktop session.
 - **Egress control:** default-deny network for the agent; allowlist model endpoints and the relay.

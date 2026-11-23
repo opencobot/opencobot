@@ -22,6 +22,39 @@ from pathlib import Path
 
 GENESIS_PREV_HASH = "0" * 64
 
+# R-006: the state dir and everything in it must be owner-only. The
+# policy boundary is a same-user boundary, not a real OS boundary
+# (see docs/risks.md), but at minimum no other local user may read
+# the audit log, approvals or auth secret through the filesystem.
+STATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def enforce_state_permissions(state_dir: Path | str) -> None:
+    """Tighten ``state_dir`` to 0700 and its private files to 0600.
+
+    Called on startup by the policy engine, policyd and the daemon.
+    Raises :class:`PermissionError` (fail loudly) when a path cannot
+    be tightened — a state dir other local users can read is a
+    security failure, not a warning to log and continue.
+    """
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(state_dir, STATE_DIR_MODE)
+    except OSError as exc:
+        raise PermissionError(
+            f"cannot secure state dir {state_dir}: {exc}") from exc
+    for name in ("audit.jsonl", "approvals.json", "policyd.auth",
+                 "daemon.auth", "taint.json"):
+        path = state_dir / name
+        if path.exists():
+            try:
+                os.chmod(path, PRIVATE_FILE_MODE)
+            except OSError as exc:
+                raise PermissionError(
+                    f"cannot secure {path}: {exc}") from exc
+
 
 def _canonical(obj: object) -> str:
     """Deterministic JSON: sorted keys, no insignificant whitespace."""
@@ -45,6 +78,12 @@ class AuditLog:
         """Append ``event`` and return the stored entry (with seq/ts/hash)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a+", encoding="utf-8") as f:
+            # R-006: the audit log is owner-only (0600) even under a
+            # permissive umask.
+            try:
+                os.chmod(self.path, PRIVATE_FILE_MODE)
+            except OSError:
+                pass
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
                 f.seek(0)

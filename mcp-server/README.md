@@ -39,12 +39,14 @@ Level 3+ tools need an explicit approval; without one the call returns
 `isError: true` with a `needs approval` message and nothing executes.
 
 > **Standalone-mode note:** this server uses the policy engine
-> in-process (`policy.engine.PolicyEngine` when installed, else the
-> same fallback engine the CLI uses), backed by the shared state dir
-> and audit log. That is weaker isolation than the separate `policyd`
-> process the daemon/CLI path uses. When `policyd` (or the daemon) is
-> running, the daemon path should be preferred; a future version of
-> this server will route `tools/call` through the daemon socket
+> in-process (`policy.engine.PolicyEngine`), backed by the shared
+> state dir and audit log. That is weaker isolation than the
+> separate `policyd` process the daemon/CLI path uses, and if the
+> real policy engine is not installed the server fails loudly
+> instead of running a weaker copy (R-009: the old
+> `cli/_fallback.py` was deleted). When `policyd` (or the daemon)
+> is running, the daemon path should be preferred; a future version
+> of this server will route `tools/call` through the daemon socket
 > instead.
 
 ## Example client config

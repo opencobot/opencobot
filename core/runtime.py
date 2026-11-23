@@ -55,6 +55,22 @@ def _redact_args(args: dict) -> dict:
     return redacted
 
 
+def _is_network_call(tool_name: str, args: dict) -> bool:
+    """Whether this exact call performs network access (tools registry).
+
+    False when the registry is unavailable; policyd re-classifies the
+    call itself on its side, so a missing registry is not a bypass.
+    """
+    try:
+        from tools.definitions import is_network_call
+    except ImportError:
+        return False
+    try:
+        return bool(is_network_call(tool_name, args or {}))
+    except Exception:
+        return False
+
+
 def _normalize_decision(decision: Any) -> dict:
     """Accept a dict or a Decision object; always return a plain dict."""
     if decision is None:
@@ -600,9 +616,17 @@ class Runtime:
             check = getattr(self.policy, "check", None)
             if not callable(check):
                 raise AttributeError("policy object has no check() method")
-            decision = _normalize_decision(
-                check(token, tool_name, level, args, tainted)
-            )
+            try:
+                decision = _normalize_decision(
+                    check(token, tool_name, level, args, tainted,
+                          network_call=_is_network_call(tool_name, args))
+                )
+            except TypeError:
+                # Older / test-double policy engines that do not accept
+                # the network_call kwarg (5-arg check).
+                decision = _normalize_decision(
+                    check(token, tool_name, level, args, tainted)
+                )
         except Exception as exc:
             decision = {
                 "allowed": False,

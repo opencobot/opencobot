@@ -33,7 +33,25 @@ MCP server (stdio, for MCP-compatible clients):
 .venv-opencobot/bin/python mcp-server/server.py
 ```
 
-Level 3 tools (for example `run_command`, `delete_to_trash`) need an explicit human approval — use `policy check` / the CLI approval flow; approvals never come from model output. `delete_to_trash` never hard-deletes. On a headless server `screenshot` and `list_windows` honestly report "unavailable" instead of faking success. The Windows adapter is a stub in Phase 1 (ADR-001).
+Level 3 tools (for example `run_command`, `delete_to_trash`) need an explicit human approval — use `policy check` / the CLI approval flow; approvals never come from model output. Each approval is bound to one exact call — the same tool, the same permission level and the same arguments (ADR-005) — so an approval for `echo 42` cannot be replayed for a different command. Capability tokens also carry a `network` flag (default off): a network call such as `run_command` with `curl` is denied unless the token was issued with `--network` (ADR-006). `delete_to_trash` never hard-deletes. On a headless server `screenshot` and `list_windows` honestly report "unavailable" instead of faking success. The Windows adapter is a stub in Phase 1 (ADR-001).
+
+## Running policyd as a separate user
+
+By default `policyd` and the daemon run as your user, so the policy boundary is a **same-user boundary, not a real OS boundary**: any process running as your UID can read the state dir (which is why it is locked down to `0700`, with the auth secret, audit log, approvals and sockets at `0600` — enforced on startup, and reported by `opencobot doctor`). For a real OS boundary, run `policyd` under a dedicated system user with its own state dir:
+
+```bash
+sudo useradd --system --home-dir /var/lib/opencobot --no-create-home opencobot
+sudo mkdir -p /var/lib/opencobot
+sudo chown opencobot:opencobot /var/lib/opencobot
+sudo chmod 0700 /var/lib/opencobot
+# Start policyd as that user (it listens on /var/lib/opencobot/policyd.sock):
+sudo -u opencobot /path/to/opencobot/.venv-opencobot/bin/python \
+  -m policy.policyd --state-dir /var/lib/opencobot
+# Point the CLI / daemon at the same state dir:
+opencobot --state-dir /var/lib/opencobot doctor
+```
+
+The state dir is tightened to `0700` on startup, so the CLI and daemon must run as the same `opencobot` user to reach the socket — run them with `sudo -u opencobot` too (or run the whole service, daemon + policyd, as that user). A group-shared state dir does not work with the current 0700 enforcement. See `docs/risks.md` (R-006) for exactly what is enforced and what still requires a separate user or container.
 
 ## Phase 2 — gateway, CLI models, benchmark, read-only, web UI
 
