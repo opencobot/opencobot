@@ -1,8 +1,9 @@
 """policyd: the policy engine as a separate process (SECURITY.md inv. 2).
 
 Listens on a Unix socket at ``<state-dir>/policyd.sock`` on POSIX and
-(on Windows, once the named-pipe listener lands) on the named pipe
-``\\\\.\\pipe\\opencobot-policyd``. Speaks newline-delimited JSON: one
+on the named pipe ``\\\\.\\pipe\\opencobot-policyd`` on Windows
+(``ctypes`` listener with a current-user + Administrators DACL,
+ADR-010). Speaks newline-delimited JSON: one
 JSON request object per line, one JSON reply per line (see
 :mod:`core.transport` for the shared framing). Every request must
 carry the ``auth`` token from ``<state-dir>/policyd.auth`` (mode 0600,
@@ -10,11 +11,11 @@ generated once and reused); requests with a missing or wrong token
 are rejected without being acted on. Handles one connection at a
 time. Logs to stderr only.
 
-Windows note: the named-pipe server is shape-only this round — the
-stdlib cannot create a pipe with a current-user-only ACL, so
-:func:`serve` refuses to start on Windows until the ``ctypes``
-listener (``core.transport.NamedPipeListener``) is implemented and
-verified on a Windows host.
+Windows note: the named-pipe server is implemented in
+:mod:`core.transport` (``ctypes`` ``CreateNamedPipeW`` with a
+current-user + Administrators DACL, ADR-010) and is mock-verified
+on Linux; it still needs live verification on a Windows host
+(docs/WINDOWS_TESTING.md §6) before it counts as proven.
 
 Run: ``python -m policy.policyd --state-dir DIR``
 """
@@ -173,9 +174,9 @@ def handle_request(
 def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
     """Serve policyd on ``state_dir/policyd.sock`` until ``stop`` is set.
 
-    On Windows the named-pipe listener is shape-only this round (its
-    ACL + ``ctypes`` implementation is deferred to laptop
-    verification), so serving refuses to start there instead of
+    On Windows the named-pipe listener (``core.transport``,
+    ``ctypes`` + current-user/Admin DACL, ADR-010) serves instead;
+    if the ACL cannot be built it refuses to start rather than
     listening on an ACL-less pipe.
     """
     state_dir = Path(state_dir)
@@ -184,7 +185,11 @@ def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
     auth_token = _load_or_create_auth(state_dir)
     engine = PolicyEngine(state_dir)
     if is_windows():
-        NamedPipeListener(POLICYD_PIPE_PATH).listen()
+        NamedPipeListener(POLICYD_PIPE_PATH).listen(
+            handler=lambda req: handle_request(engine, auth_token, req),
+            stop=stop,
+        )
+        return
     sock_path = state_dir / "policyd.sock"
     if sock_path.exists():
         # Stale socket from a previous run; remove it before binding.

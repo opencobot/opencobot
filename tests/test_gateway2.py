@@ -59,7 +59,9 @@ def write_script(bin_dir: Path, name: str, body: str) -> Path:
 def bin_dir(tmp_path, monkeypatch):
     d = tmp_path / "bin"
     d.mkdir()
-    monkeypatch.setenv("PATH", str(d) + os.pathsep + os.environ.get("PATH", ""))
+    # R-012: bare CLI names resolve only against pinned dirs, never the
+    # ambient PATH -- point the pinned dirs at the fake scripts.
+    monkeypatch.setenv("OPENCOBOT_CLI_BIN_DIRS", str(d))
     return d
 
 

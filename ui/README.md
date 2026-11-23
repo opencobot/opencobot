@@ -20,19 +20,24 @@ immediately (same files, no restart needed).
 
 ## Authentication
 
-Every request must carry the daemon auth token from
-`<state-dir>/daemon.auth` (0600), as an `Authorization: Bearer`
-header, an `X-OpenCobot-Auth` header, or a `?token=` query parameter.
-The token is never printed by the CLI — copy it from the file. Without
-a valid token, API paths return 401 JSON and `GET /` returns a small
-login form. The `?token=` form exists so a local browser can open the
-page; the token never leaves this machine.
+API clients send the daemon auth token from `<state-dir>/daemon.auth`
+(0600) as an `Authorization: Bearer` header or an `X-OpenCobot-Auth`
+header. A browser signs in once by POSTing the token to `/login` and
+receives a random session id in an HttpOnly, SameSite
+`opencobot_session` cookie (12h, sliding); sign out with `POST
+/logout`. The daemon token is never printed by the CLI — copy it from
+the file — and never appears in a URL, a redirect, a form field,
+browser history or a log: `?token=` query-parameter auth was removed
+(R-013). Without a valid session or header token, API paths return
+401 JSON and `GET /` returns a small login form.
 
 ## Endpoints
 
 | Method | Path | What it does |
 | ------ | ---- | ------------ |
 | GET | `/` | Status page (HTML, no JS): read-only/kill state, providers, tools, approvals, recent audit, with forms for the actions below |
+| POST | `/login` | Sign in with the daemon token (body field `token`) — sets the `opencobot_session` cookie, redirects to `/` |
+| POST | `/logout` | Invalidate the session cookie, redirects to `/` |
 | GET | `/api/status` | `{readonly, readonly_source, killed, tools, daemon_running, policyd_socket, audit_entries, providers}` |
 | GET | `/api/tools` | Tool registry (name, level, schema, description) |
 | GET | `/api/approvals` | Current approvals |

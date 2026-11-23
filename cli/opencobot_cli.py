@@ -865,22 +865,32 @@ def cmd_doctor(args):
     # (which is why the 0700/0600 bits above matter). A real OS
     # boundary needs policyd under a separate OS user — see the
     # README section "Running policyd as a separate user".
-    try:
-        owner = state_dir.stat().st_uid
-        same_user = owner == os.getuid()
-    except OSError:
-        same_user = True
-    if same_user:
-        checks.append(("policy boundary", "WARN",
-                       "same-user boundary, not a real OS boundary: "
-                       "policyd/daemon run as your UID; run policyd as "
-                       "a separate OS user for a real boundary "
-                       "(README: 'Running policyd as a separate user')",
-                       False))
+    #
+    # Windows has no os.getuid, so the identity check cannot run
+    # there: report it as skipped (INFO, non-essential) instead of
+    # crashing doctor with AttributeError.
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        checks.append(("policy boundary", "INFO",
+                       "unavailable on Windows (no os.getuid): "
+                       "same-user identity check skipped", False))
     else:
-        checks.append(("policy boundary", "PASS",
-                       "state dir owned by a different UID than this "
-                       "process (separate-user policyd)", False))
+        try:
+            owner = state_dir.stat().st_uid
+            same_user = owner == getuid()
+        except OSError:
+            same_user = True
+        if same_user:
+            checks.append(("policy boundary", "WARN",
+                           "same-user boundary, not a real OS boundary: "
+                           "policyd/daemon run as your UID; run policyd as "
+                           "a separate OS user for a real boundary "
+                           "(README: 'Running policyd as a separate user')",
+                           False))
+        else:
+            checks.append(("policy boundary", "PASS",
+                           "state dir owned by a different UID than this "
+                           "process (separate-user policyd)", False))
 
     # policyd: the real separate process. There is no in-process
     # fallback any more (R-009) — if policyd is not installed or

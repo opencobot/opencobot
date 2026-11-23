@@ -86,11 +86,15 @@ def test_wrong_token_rejected(server):
     assert status == 401
 
 
-def test_token_in_query_param_accepted(server):
+def test_token_in_query_param_rejected(server):
+    # R-013: the daemon token in a URL (?token=) used to be accepted;
+    # it is now rejected -- the token must never appear in a URL,
+    # browser history or server log. Browsers sign in via POST /login
+    # and get a session cookie instead.
     status, body = fetch(server["port"],
                          f"/api/status?token={server['token']}", token=None)
-    assert status == 200
-    assert json.loads(body)["ok"] is True
+    assert status == 401
+    assert json.loads(body)["error"] == "unauthorized"
 
 
 def test_unauthenticated_root_serves_login_form(server):

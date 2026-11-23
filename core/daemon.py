@@ -1,7 +1,8 @@
 """Daemon: authenticated Unix-socket JSON-lines server for the core.
 
-Listens on ``state_dir/daemon.sock`` (POSIX) and, once the named-pipe
-listener lands, on ``\\\\.\\pipe\\opencobot-daemon`` (Windows); every
+Listens on ``state_dir/daemon.sock`` (POSIX) and on
+``\\\\.\\pipe\\opencobot-daemon`` (Windows, ``ctypes`` listener with
+a current-user + Administrators DACL, ADR-010); every
 request line must carry the token from ``state_dir/daemon.auth``
 (0600, generated once and reused). The daemon owns the Runtime and
 the Model Gateway, but policy decisions always go through a
@@ -9,12 +10,12 @@ PolicyClient talking to the separate ``policyd`` process -- if
 policyd is unreachable, ``run_tool`` is refused rather than falling
 back to an in-process policy (ARCHITECTURE.md section 2).
 
-Windows note: serving on a named pipe is shape-only this round (see
-:mod:`core.transport` — the pipe needs a current-user-only ACL the
-stdlib cannot set), so ``serve_forever`` refuses to start on Windows
-until the ``ctypes`` listener is implemented and verified on a
-Windows host. The JSON-lines protocol is shared with policyd via
-:mod:`core.transport`.
+Windows note: serving on a named pipe is implemented in
+:mod:`core.transport` (``ctypes`` ``CreateNamedPipeW`` with a
+current-user + Administrators DACL, ADR-010), mock-verified on
+Linux; it still needs live verification on a Windows host
+(docs/WINDOWS_TESTING.md §6) before it counts as proven. The
+JSON-lines protocol is shared with policyd via :mod:`core.transport`.
 
 Run: ``python -m core.daemon --state-dir DIR`` (or ``python -m core``).
 """
@@ -339,11 +340,13 @@ class Daemon:
 
         enforce_state_permissions(self.state_dir)
         if is_windows():
-            # Named-pipe server is shape-only this round (current-user
-            # ACL + ctypes implementation deferred to laptop
-            # verification); refuse to serve rather than listen on an
+            # Named-pipe server with a ctypes current-user/Admin
+            # DACL (core.transport, ADR-010); refuses to start if
+            # the ACL cannot be built, rather than serving an
             # ACL-less pipe.
-            NamedPipeListener(DAEMON_PIPE_PATH).listen()
+            NamedPipeListener(DAEMON_PIPE_PATH).listen(
+                handler=self.handle_request, stop=self._stop)
+            return
         self._remove_stale_socket()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(self.sock_path))

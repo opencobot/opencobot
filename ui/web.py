@@ -2,15 +2,22 @@
 
 Stdlib ``http.server`` only -- no JavaScript framework, no external
 CDN, no new dependency. Binds 127.0.0.1 ONLY; any other host is
-refused. Every request must carry the daemon auth token from
-``<state-dir>/daemon.auth`` (0600), as an ``Authorization: Bearer``
-header, an ``X-OpenCobot-Auth`` header, or a ``?token=`` query
-parameter (the query form exists so a local browser can open the page;
-the token never leaves this machine). Requests without a valid token
-get 401 -- JSON for API paths, a small login form for ``GET /``.
+refused. Authentication (R-013): API clients send the daemon auth
+token from ``<state-dir>/daemon.auth`` (0600) as an ``Authorization:
+Bearer`` or ``X-OpenCobot-Auth`` header. A browser signs in once by
+POSTing the token to ``/login`` (token in the request body, never in a
+URL) and receives a random session id in an HttpOnly, SameSite
+``opencobot_session`` cookie (12h, sliding); the daemon token itself
+never appears in a URL, a redirect, a form field, browser history or
+a log. Requests without a valid session or header token get 401 --
+JSON for API paths, a small login form for ``GET /``.
 
 Endpoints:
   GET  /                              status page (HTML, no JS)
+  POST /login                         sign in with the daemon token
+                                       (body field ``token``) -> session
+                                       cookie + redirect to /
+  POST /logout                        invalidate the session cookie
   GET  /api/status                    readonly/killed/tools/providers
   GET  /api/tools                     tool registry (name/level/schema)
   GET  /api/approvals                 current approvals
@@ -38,7 +45,9 @@ import json
 import secrets
 import sys
 import threading
+import time
 import urllib.parse
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -47,6 +56,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 DEFAULT_PORT = 8765
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_AUDIT_LIMIT = 200
+
+# R-013: browser session cookie. HttpOnly so page scripts cannot read
+# it, SameSite=Lax so it is not sent on cross-site requests, Path=/
+# so it covers the whole UI. No Secure flag: the UI serves plain HTTP
+# on loopback only, where Secure would stop the cookie being set at
+# all; the token never leaves this machine either way. Sessions live
+# in server memory only (never on disk) and expire after 12h of
+# inactivity (sliding).
+SESSION_COOKIE = "opencobot_session"
+SESSION_MAX_AGE = 12 * 60 * 60
 
 
 class BenchmarkUnavailable(Exception):
@@ -263,9 +282,9 @@ def _login_form_html() -> str:
 <h1>OpenCobot</h1>
 <p>This UI runs on localhost only. Paste the daemon auth token
 (<code>daemon.auth</code> in the state dir) to continue.</p>
-<form method="get" action="/">
+<form method="post" action="/login">
 <label>Token: <input type="password" name="token" size="70"></label>
-<input type="submit" value="Open status page">
+<input type="submit" value="Sign in">
 </form>
 </body></html>
 """
@@ -275,51 +294,106 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     backend: WebUIBackend  # set by create_server
     auth_token: str  # set by create_server
+    sessions: dict[str, float]  # session id -> expiry epoch; set by create_server
+    sessions_lock: threading.Lock  # set by create_server
 
     # -- plumbing ------------------------------------------------------
     def log_message(self, *args):  # keep test/server output quiet
         pass
 
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(self, status: int, body: bytes, content_type: str,
+              extra_headers: list[tuple[str, str]] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(self, status: int, payload: dict,
+                   extra_headers: list[tuple[str, str]] | None = None) -> None:
         self._send(status, json.dumps(payload).encode("utf-8"),
-                   "application/json")
+                   "application/json", extra_headers)
 
-    def _send_html(self, status: int, body: str) -> None:
-        self._send(status, body.encode("utf-8"), "text/html; charset=utf-8")
+    def _send_html(self, status: int, body: str,
+                   extra_headers: list[tuple[str, str]] | None = None) -> None:
+        self._send(status, body.encode("utf-8"), "text/html; charset=utf-8",
+                   extra_headers)
 
-    def _token_from_request(self, query: dict, body: dict | None = None) -> str | None:
-        """The request's auth token when it matches, else None.
+    # -- R-013 session auth ---------------------------------------------
+    def _new_session(self) -> str:
+        """Mint a random session id, valid for SESSION_MAX_AGE."""
+        session_id = secrets.token_urlsafe(32)
+        with self.sessions_lock:
+            self.sessions[session_id] = time.time() + SESSION_MAX_AGE
+        return session_id
 
-        Accepted from an ``Authorization: Bearer`` header, an
-        ``X-OpenCobot-Auth`` header, a ``?token=`` query parameter, or
-        a ``token`` field in a POST body. Compared in constant time.
+    def _session_cookie_header(self, session_id: str) -> tuple[str, str]:
+        return ("Set-Cookie",
+                f"{SESSION_COOKIE}={session_id}; HttpOnly; SameSite=Lax; "
+                f"Path=/; Max-Age={SESSION_MAX_AGE}")
+
+    def _clear_session_cookie_header(self) -> tuple[str, str]:
+        return ("Set-Cookie",
+                f"{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+
+    def _session_valid(self) -> bool:
+        """True when the request carries a live session cookie.
+
+        Expired sessions are dropped; a valid one gets its expiry
+        refreshed (sliding 12h window).
         """
-        candidates: list[str] = []
+        raw = self.headers.get("Cookie") or ""
+        try:
+            cookie = SimpleCookie()
+            cookie.load(raw)
+        except Exception:
+            return False
+        morsel = cookie.get(SESSION_COOKIE)
+        if morsel is None or not morsel.value:
+            return False
+        now = time.time()
+        with self.sessions_lock:
+            expiry = self.sessions.get(morsel.value)
+            if expiry is None or expiry <= now:
+                self.sessions.pop(morsel.value, None)
+                return False
+            self.sessions[morsel.value] = now + SESSION_MAX_AGE
+        return True
+
+    def _invalidate_session(self) -> None:
+        raw = self.headers.get("Cookie") or ""
+        try:
+            cookie = SimpleCookie()
+            cookie.load(raw)
+        except Exception:
+            return
+        morsel = cookie.get(SESSION_COOKIE)
+        if morsel is not None and morsel.value:
+            with self.sessions_lock:
+                self.sessions.pop(morsel.value, None)
+
+    def _header_token_matches(self) -> bool:
+        """True when a Bearer / X-OpenCobot-Auth header carries the token.
+
+        Headers only: the daemon token is never accepted from a URL
+        query parameter, a form field on an API call, or any other
+        place where it would land in browser history or logs (R-013).
+        """
         auth = self.headers.get("Authorization") or ""
         if auth.startswith("Bearer "):
-            candidates.append(auth[7:].strip())
+            if secrets.compare_digest(auth[7:].strip(), self.auth_token):
+                return True
         header_token = self.headers.get("X-OpenCobot-Auth") or ""
         if header_token:
-            candidates.append(header_token.strip())
-        supplied = query.get("token", [None])[0]
-        if isinstance(supplied, str) and supplied:
-            candidates.append(supplied)
-        if body is not None:
-            body_token = body.get("token")
-            if isinstance(body_token, str) and body_token:
-                candidates.append(body_token)
-        for candidate in candidates:
-            if secrets.compare_digest(candidate, self.auth_token):
-                return candidate
-        return None
+            if secrets.compare_digest(header_token.strip(), self.auth_token):
+                return True
+        return False
+
+    def _is_authenticated(self) -> bool:
+        return self._session_valid() or self._header_token_matches()
 
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -340,13 +414,14 @@ class _Handler(BaseHTTPRequestHandler):
         return "text/html" in (self.headers.get("Accept") or "")
 
     def _after_post(self, payload: dict) -> None:
-        """Browser form posts redirect back to /; API clients get JSON."""
+        """Browser form posts redirect back to /; API clients get JSON.
+
+        The redirect never carries a token: the browser is already
+        authenticated by its session cookie (R-013).
+        """
         if self._wants_html():
-            location = "/"
-            if getattr(self, "_authed_token", None):
-                location = "/?token=" + urllib.parse.quote(self._authed_token)
             self.send_response(303)
-            self.send_header("Location", location)
+            self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.end_headers()
         else:
@@ -362,14 +437,13 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         split = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(split.query)
-        self._authed_token = self._token_from_request(query)
-        if self._authed_token is None:
+        if not self._is_authenticated():
             self._unauthorized(query)
             return
         path = split.path
         try:
             if path == "/":
-                self._send_html(200, self._status_page(query))
+                self._send_html(200, self._status_page())
             elif path == "/api/status":
                 self._send_json(200, self.backend.status())
             elif path == "/api/tools":
@@ -408,11 +482,52 @@ class _Handler(BaseHTTPRequestHandler):
         split = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(split.query)
         body = self._read_body()
-        self._authed_token = self._token_from_request(query, body)
-        if self._authed_token is None:
+        path = split.path
+        # -- sign-in / sign-out (R-013) ---------------------------------
+        if path == "/login":
+            # The only place a token in a request body is accepted: a
+            # single login exchange that mints a session cookie. The
+            # token is compared in constant time and never echoed back
+            # or put in a URL.
+            supplied = body.get("token")
+            if isinstance(supplied, str) and supplied and secrets.compare_digest(
+                supplied, self.auth_token
+            ):
+                session_id = self._new_session()
+                if self._wants_html():
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.send_header(
+                        *self._session_cookie_header(session_id))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self._send_json(
+                        200, {"ok": True},
+                        [self._session_cookie_header(session_id)])
+            else:
+                self._unauthorized(query)
+            return
+        if path == "/logout":
+            if not self._is_authenticated():
+                self._unauthorized(query)
+                return
+            self._invalidate_session()
+            if self._wants_html():
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header(*self._clear_session_cookie_header())
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_json(
+                    200, {"ok": True},
+                    [self._clear_session_cookie_header()])
+            return
+        # -- everything else needs a session cookie or header token ----
+        if not self._is_authenticated():
             self._unauthorized(query)
             return
-        path = split.path
         try:
             if path == "/api/readonly":
                 raw = body.get("enabled", body.get("readonly"))
@@ -491,13 +606,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": f"handler error: {exc}"})
 
     # -- status page ---------------------------------------------------
-    def _status_page(self, query: dict) -> str:
+    def _status_page(self) -> str:
         status = self.backend.status()
         approvals = self.backend.approvals()
         entries = self.backend.audit(limit=10)
         tools = self.backend.tools()
         providers = self.backend.providers()
-        token = query.get("token", [""])[0] or ""
         esc = html.escape
         rows = "".join(
             f"<tr><td>{esc(str(e.get('seq', '')))}</td>"
@@ -514,7 +628,6 @@ class _Handler(BaseHTTPRequestHandler):
             f"<td>L{esc(str(a.get('level', '')))} "
             f"{esc(str(a.get('arg_hash', ''))[:12])}</td>"
             f"<td><form method=\"post\" action=\"/api/approvals/{esc(str(a.get('id', '')))}/deny\">"
-            f"<input type=\"hidden\" name=\"token\" value=\"{esc(token)}\">"
             "<input type=\"submit\" value=\"Deny / revoke\"></form></td></tr>"
             for a in approvals
         ) or "<tr><td colspan=\"4\">(no approvals)</td></tr>"
@@ -540,19 +653,16 @@ Daemon: {'running' if status['daemon_running'] else 'not running'} &middot;
 Tools: {status['tools']} &middot; Audit entries: {status['audit_entries']}</p>
 <h2>Read-only</h2>
 <form method="post" action="/api/readonly">
-<input type="hidden" name="token" value="{esc(token)}">
 <input type="hidden" name="enabled" value="{'false' if readonly else 'true'}">
 <input type="submit" value="Turn read-only {'OFF' if readonly else 'ON'}">
 </form>
 <h2>Kill switch</h2>
 <form method="post" action="/api/kill">
-<input type="hidden" name="token" value="{esc(token)}">
 <input type="hidden" name="killed" value="{'false' if status['killed'] else 'true'}">
 <input type="submit" value="Turn kill switch {'OFF' if status['killed'] else 'ON'}">
 </form>
 <h2>Approve a tool</h2>
 <form method="post" action="/api/approvals/new/approve">
-<input type="hidden" name="token" value="{esc(token)}">
 <label>Token id: <input name="token_id" size="40"></label>
 <label>Tool: <input name="tool_name" size="20"></label>
 <label>Level: <input name="level" size="3"></label>
@@ -577,6 +687,9 @@ Tools: {status['tools']} &middot; Audit entries: {status['audit_entries']}</p>
 <a href="/api/audit">/api/audit</a> &middot;
 <a href="/api/providers">/api/providers</a> &middot;
 <a href="/api/benchmark">/api/benchmark</a></p>
+<form method="post" action="/logout">
+<input type="submit" value="Sign out">
+</form>
 </body></html>
 """
 
@@ -602,6 +715,8 @@ def create_server(
 
     Handler.backend = WebUIBackend(state_dir)
     Handler.auth_token = token
+    Handler.sessions = {}
+    Handler.sessions_lock = threading.Lock()
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     return server
