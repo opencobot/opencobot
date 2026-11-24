@@ -38,6 +38,9 @@ from .runtime import Runtime
 from .transport import (
     DAEMON_PIPE_PATH,
     NamedPipeListener,
+    NamedPipeTransport,
+    TransportNotAvailableError,
+    UnixSocketTransport,
     decode_message,
     is_windows,
     send_message,
@@ -77,6 +80,98 @@ def _load_auth_token(state_dir: Path) -> str:
     except OSError:
         pass
     return token
+
+
+def _read_daemon_auth(state_dir: Path) -> str | None:
+    """Read the daemon auth token WITHOUT generating one.
+
+    ``daemon.auth`` holds either the raw token or a JSON object
+    (``token``/``auth``/``secret``). Never generates: a query must
+    not create credentials for a daemon that is not running (that is
+    :func:`_load_auth_token`'s job, at daemon startup). The CLI's
+    copy of this reader used to live in cli/opencobot_cli.py; it
+    moved here so the query below and the CLI share one reader.
+    """
+    auth_path = Path(state_dir) / "daemon.auth"
+    if not auth_path.exists():
+        return None
+    raw = auth_path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data.get("token") or data.get("auth") or data.get("secret")
+    except ValueError:
+        pass
+    return raw
+
+
+def query_daemon(state_dir, op, timeout=3.0) -> dict | None:
+    """Send one JSON request to the daemon over its live transport.
+
+    POSIX: Unix socket ``state_dir/daemon.sock``; Windows: named
+    pipe ``\\\\.\\pipe\\opencobot-daemon``. The JSON-lines protocol
+    (and the auth token from ``daemon.auth``) is identical on both —
+    see :mod:`core.transport`. Returns the reply dict, or None when
+    the daemon is unreachable or the reply is invalid. On Windows
+    the pipe open has no timeout (a known transport limitation);
+    the call still returns promptly when no daemon is listening.
+    The CLI, doctor and web UI all share this one query path.
+    """
+    state_dir = Path(state_dir)
+    auth = _read_daemon_auth(state_dir)
+    request = {"op": op}
+    if auth:
+        request["auth"] = auth
+    try:
+        if is_windows():
+            stream = NamedPipeTransport(DAEMON_PIPE_PATH).connect()
+        else:
+            sock_path = state_dir / "daemon.sock"
+            if not sock_path.exists():
+                return None
+            stream = UnixSocketTransport(sock_path, timeout=timeout).connect()
+    except TransportNotAvailableError:
+        return None
+    try:
+        with stream:
+            send_message(stream, request)
+            raw = stream.readline()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        return decode_message(raw)
+    except ValueError:
+        return None
+
+
+def daemon_reachable(state_dir, timeout=1.0) -> bool:
+    """True if a daemon answers on its live transport.
+
+    A bare connect (no request, no auth): POSIX checks the Unix
+    socket, Windows the named pipe. A stale socket file with no
+    listener behind it counts as NOT reachable — unlike a bare
+    ``Path.exists()`` check, which would lie about it. Never raises.
+    """
+    state_dir = Path(state_dir)
+    try:
+        if is_windows():
+            stream = NamedPipeTransport(DAEMON_PIPE_PATH).connect()
+        else:
+            stream = UnixSocketTransport(
+                state_dir / "daemon.sock", timeout=timeout).connect()
+    except TransportNotAvailableError:
+        return False
+    except OSError:
+        return False
+    try:
+        stream.close()
+    except Exception:
+        pass
+    return True
 
 
 class Daemon:
@@ -340,6 +435,16 @@ class Daemon:
 
         enforce_state_permissions(self.state_dir)
         if is_windows():
+            # Refuse a second instance: if a daemon already answers
+            # on the pipe, do not serve alongside it — a second
+            # named-pipe instance would silently split clients
+            # between two daemons. (The listener also caps pipe
+            # instances at 1, so a simultaneous start still fails
+            # at CreateNamedPipeW; this probe gives the clean
+            # "already running" error instead of a create failure.)
+            if daemon_reachable(self.state_dir):
+                raise RuntimeError(
+                    f"daemon already running on {DAEMON_PIPE_PATH}")
             # Named-pipe server with a ctypes current-user/Admin
             # DACL (core.transport, ADR-010); refuses to start if
             # the ACL cannot be built, rather than serving an

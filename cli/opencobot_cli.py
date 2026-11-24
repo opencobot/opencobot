@@ -187,53 +187,31 @@ def cmd_tool_run(args):
     return 0 if result.get("ok") and result.get("verified") else 1
 
 
-def _read_daemon_auth(state_dir):
-    auth_path = Path(state_dir) / "daemon.auth"
-    if not auth_path.exists():
-        return None
-    raw = auth_path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data.get("token") or data.get("auth") or data.get("secret")
-    except ValueError:
-        pass
-    return raw
-
-
 def _query_daemon(state_dir, op, timeout=3.0):
-    """Send one JSON request to the daemon Unix socket. Returns dict or None."""
-    sock_path = Path(state_dir) / "daemon.sock"
-    if not sock_path.exists():
-        return None
-    auth = _read_daemon_auth(state_dir)
-    request = {"op": op}
-    if auth:
-        request["auth"] = auth
-    try:
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(timeout)
-        conn.connect(str(sock_path))
-        conn.sendall((json.dumps(request) + "\n").encode("utf-8"))
-        chunks = []
-        try:
-            while True:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                if b"\n" in chunk:
-                    break
-        finally:
-            conn.close()
-    except OSError:
-        return None
-    try:
-        return json.loads(b"".join(chunks).decode("utf-8").strip().splitlines()[0])
-    except (ValueError, IndexError):
-        return None
+    """Send one JSON request to the daemon. Returns dict or None.
+
+    POSIX: Unix socket ``daemon.sock``; Windows: named pipe
+    ``\\\\.\\pipe\\opencobot-daemon`` — the same JSON-lines protocol
+    on both. Implemented in :mod:`core.daemon` so the CLI, doctor
+    and web UI share one query path (the auth reader moved there
+    with it; this wrapper keeps the old call sites unchanged).
+    """
+    from core.daemon import query_daemon  # lazy: heavy import
+
+    return query_daemon(state_dir, op, timeout=timeout)
+
+
+def _daemon_reachable(state_dir):
+    """True if a daemon answers on this platform's live transport.
+
+    POSIX: the Unix socket accepts a connection; Windows: the
+    named pipe answers. A stale socket file with no listener behind
+    it counts as NOT reachable. Thin wrapper over
+    :func:`core.daemon.daemon_reachable` (lazy import, as above).
+    """
+    from core.daemon import daemon_reachable  # lazy: heavy import
+
+    return daemon_reachable(state_dir)
 
 
 def _pid_alive(pid):
@@ -298,17 +276,33 @@ def cmd_daemon_start(args):
     pid_path.write_text(str(proc.pid), encoding="utf-8")
     deadline = time.time() + 5.0
     while time.time() < deadline:
-        if (state_dir / "daemon.sock").exists():
+        # Readiness is a real answer on the live transport (Unix
+        # socket on POSIX, named pipe on Windows) — not the mere
+        # existence of a socket file, which never appears on
+        # Windows and can go stale on POSIX.
+        if _daemon_reachable(state_dir):
             break
         if proc.poll() is not None:
             _err(f"daemon exited immediately (see {log_path})")
             pid_path.unlink(missing_ok=True)
             return 1
         time.sleep(0.1)
-    payload = {"running": True, "pid": proc.pid,
-               "socket": str(state_dir / "daemon.sock")}
-    _emit(payload, args.json,
-          [f"daemon started (pid {proc.pid}, socket {state_dir / 'daemon.sock'})"])
+    if not _daemon_reachable(state_dir):
+        # The process is alive but never answered within the
+        # deadline: do not claim success for a deaf daemon.
+        _err(f"daemon did not become ready within 5s (see {log_path})")
+        pid_path.unlink(missing_ok=True)
+        return 1
+    payload = {"running": True, "pid": proc.pid}
+    if sys.platform == "win32":
+        from core.transport import DAEMON_PIPE_PATH  # lazy import
+
+        payload["pipe"] = DAEMON_PIPE_PATH
+        lines = [f"daemon started (pid {proc.pid}, pipe {DAEMON_PIPE_PATH})"]
+    else:
+        payload["socket"] = str(state_dir / "daemon.sock")
+        lines = [f"daemon started (pid {proc.pid}, socket {state_dir / 'daemon.sock'})"]
+    _emit(payload, args.json, lines)
     return 0
 
 
@@ -317,7 +311,15 @@ def cmd_daemon_stop(args):
     pid_path = state_dir / "daemon.pid"
     sock_path = state_dir / "daemon.sock"
     if not pid_path.exists():
-        if sock_path.exists():
+        if sys.platform == "win32":
+            # No socket file exists on Windows: a live daemon shows
+            # up as an answering named pipe instead.
+            if _daemon_reachable(state_dir):
+                _err("daemon is running on the named pipe but no PID file "
+                     "exists; refusing to guess — stop the daemon process "
+                     "manually (e.g. taskkill /PID <pid>)")
+                return 1
+        elif sock_path.exists():
             _err("daemon socket exists but no PID file; refusing to guess — "
                  f"remove {sock_path} manually if the daemon is really gone")
             return 1
@@ -348,15 +350,29 @@ def cmd_daemon_status(args):
             running = _pid_alive(pid)
         except ValueError:
             pid = None
-    sock_exists = (state_dir / "daemon.sock").exists()
-    status = _query_daemon(state_dir, "status") if sock_exists else None
+    # Whether the live transport exists at all: the socket file on
+    # POSIX, an answering named pipe on Windows (there is no socket
+    # file there). The status query itself is attempted only when
+    # the transport is there.
+    if sys.platform == "win32":
+        transport_exists = _daemon_reachable(state_dir)
+        transport_name = "named pipe"
+    else:
+        transport_exists = (state_dir / "daemon.sock").exists()
+        transport_name = "socket"
+    status = _query_daemon(state_dir, "status") if transport_exists else None
     if status is not None:
         running = True
-    elif sock_exists and running:
-        status = {"note": "socket reachable, status query failed"}
-    payload = {"running": running, "pid": pid,
-               "socket": str(state_dir / "daemon.sock") if sock_exists else None,
-               "status": status}
+    elif transport_exists and running:
+        status = {"note": f"{transport_name} reachable, status query failed"}
+    payload = {"running": running, "pid": pid}
+    if sys.platform == "win32":
+        from core.transport import DAEMON_PIPE_PATH  # lazy import
+
+        payload["pipe"] = DAEMON_PIPE_PATH if transport_exists else None
+    else:
+        payload["socket"] = str(state_dir / "daemon.sock") if transport_exists else None
+    payload["status"] = status
     if running:
         lines = [f"daemon running (pid {pid})" if pid else "daemon running"]
         if status:
@@ -853,6 +869,13 @@ def cmd_doctor(args):
                        ("daemon.sock", 0o600)):
         path = state_dir if name == "." else state_dir / name
         label = "state dir perms" if name == "." else f"{name} perms"
+        if sys.platform == "win32" and name.endswith(".sock"):
+            # No socket files on Windows: policyd and the daemon
+            # serve on named pipes, so "not created yet" would be a
+            # lie — the transport exists, just not as a file.
+            checks.append((label, "INFO",
+                           "named pipe on Windows (no socket file)", False))
+            continue
         if not path.exists():
             checks.append((label, "INFO", "not created yet", False))
             continue
@@ -918,11 +941,21 @@ def cmd_doctor(args):
     except PolicyUnavailable as exc:
         checks.append(("policyd", "FAIL", str(exc), True))
 
-    sock = state_dir / "daemon.sock"
-    if sock.exists() and _query_daemon(state_dir, "status") is not None:
-        checks.append(("daemon", "PASS", "reachable (socket)", False))
-    elif sock.exists():
-        checks.append(("daemon", "INFO", "socket exists but status query failed", False))
+    # Whether the live transport exists at all: the socket file on
+    # POSIX, an answering named pipe on Windows (there is no socket
+    # file there, so a bare .exists() check would always say the
+    # daemon is down even while it is listening).
+    if sys.platform == "win32":
+        transport_exists = _daemon_reachable(state_dir)
+        transport_name = "named pipe"
+    else:
+        transport_exists = (state_dir / "daemon.sock").exists()
+        transport_name = "socket"
+    if transport_exists and _query_daemon(state_dir, "status") is not None:
+        checks.append(("daemon", "PASS", f"reachable ({transport_name})", False))
+    elif transport_exists:
+        checks.append(("daemon", "INFO",
+                       f"{transport_name} exists but status query failed", False))
     else:
         checks.append(("daemon", "INFO", "not running", False))
 
