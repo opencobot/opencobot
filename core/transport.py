@@ -384,7 +384,14 @@ class _CtypesWindowsPipeApi:
     _PIPE_TYPE_MESSAGE = 0x00000004
     _PIPE_READMODE_MESSAGE = 0x00000002
     _PIPE_WAIT = 0x00000000
-    _PIPE_UNLIMITED_INSTANCES = 255
+    # One server instance only: a second daemon's CreateNamedPipeW on
+    # the same name fails (ERROR_PIPE_BUSY) instead of silently
+    # serving a second pipe instance alongside the first, which would
+    # split clients between two daemons. This closes the same gap for
+    # policyd (same listener). Clients are unaffected: the listener
+    # serves one connection at a time on its single handle, and a
+    # client can only connect to an instance the server created.
+    _PIPE_MAX_INSTANCES = 1
     _TOKEN_QUERY = 0x0008
     _TOKEN_USER = 1
     _SECURITY_DESCRIPTOR_REVISION = 1
@@ -584,7 +591,7 @@ class _CtypesWindowsPipeApi:
             self._PIPE_ACCESS_DUPLEX,
             self._PIPE_TYPE_MESSAGE | self._PIPE_READMODE_MESSAGE
             | self._PIPE_WAIT,
-            self._PIPE_UNLIMITED_INSTANCES,
+            self._PIPE_MAX_INSTANCES,
             65536,  # out buffer
             65536,  # in buffer
             0,      # default timeout (client WaitNamedPipe default)
