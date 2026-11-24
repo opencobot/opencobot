@@ -141,6 +141,29 @@ configuration — it only changes which model/endpoint already-configured
 providers use; API keys are never read from it (they still come from
 environment variables at call time).
 
+### Timeouts and cold model loads
+
+Every provider has a `timeout` in seconds (default 30) that bounds one
+call: an HTTP request for Ollama / OpenAI-compatible providers, or the
+whole CLI run for a CLI provider. A cold model load — the first call
+after the server or machine starts, or a large model being paged into
+memory — can take longer than 30s, and the gateway then fails the call
+as a timeout instead of waiting for the model to answer.
+
+Raise the timeout per provider when cold loads are slow on your
+machine. 120s is the tuning value that works on Windows:
+
+```json
+{"providers": [{"name": "ollama-local", "timeout": 120}]}
+```
+
+On Windows the config file lives at
+`%USERPROFILE%\.config\opencobot\gateway.json` (the default location
+`~/.config/opencobot/gateway.json` under your home directory). A longer
+timeout only waits longer — it does not retry a failed call, and it
+does not raise the 60s ceiling on the `run_command` tool, which is a
+separate limit.
+
 ## Read-only mode
 
 The daemon can run in read-only mode: the agent may observe and explain

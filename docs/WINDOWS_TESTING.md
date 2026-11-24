@@ -18,13 +18,18 @@ policy.
 ```powershell
 git clone https://github.com/opencobot/opencobot.git
 cd opencobot
-git checkout agent/windows-adapter
+git pull
+git log --oneline -1
 py -3.12 -m venv .venv-opencobot
 .\.venv-opencobot\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 **Pass:** `pip install` finishes with no errors; `python --version`
-inside the venv reports 3.12.x.
+inside the venv reports 3.12.x; `git log --oneline -1` shows
+`f119660` or newer — everything (Windows adapter, pipe server,
+doctor fix, CI fix) is on `main` now. Do **not** check out the old
+`agent/windows-adapter` branch: it was deleted after its PR merged,
+and it predates the pipe server and doctor fixes.
 
 ## 2. Windows tests (must pass)
 
@@ -151,12 +156,6 @@ one-liner.
 **Pass:** it fails with `cannot connect to named pipe` — no
 stale pipe is left listening after the server stops.
 
-> Note on step 9 below: it still says "expected to fail" — that
-> was written when the pipe server was fail-closed (ADR-008).
-> Now that the listener exists, re-run step 9 expecting success:
-> `tool run` should complete instead of failing at the policyd
-> step. If it still fails there, paste the exact error.
-
 ## 7. Ollama + gateway ping + benchmark
 
 ```powershell
@@ -198,28 +197,29 @@ also takes a one-run `--model` override.
 the `policy boundary` check reports INFO — "unavailable on Windows
 (no os.getuid): same-user identity check skipped". `doctor` no longer
 crashes on Windows: the identity check is skipped there because
-`os.getuid` has no Windows equivalent. `policyd` is still reported
-FAIL — that is the known gap of this round (named-pipe server,
-step 6), not a setup mistake on your side — so expect exit code 1
-until policyd starts. Do not treat this as "the install is broken":
-steps 2, 4, 5 and 7 above are the real verification.
+`os.getuid` has no Windows equivalent. The `policyd` check reports
+FAIL only while `policyd` is not running — that just means it is not
+up yet, not that the install is broken: start it (step 6) and re-run
+`doctor`. Do not treat a policyd FAIL with no server running as
+"the install is broken": steps 2, 4, 5 and 7 above are the real
+verification.
 
-## 9. Live task via the CLI (expected to fail this round)
+## 9. Live task via the CLI (should succeed now)
 
 ```powershell
 .\.venv-opencobot\Scripts\python.exe -m cli.opencobot_cli tool run list_dir --args-json '{"path": "."}'
 .\.venv-opencobot\Scripts\python.exe -m cli.opencobot_cli tool run run_command --args-json '{"argv": ["Write-Output", "hello windows"]}' --approve
 ```
 
-**Expected:** both fail at the policyd step (`policyd did not
-start`) because the named-pipe server is fail-closed (step 6).
-That is the known blocker, not a setup error. **Paste the exact
-error** — it confirms the failure mode. A direct adapter-level
-`run_command` already works (step 5); the end-to-end CLI path
-needs the `ctypes` pipe listener first.
+**Pass:** both commands complete — the named-pipe server landed in
+PR #8, so the end-to-end CLI path is unblocked now. This step used
+to say "expected to fail" when the pipe server was fail-closed
+(ADR-008); that no longer applies. If either command still fails
+at the policyd step, **paste the exact error** — that is the one
+failure worth chasing. A direct adapter-level `run_command` already
+works (step 5).
 
-Until that lands, the closest live end-to-end check is the
-in-process tool call (no policyd involved):
+Extra check, no policyd involved — the in-process tool call:
 
 ```powershell
 .\.venv-opencobot\Scripts\python.exe -c "from tools.definitions import get_tool; t = get_tool('list_dir'); print(t.execute({'path': '.'}, {'workdir': '.'})['data'].keys())"
@@ -233,7 +233,7 @@ from the repo root.
 For each step: step number, PASS/FAIL, and the pasted output for
 anything unexpected — especially the `doctor` output if the
 policy-boundary check is anything other than the expected INFO skip
-(step 8), the `tool run` error (step 9), the execution-policy table (step 4),
+(step 8), the `tool run` output (step 9), the execution-policy table (step 4),
 and any full-suite failures (step 3). Also report: Windows
 version/edition, Python version, Ollama model used, and available
 RAM.

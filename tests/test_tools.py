@@ -147,6 +147,10 @@ def test_safe_resolve_allows_token_scope(ctx, tmp_path):
     assert result["data"]["content"] == "hi"
 
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="Linux adapter XDG-trash fallback; POSIX absolute "
+                           "path is drive-relative on Windows, so the trash "
+                           "destination no longer lands under state_dir")
 def test_trash_path_uses_state_dir_when_no_xdg_trash(ctx):
     dest = trash_path(ctx["state_dir"], Path("/tmp/work/file.txt"))
     assert str(dest).startswith(str(ctx["state_dir"] / "trash"))
@@ -233,6 +237,9 @@ def test_search_files_not_a_directory(ctx):
 # System / processes
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="asserts platform == 'Linux' from the Linux "
+                           "adapter's system_info")
 def test_system_info(ctx):
     result = run("system_info", {}, ctx)
     assert result["ok"] is True
@@ -244,6 +251,9 @@ def test_system_info(ctx):
     assert verify("system_info", {}, result, ctx)[0] is True
 
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="asserts cmdline content; Windows list_processes "
+                           "entries (tasklist shape) carry no cmdline")
 def test_list_processes_and_verify(ctx):
     result = run("list_processes", {}, ctx)
     assert result["ok"] is True
@@ -257,6 +267,9 @@ def test_list_processes_and_verify(ctx):
     assert verify("list_processes", {"name_filter": "python"}, filtered, ctx)[0] is True
 
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="process_info reads /proc directly; there is no "
+                           "Windows implementation behind it")
 def test_process_info_self(ctx):
     result = run("process_info", {"pid": os.getpid()}, ctx)
     assert result["ok"] is True
@@ -331,6 +344,10 @@ def test_git_tools_not_a_repo(ctx):
 # Screenshot / windows (headless: honest unavailable, never fake)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="Linux display-server (DISPLAY/WAYLAND_DISPLAY) "
+                           "unavailability path; the Windows adapter reports "
+                           "a different reason")
 def test_screenshot_unavailable_headless(ctx):
     assert "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ
     result = run("screenshot", {}, ctx)
@@ -340,6 +357,9 @@ def test_screenshot_unavailable_headless(ctx):
     assert verify("screenshot", {}, result, ctx)[0] is False
 
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="Linux wmctrl/xdotool headless path; on Windows "
+                           "PowerShell lists windows, so the tool succeeds")
 def test_list_windows_unavailable_headless(ctx):
     result = run("list_windows", {}, ctx)
     assert result["ok"] is False
@@ -351,6 +371,8 @@ def test_list_windows_unavailable_headless(ctx):
 # launch_app
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="launches POSIX 'sleep'; no such binary on Windows")
 def test_launch_app_sleep_and_verify(ctx, launched_pids):
     result = run("launch_app", {"app": "sleep", "args": ["30"]}, ctx)
     assert result["ok"] is True
@@ -478,11 +500,12 @@ def test_delete_to_trash_missing(ctx):
 # ---------------------------------------------------------------------------
 
 def test_run_command_happy(ctx):
-    result = run("run_command", {"argv": ["python3", "-c", "print(1)"]}, ctx)
+    # sys.executable, not "python3": there is no python3.exe on Windows.
+    result = run("run_command", {"argv": [sys.executable, "-c", "print(1)"]}, ctx)
     assert result["ok"] is True
     assert result["data"]["returncode"] == 0
     assert result["data"]["stdout"].strip() == "1"
-    assert verify("run_command", {"argv": ["python3", "-c", "print(1)"]},
+    assert verify("run_command", {"argv": [sys.executable, "-c", "print(1)"]},
                   result, ctx)[0] is True
 
 
@@ -522,8 +545,9 @@ def test_run_command_timeout(ctx):
 
 
 def test_run_command_output_truncated(ctx):
+    # sys.executable, not "python3": there is no python3.exe on Windows.
     result = run("run_command",
-                 {"argv": ["python3", "-c", "print('x' * 200000)"]}, ctx)
+                 {"argv": [sys.executable, "-c", "print('x' * 200000)"]}, ctx)
     assert result["ok"] is True
     assert len(result["data"]["stdout"]) <= 64 * 1024
     assert result["data"]["truncated"] is True
