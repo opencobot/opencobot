@@ -151,6 +151,10 @@ def _verify(name, args, result, ctx):
 # Dispatch
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="Linux dispatch branch only applies on Linux; "
+                           "see test_dispatch_returns_windows_adapter_on_"
+                           "windows for the Windows branch")
 def test_dispatch_returns_linux_adapter_on_linux():
     assert definitions._os_adapter() is linux_adapter
     assert definitions._is_windows() is False

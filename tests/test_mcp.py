@@ -5,9 +5,10 @@ tmp state dir. No network.
 """
 
 import json
-import select
+import queue
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -23,13 +24,30 @@ class MCPClient:
             cwd=REPO_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         self._next_id = 1
+        # Portable stdout reader: select.select() only works on sockets
+        # on Windows, not on pipe fds (WinError 10038). A daemon thread
+        # pumps lines into a queue; _readline() waits on the queue with
+        # the same timeout semantics as the old select() call.
+        self._lines: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(target=self._pump_stdout,
+                                        daemon=True)
+        self._reader.start()
+
+    def _pump_stdout(self):
+        try:
+            for line in self.proc.stdout:
+                self._lines.put(line)
+        except ValueError:
+            pass  # stdout closed while reading
+        finally:
+            self._lines.put(None)  # sentinel: EOF
 
     def _readline(self, timeout=10.0):
-        ready, _w, _x = select.select([self.proc.stdout], [], [], timeout)
-        if not ready:
+        try:
+            line = self._lines.get(timeout=timeout)
+        except queue.Empty:
             raise TimeoutError("no MCP response within timeout")
-        line = self.proc.stdout.readline()
-        if not line:
+        if line is None:
             raise EOFError("MCP server closed stdout")
         return json.loads(line)
 

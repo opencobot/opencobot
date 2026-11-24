@@ -7,18 +7,31 @@ of the entry without the ``hash`` field. Any later edit to any line
 breaks the chain and :meth:`AuditLog.verify` reports it.
 
 Appends are multi-process safe: the file is opened in append mode and an
-exclusive ``fcntl`` lock is held while the next sequence number and
-previous hash are read and the new line is written.
+exclusive lock is held while the next sequence number and previous hash
+are read and the new line is written. On POSIX that lock is
+``fcntl.flock``; on Windows (which has no ``fcntl``) it is
+``msvcrt.locking`` on the first byte — see :func:`_exclusive_lock`.
 """
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; see _exclusive_lock.
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # POSIX has no msvcrt; see _exclusive_lock.
+    msvcrt = None
 
 GENESIS_PREV_HASH = "0" * 64
 
@@ -68,6 +81,64 @@ def _entry_hash(entry_without_hash: dict) -> str:
     ).hexdigest()
 
 
+# Process-local fallback lock, used only when neither fcntl nor msvcrt
+# is importable. It serialises threads inside this process only.
+_fallback_thread_lock = threading.Lock()
+
+
+@contextmanager
+def _exclusive_lock(f):
+    """Hold an exclusive, cross-process lock on open file ``f``.
+
+    Locking choice (BUG-1: ``fcntl`` does not exist on Windows, so the
+    old unconditional ``import fcntl`` broke the whole ``policy``
+    package there):
+
+    - POSIX (``fcntl`` available): ``fcntl.flock(LOCK_EX)`` — the
+      original behaviour, unchanged. Whole-file, blocking, released
+      with ``LOCK_UN``.
+    - Windows (``msvcrt`` available): ``msvcrt.locking(fd, LK_LOCK, 1)``
+      on byte 0 — the closest stdlib equivalent to ``flock``. It is a
+      blocking, cross-process byte-range lock: ``LK_LOCK`` waits until
+      the range is free, and the locked range may extend beyond EOF,
+      so it works on an empty audit log. The same 1-byte range at the
+      same offset is locked and unlocked by every cooperating process,
+      and the read-seq/write critical section runs inside it, exactly
+      as with ``flock``.
+    - Neither available: a process-local ``threading.Lock``. This only
+      serialises threads in this process — concurrent *processes*
+      could interleave appends and break the hash chain. It exists so
+      the audit log still works rather than crashing the package on
+      an exotic platform; in practice Windows always has ``msvcrt``
+      and POSIX always has ``fcntl``, so this path should not be hit.
+
+    Limits shared by both real locks: they are advisory/cooperative —
+    a process that opens the file without locking can still write.
+    ``msvcrt.locking`` additionally locks a byte range, not the whole
+    file, so only the reserved byte 0 is protected; that is enough
+    here because every append locks that same byte before touching
+    the file. The hash chain, entry format and file format are
+    identical on every platform.
+    """
+    if fcntl is not None:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        with _fallback_thread_lock:
+            yield
+
+
 class AuditLog:
     """Hash-chained JSON-lines audit log."""
 
@@ -84,8 +155,7 @@ class AuditLog:
                 os.chmod(self.path, PRIVATE_FILE_MODE)
             except OSError:
                 pass
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
+            with _exclusive_lock(f):
                 f.seek(0)
                 lines = [line for line in f.read().splitlines() if line.strip()]
                 entries = [json.loads(line) for line in lines]
@@ -106,8 +176,6 @@ class AuditLog:
                 f.flush()
                 os.fsync(f.fileno())
                 return entry
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
 
     def read_all(self) -> list[dict]:
         """Return every entry in order; ``[]`` when the log does not exist."""

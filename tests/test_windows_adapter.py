@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
+import sys
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -308,10 +309,20 @@ def test_system_info_falls_back_when_wmic_missing():
         raise FileNotFoundError("wmic not found")
 
     info = system_info(runner=failing_runner)
-    assert info["windows_version"] is None
-    assert info["windows_build"] is None
+    # wmic is the sole source of edition and RAM: both stay None.
     assert info["windows_edition"] is None
     assert info["memory_total_bytes"] is None
+    # Version/build come FIRST from sys.getwindowsversion() (wmic only
+    # overrides them), so on a real Windows host they survive a missing
+    # wmic; on a non-Windows host there is no such source and both are
+    # None.
+    if hasattr(sys, "getwindowsversion"):
+        ver = sys.getwindowsversion()
+        assert info["windows_version"] == f"{ver.major}.{ver.minor}"
+        assert info["windows_build"] == str(ver.build)
+    else:
+        assert info["windows_version"] is None
+        assert info["windows_build"] is None
     assert info["platform"]  # platform keys still present, no crash
 
 
