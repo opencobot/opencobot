@@ -23,6 +23,7 @@ from core.model_gateway import (  # noqa: E402
     ProviderConfig,
 )
 from core.usage import UsageStore  # noqa: E402
+from tests._cli_fakes import write_cli_fake  # noqa: E402
 
 
 def local_config(name="ollama-local"):
@@ -48,11 +49,6 @@ def gateway_with(calls, configs=None, **kwargs):
     return Gateway(configs=configs, transport=recording_transport(calls), **kwargs)
 
 
-def write_script(bin_dir: Path, name: str, body: str) -> Path:
-    path = bin_dir / name
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
 
 
 @pytest.fixture
@@ -226,8 +222,8 @@ def test_escalate_unknown_reason_still_works_but_empty_rejected():
 def test_secret_never_reaches_cloud_backed_cli(bin_dir, tmp_path, monkeypatch):
     marker = tmp_path / "q-called"
     monkeypatch.setenv("Q_MARKER", str(marker))
-    write_script(bin_dir, "q", 'touch "$Q_MARKER"\necho q-reply\n')
-    write_script(bin_dir, "opencode", 'printf "local-cli-reply\\n"\n')
+    write_cli_fake(bin_dir, "q", 'touch "$Q_MARKER"\necho q-reply\n', "type nul > \"%Q_MARKER%\"\n@echo q-reply\n")
+    write_cli_fake(bin_dir, "opencode", 'printf "local-cli-reply\\n"\n', "@echo local-cli-reply\n")
     q_cfg = builtin_cli_config("q")
     local_cli = builtin_cli_config("opencode")
     calls = []
@@ -268,7 +264,7 @@ def test_personal_may_use_cloud_when_role_assigned():
 
 
 def test_local_cli_allowed_for_secret_but_cloud_cli_blocked(bin_dir):
-    write_script(bin_dir, "opencode", 'printf "local-ok\\n"\n')
+    write_cli_fake(bin_dir, "opencode", 'printf "local-ok\\n"\n', "@echo local-ok\n")
     local_cli = builtin_cli_config("opencode")
     q_cfg = builtin_cli_config("q")
     gw = Gateway(configs=[q_cfg, local_cli])
@@ -396,7 +392,7 @@ def test_gateway_with_usage_store_enforces_persisted_budget(tmp_path):
 # ---------------------------------------------------------------- CLI via gateway
 
 def test_complete_with_fake_opencode_cli(bin_dir):
-    write_script(bin_dir, "opencode", 'printf "cli-says: %s\\n" "$*"\n')
+    write_cli_fake(bin_dir, "opencode", 'printf "cli-says: %s\\n" "$*"\n', "@echo cli-says: %ARGS%\n")
     gw = Gateway(configs=[builtin_cli_config("opencode")])
     out = gw.complete("EXECUTOR", "list files", "public")
     assert out["text"] == "cli-says: run list files"

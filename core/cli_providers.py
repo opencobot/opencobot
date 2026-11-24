@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -239,6 +240,17 @@ def builtin_cli_config(name: str, **overrides) -> "ProviderConfig":
     )
 
 
+# Windows only: a CLI installed via npm (or a test fake) is a .bat/.cmd
+# file, not a PE executable, and CreateProcess cannot run it directly
+# (WinError 193). It must go through cmd.exe /c -- see
+# _windows_batch_argv. Real CLIs installed as .exe need no wrapping.
+_WINDOWS_BATCH_SUFFIXES = (".bat", ".cmd")
+
+# Suffixes a Windows executable file may carry; the allowlist is about
+# the binary's stem (see _resolve_binary).
+_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".bat", ".cmd", ".com")
+
+
 def _resolve_binary(binary: str, bin_dirs: tuple[str, ...] | None = None) -> str:
     """Resolve ``binary`` against the allowlist; return an executable path.
 
@@ -252,6 +264,12 @@ def _resolve_binary(binary: str, bin_dirs: tuple[str, ...] | None = None) -> str
     if not binary or not isinstance(binary, str):
         raise CliProviderError("CLI provider has no binary configured")
     name = Path(binary).name
+    if sys.platform == "win32":
+        # Windows executables carry an extension (.exe/.bat/.cmd):
+        # the allowlist is about the binary's stem, and shutil.which
+        # finds the file via PATHEXT. (On POSIX the name is used as-is.)
+        if Path(binary).suffix.lower() in _WINDOWS_EXECUTABLE_SUFFIXES:
+            name = Path(binary).stem
     if name not in ALLOWED_BINARIES:
         raise CliProviderError(
             f"CLI binary {binary!r} is not in the allowlist "
@@ -272,6 +290,49 @@ def _resolve_binary(binary: str, bin_dirs: tuple[str, ...] | None = None) -> str
     return found
 
 
+def _comspec() -> str:
+    """cmd.exe for running .bat/.cmd CLI providers on Windows.
+
+    Read from the parent process environment (the daemon's own env),
+    never the scrubbed child env; falls back to the System32 path.
+    """
+    comspec = os.environ.get("COMSPEC")
+    if comspec:
+        return comspec
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    return str(Path(system_root) / "System32" / "cmd.exe")
+
+
+def _batch_command_line(argv: list[str]) -> str:
+    """Build the single /c command string for a .bat/.cmd provider.
+
+    cmd.exe parses the /c string itself, so every element is
+    double-quoted and the whole command is wrapped in an extra pair of
+    quotes -- the documented cmd.exe form for a quoted program with
+    quoted arguments (cmd strips the first and last quote). Inside
+    double quotes, cmd metacharacters (& | < > ^) are literal, so a
+    model-influenced prompt cannot inject a second command. Two hard
+    limits, refused loudly instead of worked around: an element
+    containing a double quote cannot be quoted safely for cmd.exe
+    (there is no escape for " inside a quoted cmd string), and neither
+    can a line break. %VAR% can still expand inside the quotes, but
+    the child environment is scrubbed (R-010: no secrets), so expansion
+    can only reveal non-secret values to the CLI itself.
+    """
+    for elem in argv:
+        if '"' in elem or "\r" in elem or "\n" in elem:
+            raise CliProviderError(
+                "CLI provider argument cannot be passed to a .bat/.cmd "
+                "binary on Windows: it contains a double quote or line "
+                "break (use cli_prompt_via stdin/file for such prompts)")
+    return '"' + ' '.join(f'"{elem}"' for elem in argv) + '"'
+
+
+def _windows_batch_argv(argv: list[str]) -> list[str]:
+    """Wrap a resolved .bat/.cmd provider argv for cmd.exe /c (Windows)."""
+    return [_comspec(), "/c", _batch_command_line(argv)]
+
+
 def _build_argv(
     config: "ProviderConfig", prompt: str, bin_dirs: tuple[str, ...] | None = None
 ) -> tuple[list[str], str | None]:
@@ -288,6 +349,7 @@ def _build_argv(
     via = config.cli_prompt_via or "arg"
     if via not in ("stdin", "arg", "file"):
         raise CliProviderError(f"unsupported cli_prompt_via: {via!r}")
+    temp_path: str | None = None
     if via == "file":
         fd, temp_path = tempfile.mkstemp(prefix="opencobot-prompt-", suffix=".txt")
         try:
@@ -295,13 +357,18 @@ def _build_argv(
         finally:
             os.close(fd)
         argv = [binary] + [item.replace("{prompt}", temp_path) for item in template]
-        return argv, temp_path
-    if via == "arg":
+    elif via == "arg":
         argv = [binary] + [item.replace("{prompt}", prompt) for item in template]
-        return argv, None
-    # stdin: prompt never appears in argv, even if the template names it.
-    argv = [binary] + [item for item in template if "{prompt}" not in item]
-    return argv, None
+    else:
+        # stdin: prompt never appears in argv, even if the template names it.
+        argv = [binary] + [item for item in template if "{prompt}" not in item]
+    if (sys.platform == "win32" and argv
+            and Path(argv[0]).suffix.lower() in _WINDOWS_BATCH_SUFFIXES):
+        # A .bat/.cmd file is not a PE executable: CreateProcess cannot
+        # run it directly (WinError 193). It goes through cmd.exe /c
+        # with the safe quoting of _batch_command_line.
+        argv = _windows_batch_argv(argv)
+    return argv, temp_path
 
 
 def _extract_output(config: "ProviderConfig", stdout: str) -> str:

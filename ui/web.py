@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import secrets
 import sys
 import threading
@@ -59,17 +60,132 @@ MAX_AUDIT_LIMIT = 200
 
 # R-013: browser session cookie. HttpOnly so page scripts cannot read
 # it, SameSite=Lax so it is not sent on cross-site requests, Path=/
-# so it covers the whole UI. No Secure flag: the UI serves plain HTTP
-# on loopback only, where Secure would stop the cookie being set at
-# all; the token never leaves this machine either way. Sessions live
-# in server memory only (never on disk) and expire after 12h of
-# inactivity (sliding).
+# so it covers the whole UI. No Secure flag -- deliberately, and
+# re-checked 2026-11-24 (Phase 2 follow-ups): the UI serves plain HTTP
+# on loopback only, and a Secure cookie is stored but NOT sent back
+# over plain http://127.0.0.1 by both the stdlib http.cookiejar and
+# httpx (login round-trip breaks with 401), so adding Secure would
+# break login for every script/API client that keeps cookies in a jar.
+# Browsers do treat localhost as a secure context and would accept it,
+# but the gain on loopback is nil -- loopback traffic never leaves
+# this machine, and a local attacker who could sniff it could already
+# read daemon.auth from the state dir. Sessions are persisted in the
+# state dir (see SessionStore) and expire after 12h of inactivity
+# (sliding).
 SESSION_COOKIE = "opencobot_session"
 SESSION_MAX_AGE = 12 * 60 * 60
+
+#: Session store file inside the state dir (see SessionStore).
+SESSIONS_FILE = "sessions.json"
 
 
 class BenchmarkUnavailable(Exception):
     """core.benchmark (Phase 2, Worker B) is not installed yet."""
+
+
+class SessionStore:
+    """Server-side web UI sessions, persisted in the state dir.
+
+    Sessions survive a daemon/UI restart: ``{session_id: expiry}`` is
+    stored as JSON in ``<state-dir>/sessions.json``, written atomically
+    (temp file + ``os.replace``) with 0600 permissions -- the same
+    discipline as ``policyd.auth``/``daemon.auth``, because a session
+    id is as sensitive as the daemon token. Persisting sessions does
+    not widen the trust boundary: anyone who can read the state dir
+    already owns the daemon token itself. A single server normally
+    owns the file; concurrent writers are last-writer-wins.
+    A missing file means no sessions. A corrupt or tampered file is
+    ignored (fail closed, start empty) and never crashes the server;
+    expired sessions are pruned on load. Expiry is still enforced
+    (sliding 12h window) and logout still invalidates.
+    """
+
+    def __init__(self, state_dir: str | Path):
+        self.path = Path(state_dir) / SESSIONS_FILE
+        self._lock = threading.Lock()
+        self._sessions: dict[str, float] = self._load()
+
+    def _load(self) -> dict[str, float]:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        now = time.time()
+        sessions: dict[str, float] = {}
+        for session_id, expiry in data.items():
+            if (isinstance(session_id, str)
+                    and isinstance(expiry, (int, float))
+                    and not isinstance(expiry, bool)
+                    and expiry > now):
+                sessions[session_id] = float(expiry)
+        # Tighten the file if it was created with wider permissions.
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        return sessions
+
+    def _save_locked(self) -> None:
+        """Write the store atomically (0600); never raise.
+
+        A failed write only loses restart-survival for this process
+        lifetime -- the session stays valid in memory -- so the server
+        never crashes over a session file write.
+        """
+        tmp_path = None
+        try:
+            tmp_path = self.path.with_name(
+                f"{SESSIONS_FILE}.tmp-{os.getpid()}-{threading.get_ident()}")
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(self._sessions).encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, self.path)
+        except OSError:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def mint(self) -> str:
+        """Create a session id, valid for SESSION_MAX_AGE, and persist it."""
+        session_id = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions[session_id] = time.time() + SESSION_MAX_AGE
+            self._save_locked()
+        return session_id
+
+    def touch(self, session_id: str) -> bool:
+        """True when the session exists and is live.
+
+        A live session gets its expiry refreshed (sliding window) and
+        the refresh is persisted. An expired or unknown id returns
+        False and is dropped.
+        """
+        now = time.time()
+        with self._lock:
+            expiry = self._sessions.get(session_id)
+            if expiry is None or expiry <= now:
+                if self._sessions.pop(session_id, None) is not None:
+                    self._save_locked()
+                return False
+            self._sessions[session_id] = now + SESSION_MAX_AGE
+            self._save_locked()
+            return True
+
+    def invalidate(self, session_id: str) -> None:
+        """Drop a session (logout); persists the removal."""
+        with self._lock:
+            if self._sessions.pop(session_id, None) is not None:
+                self._save_locked()
 
 
 def validate_host(host: str) -> str:
@@ -294,8 +410,7 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     backend: WebUIBackend  # set by create_server
     auth_token: str  # set by create_server
-    sessions: dict[str, float]  # session id -> expiry epoch; set by create_server
-    sessions_lock: threading.Lock  # set by create_server
+    session_store: SessionStore  # set by create_server
 
     # -- plumbing ------------------------------------------------------
     def log_message(self, *args):  # keep test/server output quiet
@@ -325,10 +440,7 @@ class _Handler(BaseHTTPRequestHandler):
     # -- R-013 session auth ---------------------------------------------
     def _new_session(self) -> str:
         """Mint a random session id, valid for SESSION_MAX_AGE."""
-        session_id = secrets.token_urlsafe(32)
-        with self.sessions_lock:
-            self.sessions[session_id] = time.time() + SESSION_MAX_AGE
-        return session_id
+        return self.session_store.mint()
 
     def _session_cookie_header(self, session_id: str) -> tuple[str, str]:
         return ("Set-Cookie",
@@ -343,7 +455,7 @@ class _Handler(BaseHTTPRequestHandler):
         """True when the request carries a live session cookie.
 
         Expired sessions are dropped; a valid one gets its expiry
-        refreshed (sliding 12h window).
+        refreshed (sliding 12h window) and the refresh is persisted.
         """
         raw = self.headers.get("Cookie") or ""
         try:
@@ -354,14 +466,7 @@ class _Handler(BaseHTTPRequestHandler):
         morsel = cookie.get(SESSION_COOKIE)
         if morsel is None or not morsel.value:
             return False
-        now = time.time()
-        with self.sessions_lock:
-            expiry = self.sessions.get(morsel.value)
-            if expiry is None or expiry <= now:
-                self.sessions.pop(morsel.value, None)
-                return False
-            self.sessions[morsel.value] = now + SESSION_MAX_AGE
-        return True
+        return self.session_store.touch(morsel.value)
 
     def _invalidate_session(self) -> None:
         raw = self.headers.get("Cookie") or ""
@@ -372,8 +477,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         morsel = cookie.get(SESSION_COOKIE)
         if morsel is not None and morsel.value:
-            with self.sessions_lock:
-                self.sessions.pop(morsel.value, None)
+            self.session_store.invalidate(morsel.value)
 
     def _header_token_matches(self) -> bool:
         """True when a Bearer / X-OpenCobot-Auth header carries the token.
@@ -715,8 +819,7 @@ def create_server(
 
     Handler.backend = WebUIBackend(state_dir)
     Handler.auth_token = token
-    Handler.sessions = {}
-    Handler.sessions_lock = threading.Lock()
+    Handler.session_store = SessionStore(state_dir)
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     return server

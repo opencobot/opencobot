@@ -16,17 +16,18 @@ from core.cli_providers import (  # noqa: E402
     ALLOWED_BINARIES,
     BUILTIN_CLI_PROVIDERS,
     CliProviderError,
+    _batch_command_line,
+    _build_argv,
+    _comspec,
+    _resolve_binary,
+    _windows_batch_argv,
     builtin_cli_config,
     run_cli_provider,
 )
 from core.model_gateway import ProviderConfig  # noqa: E402
+from tests._cli_fakes import write_cli_fake  # noqa: E402
 
 
-def write_script(bin_dir: Path, name: str, body: str) -> Path:
-    path = bin_dir / name
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
 
 
 @pytest.fixture
@@ -58,32 +59,32 @@ def cli_config(name="opencode", **overrides):
 # ---------------------------------------------------------------- happy paths
 
 def test_opencode_fake_script_arg_mode(bin_dir):
-    write_script(bin_dir, "opencode", 'printf "opencode-reply: %s\\n" "$*"\n')
+    write_cli_fake(bin_dir, "opencode", 'printf "opencode-reply: %s\\n" "$*"\n', "@echo opencode-reply: %ARGS%\n")
     out = run_cli_provider(cli_config(), "hello world")
     assert out == "opencode-reply: hello world"
 
 
 def test_gpt_fake_script_stdin_mode(bin_dir):
-    write_script(bin_dir, "gpt", 'printf "stdin:"; cat; printf "\\n"\n')
+    write_cli_fake(bin_dir, "gpt", 'printf "stdin:"; cat; printf "\\n"\n', '<nul set /p="stdin:"\nset /p _in=\necho(%_in%\n')
     cfg = cli_config("gpt", cli_prompt_via="stdin")
     out = run_cli_provider(cfg, "read me from stdin")
     assert out == "stdin:read me from stdin"
 
 
 def test_q_fake_script_json_field_output(bin_dir):
-    write_script(bin_dir, "q", 'printf "{\\"text\\": \\"q-json-reply\\"}\\n"\n')
+    write_cli_fake(bin_dir, "q", 'printf "{\\"text\\": \\"q-json-reply\\"}\\n"\n', '@echo {"text": "q-json-reply"}\n')
     cfg = cli_config("q", cli_output="json-field", cli_output_field="text")
     assert run_cli_provider(cfg, "anything") == "q-json-reply"
 
 
 def test_prompt_via_file(bin_dir):
-    write_script(bin_dir, "opencode", 'cat "$@"\n')
+    write_cli_fake(bin_dir, "opencode", 'cat "$@"\n', '@type "%1"\n')
     cfg = cli_config(cli_prompt_via="file")
     assert run_cli_provider(cfg, "prompt from file") == "prompt from file"
 
 
 def test_custom_cli_template(bin_dir):
-    write_script(bin_dir, "custom-cli", 'printf "custom:%s\\n" "$*"\n')
+    write_cli_fake(bin_dir, "custom-cli", 'printf "custom:%s\\n" "$*"\n', "@echo custom:%ARGS%\n")
     cfg = cli_config(
         "custom-cli",
         cli_argv_template=["answer", "--mode", "fast", "{prompt}"],
@@ -93,7 +94,7 @@ def test_custom_cli_template(bin_dir):
 
 def test_stdin_prompt_never_appears_in_argv(bin_dir):
     # The script echoes its argv; the prompt must not be among them.
-    write_script(bin_dir, "gpt", 'printf "argv:%s\\n" "$*"\n')
+    write_cli_fake(bin_dir, "gpt", 'printf "argv:%s\\n" "$*"\n', "@echo argv:%ARGS%\n")
     cfg = cli_config("gpt", cli_prompt_via="stdin",
                      cli_argv_template=["run"])
     out = run_cli_provider(cfg, "top-secret-prompt")
@@ -104,33 +105,33 @@ def test_stdin_prompt_never_appears_in_argv(bin_dir):
 # ---------------------------------------------------------------- failures
 
 def test_timeout_raises(bin_dir):
-    write_script(bin_dir, "opencode", "sleep 10\n")
+    write_cli_fake(bin_dir, "opencode", "sleep 10\n", "for /l %%i in (1,1,20000000) do rem\n")
     with pytest.raises(CliProviderError, match="timed out"):
         run_cli_provider(cli_config(), "hi", timeout=1)
 
 
 def test_nonzero_exit_raises_with_stderr(bin_dir):
-    write_script(bin_dir, "opencode", 'echo "boom stderr" >&2\nexit 3\n')
+    write_cli_fake(bin_dir, "opencode", 'echo "boom stderr" >&2\nexit 3\n', "@echo boom stderr 1>&2\n@exit /b 3\n")
     with pytest.raises(CliProviderError, match="exited with code 3"):
         run_cli_provider(cli_config(), "hi")
 
 
 def test_bad_json_raises(bin_dir):
-    write_script(bin_dir, "q", 'echo "not json{"\n')
+    write_cli_fake(bin_dir, "q", 'echo "not json{"\n', "@echo not json{\n")
     cfg = cli_config("q", cli_output="json-field")
     with pytest.raises(CliProviderError, match="invalid JSON"):
         run_cli_provider(cfg, "hi")
 
 
 def test_json_missing_text_field_raises(bin_dir):
-    write_script(bin_dir, "q", 'printf "{\\"other\\": 1}\\n"\n')
+    write_cli_fake(bin_dir, "q", 'printf "{\\"other\\": 1}\\n"\n', '@echo {"other": 1}\n')
     cfg = cli_config("q", cli_output="json-field")
     with pytest.raises(CliProviderError, match="no text field"):
         run_cli_provider(cfg, "hi")
 
 
 def test_empty_output_raises(bin_dir):
-    write_script(bin_dir, "opencode", "true\n")
+    write_cli_fake(bin_dir, "opencode", "true\n", "@rem\n")
     with pytest.raises(CliProviderError, match="empty output"):
         run_cli_provider(cli_config(), "hi")
 
@@ -144,7 +145,7 @@ def test_non_cli_kind_rejected(bin_dir):
 # ---------------------------------------------------------------- safety
 
 def test_shell_metacharacters_treated_as_data(bin_dir, tmp_path):
-    write_script(bin_dir, "opencode", 'printf "got:%s\\n" "$*"\n')
+    write_cli_fake(bin_dir, "opencode", 'printf "got:%s\\n" "$*"\n', "@echo got:%ARGS%\n")
     marker = tmp_path / "pwned"
     prompt = f"$(touch {marker}); `touch {marker}.2`; hello"
     out = run_cli_provider(cli_config(), prompt)
@@ -154,7 +155,7 @@ def test_shell_metacharacters_treated_as_data(bin_dir, tmp_path):
 
 
 def test_binary_not_in_allowlist_rejected(bin_dir):
-    write_script(bin_dir, "evil-bin", 'echo hi\n')
+    write_cli_fake(bin_dir, "evil-bin", 'echo hi\n', "@echo hi\n")
     cfg = cli_config("evil-bin", cli_binary="evil-bin")
     with pytest.raises(CliProviderError, match="not in the allowlist"):
         run_cli_provider(cfg, "hi")
@@ -170,13 +171,13 @@ def test_binary_not_in_pinned_dirs_raises(monkeypatch):
 
 
 def test_absolute_path_binary_with_allowlisted_basename(bin_dir, tmp_path):
-    script = write_script(bin_dir, "opencode", 'printf "abs:%s\\n" "$*"\n')
+    script = write_cli_fake(bin_dir, "opencode", 'printf "abs:%s\\n" "$*"\n', "@echo abs:%ARGS%\n")
     cfg = cli_config(cli_binary=str(script))
     assert run_cli_provider(cfg, "hi") == "abs:hi"
 
 
 def test_absolute_path_binary_with_other_basename_rejected(bin_dir):
-    script = write_script(bin_dir, "not-allowed", 'echo hi\n')
+    script = write_cli_fake(bin_dir, "not-allowed", 'echo hi\n', "@echo hi\n")
     cfg = cli_config(cli_binary=str(script))
     with pytest.raises(CliProviderError, match="not in the allowlist"):
         run_cli_provider(cfg, "hi")
@@ -210,3 +211,142 @@ def test_builtin_cli_config_overrides():
                              cli_argv_template=["run", "--model", "x", "{prompt}"])
     assert cfg.cost_per_call == 0.01
     assert cfg.cli_argv_template == ["run", "--model", "x", "{prompt}"]
+
+
+# ---------------------------------------------------------------- Windows .bat/.cmd
+# These tests run on Linux too: sys.platform is patched to "win32" so
+# the Windows branches of _resolve_binary / _build_argv execute, and
+# shutil.which honours PATHEXT (its separator is os.pathsep, so the
+# test builds PATHEXT with os.pathsep.join -- ":" here, ";" on real
+# Windows). Nothing here executes a .bat file or cmd.exe, so nothing
+# can hang on a platform without them.
+
+def test_windows_batch_command_line_quotes_every_element():
+    # Every element double-quoted, whole command wrapped in an extra
+    # pair of quotes -- the documented cmd.exe /c form (cmd strips
+    # the first and last quote).
+    script = "/tmp/fake-bin/opencode.bat"
+    line = _batch_command_line([script, "hello world", "--flag"])
+    assert line == '"' + f'"{script}" "hello world" "--flag"' + '"'
+
+
+def test_windows_batch_command_line_single_element():
+    assert _batch_command_line(["opencode.bat"]) == '""opencode.bat""'
+
+
+def test_windows_batch_command_line_refuses_double_quote():
+    # There is no escape for " inside a quoted cmd string: refuse
+    # loudly instead of building a breakable command line.
+    with pytest.raises(CliProviderError, match="double quote or line"):
+        _batch_command_line(["opencode.bat", 'say "hi"'])
+
+
+@pytest.mark.parametrize("bad", ["a" + chr(10) + "b", "a" + chr(13) + "b"])
+def test_windows_batch_command_line_refuses_line_breaks(bad):
+    with pytest.raises(CliProviderError, match="double quote or line"):
+        _batch_command_line(["opencode.bat", bad])
+
+
+def test_windows_batch_command_line_metacharacters_are_literal():
+    # Inside double quotes, cmd metacharacters are literal data, so a
+    # model-influenced prompt cannot inject a second command.
+    line = _batch_command_line(["opencode.bat", "a & b | c > d"])
+    assert line == '""opencode.bat" "a & b | c > d""'
+
+
+def test_windows_comspec_env_and_fallback(monkeypatch):
+    monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
+    assert _comspec() == "/fake/cmd.exe"
+    monkeypatch.delenv("COMSPEC")
+    monkeypatch.setenv("SystemRoot", "/fake-root")
+    result = _comspec()
+    assert result.endswith("cmd.exe")
+    assert "System32" in result
+
+
+def test_windows_batch_argv_wraps_with_comspec(monkeypatch):
+    monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
+    argv = _windows_batch_argv(["opencode.bat", "hi"])
+    assert argv == ["/fake/cmd.exe", "/c", '""opencode.bat" "hi""']
+
+
+def test_write_cli_fake_writes_bat_on_win32(bin_dir, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
+    assert script == bin_dir / "opencode.bat"
+    assert script.exists()
+    assert not (bin_dir / "opencode").exists()
+    text = script.read_text(encoding="utf-8")
+    assert text.startswith("@echo off")
+    assert "@echo hi" in text
+
+
+def test_write_cli_fake_writes_sh_on_posix(bin_dir):
+    script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
+    assert script == bin_dir / "opencode"
+    assert script.exists()
+    assert not (bin_dir / "opencode.bat").exists()
+    text = script.read_text(encoding="utf-8")
+    assert text.startswith("#!/bin/sh")
+    assert "echo hi" in text
+
+
+def test_windows_bat_stem_allowlist(bin_dir, monkeypatch):
+    # On Windows the allowlist is about the binary's STEM: a .bat/.cmd
+    # name is allowlisted iff its stem is, and a non-executable suffix
+    # is not stripped at all. Both rejections happen before any
+    # shutil.which call, so this runs on Linux too (platform patched).
+    monkeypatch.setattr(sys, "platform", "win32")
+    with pytest.raises(CliProviderError, match="not in the allowlist"):
+        _resolve_binary("evil-bin.bat")
+    with pytest.raises(CliProviderError, match="not in the allowlist"):
+        _resolve_binary("opencode.txt")
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="shutil.which PATHEXT needs real Windows: "
+                    "its win32 branch calls _winapi, which is None on "
+                    "POSIX even with sys.platform patched")
+def test_windows_resolve_bare_name_finds_bat_via_pathext(bin_dir, monkeypatch):
+    # A bare name resolves to the .bat twin via PATHEXT, still only
+    # against the pinned dirs (R-012) -- never the ambient PATH.
+    # Runs on the Windows laptop; skipped (not failed) on Linux CI.
+    monkeypatch.setenv("PATHEXT",
+                       os.pathsep.join([".COM", ".EXE", ".BAT", ".CMD"]))
+    write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
+    assert _resolve_binary("opencode") == str(bin_dir / "opencode.bat")
+    # The extension itself is fine too: the allowlist is about the stem.
+    assert _resolve_binary("opencode.bat") == str(bin_dir / "opencode.bat")
+
+
+def test_windows_resolve_absolute_bat_path(bin_dir, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
+    assert _resolve_binary(str(script)) == str(script)
+    with pytest.raises(CliProviderError, match="not in the allowlist"):
+        _resolve_binary(str(bin_dir / "not-allowed.bat"))
+
+
+def test_windows_build_argv_wraps_bat_through_cmd(bin_dir, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
+    script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
+    argv, temp_path = _build_argv(cli_config(cli_binary=str(script)),
+                                  "hello world")
+    assert temp_path is None
+    assert argv[0] == "/fake/cmd.exe"
+    assert argv[1] == "/c"
+    assert argv[2] == '"' + f'"{script}" "hello world"' + '"'
+
+
+def test_windows_build_argv_leaves_exe_unwrapped(bin_dir, monkeypatch):
+    # A real PE executable needs no cmd.exe wrapping.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
+    exe = bin_dir / "opencode.exe"
+    exe.write_text("fake", encoding="utf-8")
+    exe.chmod(0o755)
+    argv, temp_path = _build_argv(cli_config(cli_binary=str(exe)),
+                                  "hello world")
+    assert temp_path is None
+    assert argv == [str(exe), "hello world"]

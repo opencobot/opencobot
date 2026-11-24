@@ -232,8 +232,36 @@ GATEWAY_CONFIG_ENV = "OPENCOBOT_GATEWAY_CONFIG"
 DEFAULT_GATEWAY_CONFIG_PATH = Path.home() / ".config" / "opencobot" / "gateway.json"
 
 #: Provider fields a config file may override on an existing provider.
+#: ``cli_binary_dirs`` is handled separately (see
+#: :func:`_validated_cli_binary_dirs`) because it needs validation.
 _CONFIG_OVERRIDABLE = ("model", "base_url", "timeout", "api_key_env",
                        "cost_per_call", "daily_budget", "monthly_budget")
+
+
+def _validated_cli_binary_dirs(entry: dict, config_path: Path) -> list[str] | None:
+    """Validate a gateway.json ``cli_binary_dirs`` value (R-012).
+
+    Returns the list when the entry declares it, None otherwise. The
+    value must be a list of existing directories -- a string, a list
+    with a non-string, or a non-existent directory fails loudly, so a
+    typo does not silently leave the provider unresolvable. (Bare
+    binary names resolved from these dirs still need an allowlisted
+    basename -- see ``core.cli_providers._resolve_binary``.)
+    """
+    if "cli_binary_dirs" not in entry:
+        return None
+    dirs = entry["cli_binary_dirs"]
+    name = entry.get("name")
+    if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
+        raise ValueError(
+            f"gateway config {config_path}: 'cli_binary_dirs' for provider "
+            f"{name!r} must be a list of directory paths")
+    missing = [d for d in dirs if not Path(d).is_dir()]
+    if missing:
+        raise ValueError(
+            f"gateway config {config_path}: 'cli_binary_dirs' for provider "
+            f"{name!r} lists non-existent directories: {missing}")
+    return dirs
 
 
 def gateway_config_path(explicit: str | None = None) -> Path | None:
@@ -264,8 +292,11 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
     provider's ``model`` / ``base_url`` (and the other fields in
     ``_CONFIG_OVERRIDABLE``). An entry with a new name and a ``kind``
     adds a provider. An unknown name without ``kind`` raises ValueError
-    so a typo fails loudly instead of being silently ignored. With no
-    config file, this is exactly ``_default_configs()``.
+    so a typo fails loudly instead of being silently ignored. A
+    ``cli_binary_dirs`` entry (a list of existing directories) may be
+    declared on any provider -- it is validated, not silently ignored
+    (see ``_validated_cli_binary_dirs``). With no config file, this is
+    exactly ``_default_configs()``.
     """
     configs = _default_configs()
     config_path = gateway_config_path(path)
@@ -290,7 +321,23 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
             for field in _CONFIG_OVERRIDABLE:
                 if field in entry:
                     setattr(config, field, entry[field])
+            dirs = _validated_cli_binary_dirs(entry, config_path)
+            if dirs is not None:
+                config.cli_binary_dirs = dirs
         elif entry.get("kind"):
+            # A file-defined CLI provider needs its binary/argv fields
+            # too: without them ``cli_binary_dirs`` would have nothing
+            # to resolve (there are no CLI providers among the defaults).
+            # The values are validated by ProviderConfig.__post_init__
+            # (unknown kind/prompt-via/output/egress fail loudly) and
+            # the binary allowlist is enforced at resolve time.
+            cli_fields: dict = {}
+            if entry["kind"] == "cli":
+                for field in ("cli_binary", "cli_argv_template",
+                              "cli_prompt_via", "cli_output",
+                              "cli_output_field", "egress"):
+                    if field in entry:
+                        cli_fields[field] = entry[field]
             configs.append(ProviderConfig(
                 name=name,
                 kind=entry["kind"],
@@ -298,6 +345,8 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
                 model=entry.get("model", ""),
                 api_key_env=entry.get("api_key_env"),
                 timeout=entry.get("timeout", 30),
+                cli_binary_dirs=_validated_cli_binary_dirs(entry, config_path),
+                **cli_fields,
             ))
         else:
             raise ValueError(

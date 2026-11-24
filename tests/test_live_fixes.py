@@ -293,3 +293,80 @@ def test_gateway_default_uses_config_file(monkeypatch, tmp_path):
         encoding="utf-8")
     monkeypatch.setenv(GATEWAY_CONFIG_ENV, str(path))
     assert Gateway().configs[0].model == "qwen2.5:0.5b"
+
+
+# --------------------------------- finding 4: cli_binary_dirs in gateway.json
+
+def test_config_file_cli_binary_dirs_for_new_cli_provider(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    path = tmp_path / "gateway.json"
+    path.write_text(json.dumps(
+        {"providers": [{"name": "opencode", "kind": "cli",
+                        "cli_binary": "opencode",
+                        "cli_argv_template": ["run", "{prompt}"],
+                        "cli_binary_dirs": [str(bin_dir)]}]}),
+        encoding="utf-8")
+    configs = load_gateway_configs(str(path))
+    added = [c for c in configs if c.name == "opencode"]
+    assert len(added) == 1
+    assert added[0].kind == "cli"
+    assert added[0].cli_binary == "opencode"
+    assert added[0].cli_binary_dirs == [str(bin_dir)]
+
+
+def test_config_file_cli_binary_dirs_overrides_existing(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    path = tmp_path / "gateway.json"
+    path.write_text(json.dumps(
+        {"providers": [{"name": "ollama-local",
+                        "cli_binary_dirs": [str(bin_dir)]}]}),
+        encoding="utf-8")
+    configs = load_gateway_configs(str(path))
+    assert configs[0].cli_binary_dirs == [str(bin_dir)]
+
+
+def test_config_file_cli_binary_dirs_must_be_a_list(tmp_path):
+    path = tmp_path / "gateway.json"
+    path.write_text(json.dumps(
+        {"providers": [{"name": "ollama-local",
+                        "cli_binary_dirs": "/tmp"}]}),
+        encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a list"):
+        load_gateway_configs(str(path))
+
+
+def test_config_file_cli_binary_dirs_must_exist(tmp_path):
+    path = tmp_path / "gateway.json"
+    path.write_text(json.dumps(
+        {"providers": [{"name": "ollama-local",
+                        "cli_binary_dirs": [str(tmp_path / "no-such-dir")]}]}),
+        encoding="utf-8")
+    with pytest.raises(ValueError, match="non-existent directories"):
+        load_gateway_configs(str(path))
+
+
+def test_config_file_cli_binary_dirs_empty_list_means_defaults(tmp_path):
+    # An empty list is valid (vacuously a list of existing dirs) and
+    # leaves resolution to the env var / built-in defaults.
+    path = tmp_path / "gateway.json"
+    path.write_text(json.dumps(
+        {"providers": [{"name": "ollama-local", "cli_binary_dirs": []}]}),
+        encoding="utf-8")
+    configs = load_gateway_configs(str(path))
+    assert configs[0].cli_binary_dirs == []
+
+
+def test_config_file_new_cli_provider_bad_prompt_via_fails(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    path = tmp_path / "gateway.json"
+    path.write_text(json.dumps(
+        {"providers": [{"name": "opencode", "kind": "cli",
+                        "cli_binary": "opencode",
+                        "cli_prompt_via": "telepathy",
+                        "cli_binary_dirs": [str(bin_dir)]}]}),
+        encoding="utf-8")
+    with pytest.raises(ValueError, match="cli_prompt_via"):
+        load_gateway_configs(str(path))
