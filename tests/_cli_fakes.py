@@ -9,10 +9,16 @@ Windows with WinError 193: CreateProcess cannot run a text file).
 Batch notes (Windows): only cmd.exe builtins may be used in the
 bodies (echo, type, set, for, rem, exit) -- the child environment is
 scrubbed (R-010), so external commands (find, timeout, ping) do not
-resolve. ``%*`` keeps the quotes cmd.exe put around each argument, so
-the helper normalizes it into %ARGS% (quotes stripped) for bodies
-that echo their arguments; bodies that need one argument re-quote it
-("%1").
+resolve. ``%*`` keeps the quotes cmd.exe put around each argument.
+Bodies echo them via ``!ARGS!`` (delayed expansion): it expands AFTER
+cmd.exe parses the line, so metacharacters in an argument (& | < > ^)
+are literal data and can never become a second command -- the old
+preamble stripped the quotes (``%ARGS:"=%``) and a hostile argument
+like ``hello & whoami`` really executed ``whoami`` (laptop round 4).
+Quotes are stripped by delayed-expansion substitution
+(``!ARGS:"=!``, also post-parse, so the stripped value is never
+re-parsed) so the echoed output matches the POSIX twin exactly.
+Bodies that need one argument re-quote it ("%1").
 """
 
 from __future__ import annotations
@@ -20,11 +26,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Batch preamble: normalize the raw argument string (%*) into %ARGS%
-# with quotes stripped. %1..%9 already have quotes stripped by cmd.
+# Batch preamble: capture the raw argument string (%*, quotes intact)
+# into %ARGS%, then strip the quotes with delayed-expansion
+# substitution. Both the substitution and the !ARGS! expansion in
+# bodies happen AFTER cmd.exe parses the line, so a metacharacter in
+# an argument is never re-parsed as a command separator. Never go back
+# to %ARGS:"=% (percent-expansion stripping) or %ARGS% (percent
+# expansion): both re-expose & and | to cmd.exe execution.
 _WINDOWS_PREAMBLE = (
+    "setlocal EnableDelayedExpansion\n"
     'set "ARGS=%*"\n'
-    'set "ARGS=%ARGS:"=%"\n'
+    'set ARGS=!ARGS:"=!\n'
 )
 
 

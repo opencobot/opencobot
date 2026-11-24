@@ -392,7 +392,7 @@ def test_gateway_with_usage_store_enforces_persisted_budget(tmp_path):
 # ---------------------------------------------------------------- CLI via gateway
 
 def test_complete_with_fake_opencode_cli(bin_dir):
-    write_cli_fake(bin_dir, "opencode", 'printf "cli-says: %s\\n" "$*"\n', "@echo cli-says: %ARGS%\n")
+    write_cli_fake(bin_dir, "opencode", 'printf "cli-says: %s\\n" "$*"\n', "@echo cli-says: !ARGS!\n")
     gw = Gateway(configs=[builtin_cli_config("opencode")])
     out = gw.complete("EXECUTOR", "list files", "public")
     assert out["text"] == "cli-says: run list files"
