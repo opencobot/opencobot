@@ -274,6 +274,15 @@ def cmd_daemon_start(args):
     finally:
         log_fh.close()
     pid_path.write_text(str(proc.pid), encoding="utf-8")
+    # NOTE: trust the FIRST successful probe. The loop breaks as soon
+    # as the daemon answers; re-probing immediately after would be a
+    # second connection, and on Windows the pipe listener (max
+    # instances 1) needs a beat between disconnect and the next
+    # ConnectNamedPipe, so that second probe can fail with
+    # ERROR_PIPE_BUSY even though the daemon is fine — which used to
+    # report a false "did not become ready" timeout and unlink
+    # daemon.pid, orphaning a live daemon (laptop round, PR #16).
+    ready = False
     deadline = time.time() + 5.0
     while time.time() < deadline:
         # Readiness is a real answer on the live transport (Unix
@@ -281,13 +290,14 @@ def cmd_daemon_start(args):
         # existence of a socket file, which never appears on
         # Windows and can go stale on POSIX.
         if _daemon_reachable(state_dir):
+            ready = True
             break
         if proc.poll() is not None:
             _err(f"daemon exited immediately (see {log_path})")
             pid_path.unlink(missing_ok=True)
             return 1
         time.sleep(0.1)
-    if not _daemon_reachable(state_dir):
+    if not ready:
         # The process is alive but never answered within the
         # deadline: do not claim success for a deaf daemon.
         _err(f"daemon did not become ready within 5s (see {log_path})")
