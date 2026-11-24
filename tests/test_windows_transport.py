@@ -9,6 +9,7 @@ current-user-only ACL (ADR-010) — it serves on Windows and refuses
 to start only when the Win32 API is unavailable (fail closed).
 """
 
+import ctypes
 import io
 import json
 import socket
@@ -294,13 +295,17 @@ def test_named_pipe_listener_raises_on_linux():
         NamedPipeListener(POLICYD_PIPE_PATH).listen()
 
 
-def test_named_pipe_listener_refuses_without_win32_api_on_windows(windows_platform):
+def test_named_pipe_listener_refuses_without_win32_api_on_windows(windows_platform, monkeypatch):
     """Fail closed, ADR-010: on Windows the listener refuses to start
-    when the Win32 API is unavailable (this Linux host has no
-    ``ctypes.windll``) — an ACL-less pipe is never served. The
-    refusal is about the missing API, not about Windows as such:
-    see test_named_pipe_listener_serves_request_with_fake_api_on_windows.
+    when the Win32 API is unavailable — an ACL-less pipe is never
+    served. The refusal is about the missing API, not about Windows
+    as such: see test_named_pipe_listener_serves_request_with_fake_api_on_windows.
+    BUG-J: the test must delete ``ctypes.windll`` explicitly. On a
+    Linux host it is absent anyway, but on real Windows it exists —
+    without the deletion the listener really starts and blocks in
+    ``ConnectNamedPipe`` waiting for a client, hanging the test.
     """
+    monkeypatch.delattr(ctypes, "windll", raising=False)
     with pytest.raises(NotImplementedError, match="CreateNamedPipeW"):
         NamedPipeListener(POLICYD_PIPE_PATH).listen(
             handler=lambda req: {"ok": True})
@@ -339,12 +344,16 @@ def test_named_pipe_listener_requires_handler_on_windows(windows_platform):
 # Server side: listener selection by platform (mocked)
 # ---------------------------------------------------------------------------
 
-def test_policyd_serve_refuses_without_win32_api_on_windows(tmp_path, windows_platform):
+def test_policyd_serve_refuses_without_win32_api_on_windows(tmp_path, windows_platform, monkeypatch):
     """Fail closed: policyd on Windows refuses to start when the
-    Win32 API is unavailable (this Linux host) — no ACL-less pipe
-    is ever served. The refusal is about the missing API, not
-    about Windows as such (see the _uses_named_pipe_listener test
-    below)."""
+    Win32 API is unavailable — no ACL-less pipe is ever served.
+    The refusal is about the missing API, not about Windows as
+    such (see the _uses_named_pipe_listener test below).
+    BUG-J: ``ctypes.windll`` is deleted explicitly so the missing
+    API is really simulated — on real Windows it exists, and
+    without the deletion serve() would really start listening and
+    hang waiting for a client."""
+    monkeypatch.delattr(ctypes, "windll", raising=False)
     state = tmp_path / "state"
     state.mkdir()
     stop = threading.Event()
@@ -383,12 +392,16 @@ def test_policyd_serve_uses_named_pipe_listener_on_windows(tmp_path, windows_pla
     assert reply["socket"] == POLICYD_PIPE_PATH
 
 
-def test_daemon_serve_forever_refuses_without_win32_api_on_windows(tmp_path, windows_platform):
+def test_daemon_serve_forever_refuses_without_win32_api_on_windows(tmp_path, windows_platform, monkeypatch):
     """Fail closed: the daemon on Windows refuses to start when the
-    Win32 API is unavailable (this Linux host) — no ACL-less pipe
-    is ever served. The refusal is about the missing API, not
-    about Windows as such (see the _uses_named_pipe_listener test
-    below)."""
+    Win32 API is unavailable — no ACL-less pipe is ever served.
+    The refusal is about the missing API, not about Windows as
+    such (see the _uses_named_pipe_listener test below).
+    BUG-J: ``ctypes.windll`` is deleted explicitly so the missing
+    API is really simulated — on real Windows it exists, and
+    without the deletion serve_forever() would really start
+    listening and hang waiting for a client."""
+    monkeypatch.delattr(ctypes, "windll", raising=False)
     state = tmp_path / "state"
     state.mkdir()
     daemon = Daemon(state)
