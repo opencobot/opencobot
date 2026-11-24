@@ -198,10 +198,12 @@ machine. 120s is the tuning value that works on Windows:
 
 On Windows the config file lives at
 `%USERPROFILE%\.config\opencobot\gateway.json` (the default location
-`~/.config/opencobot/gateway.json` under your home directory). A longer
-timeout only waits longer — it does not retry a failed call, and it
-does not raise the 60s ceiling on the `run_command` tool, which is a
-separate limit.
+`~/.config/opencobot/gateway.json` under your home directory). The file
+is read as UTF-8 and a leading BOM is accepted, so files saved by
+Windows editors or PowerShell `Set-Content -Encoding UTF8` load fine.
+A longer timeout only waits longer — it does not retry a failed call,
+and it does not raise the 60s ceiling on the `run_command` tool, which
+is a separate limit.
 
 ## Read-only mode
 

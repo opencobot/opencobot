@@ -303,7 +303,11 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
     if config_path is None:
         return configs
     try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
+        # utf-8-sig: tolerate a leading UTF-8 BOM. Windows editors and
+        # PowerShell Set-Content -Encoding UTF8 write one, and a BOM used
+        # to fail the load with "Unexpected UTF-8 BOM" even though the
+        # JSON itself was valid. BOM-less files read identically.
+        data = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         raise ValueError(f"gateway config {config_path} is not valid JSON: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
