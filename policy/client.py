@@ -43,6 +43,37 @@ class PolicyAuthError(PermissionError):
     """policyd rejected the client's auth token."""
 
 
+def policyd_reachable(state_dir, timeout=1.0) -> bool:
+    """True if a policyd answers on its live transport.
+
+    A bare connect (no request, no auth) — the mirror of
+    ``core.daemon.daemon_reachable`` for policyd: POSIX checks the
+    Unix socket, Windows the named pipe (``POLICYD_PIPE_PATH``).
+    A stale socket file with no listener behind it counts as NOT
+    reachable — unlike a bare ``Path.exists()`` check, which would
+    lie about it — and on Windows there is never a socket file at
+    all, so the old existence check always reported "down" there.
+    Never raises; in particular it does not need ``policyd.auth``
+    to exist, so it is safe to call before policyd has ever run.
+    """
+    state_dir = Path(state_dir)
+    try:
+        if is_windows():
+            stream = NamedPipeTransport(POLICYD_PIPE_PATH).connect()
+        else:
+            stream = UnixSocketTransport(
+                state_dir / "policyd.sock", timeout=timeout).connect()
+    except TransportNotAvailableError:
+        return False
+    except OSError:
+        return False
+    try:
+        stream.close()
+    except Exception:
+        pass
+    return True
+
+
 class PolicyClient:
     """Talk to policyd over its IPC transport (Unix socket / named pipe)."""
 

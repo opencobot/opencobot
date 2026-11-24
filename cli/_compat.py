@@ -323,18 +323,29 @@ def _policyd_module_available():
 def _policyd_ready(state_dir):
     """True when a ``policyd`` is already reachable from ``state_dir``.
 
-    BUG-K: on POSIX the Unix socket file is the readiness signal,
-    but on Windows policyd serves on a named pipe and never creates
-    a socket file — so on Windows probe it with a real
-    ``PolicyClient.status()`` call instead. A missing pipe, a missing
-    auth file and a rejected token all mean "not ready yet". Imports
-    are lazy: this module must stay importable without the policy
-    package (see :func:`get_policy_client`).
+    Readiness is a real answer on the live transport, not the mere
+    existence of a socket file: on POSIX a stale ``policyd.sock``
+    from a previous run would have lied "ready" and skipped
+    spawning a policyd that was not there. So on POSIX probe it
+    with a bare ``policyd_reachable`` connect (no auth needed).
+    On Windows policyd serves on a named pipe and never creates a
+    socket file — probe it with a real ``PolicyClient.status()``
+    call instead (unchanged from BUG-K). A missing pipe/socket, a
+    missing auth file and a rejected token all mean "not ready
+    yet". Imports are lazy: this module must stay importable
+    without the policy package (see :func:`get_policy_client`).
     """
     from core.transport import is_windows
 
     if not is_windows():
-        return (Path(state_dir) / "policyd.sock").exists()
+        try:
+            from policy.client import policyd_reachable
+        except ImportError:
+            return False
+        try:
+            return policyd_reachable(state_dir)
+        except Exception:
+            return False
     try:
         from policy.client import PolicyClient
     except ImportError:

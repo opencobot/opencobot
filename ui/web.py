@@ -279,13 +279,12 @@ class WebUIBackend:
     def status(self) -> dict:
         # Reachability is a real answer on the live transport, not
         # the mere existence of a socket file: on Windows the daemon
-        # serves on a named pipe and daemon.sock never exists, so the
-        # old .exists() check always reported "not running" there. A
-        # stale socket file with no listener behind it now also
-        # correctly reports False on POSIX. (policyd_socket below is
-        # still a file check — the same treatment for policyd is a
-        # separate step; see the daemon-transport PR notes.)
+        # and policyd serve on named pipes and the .sock files never
+        # exist, so the old .exists() checks always reported "not
+        # running" there. A stale socket file with no listener behind
+        # it now also correctly reports False on POSIX.
         from core.daemon import daemon_reachable  # lazy: heavy import
+        from policy.client import policyd_reachable  # lazy: heavy import
 
         engine = self._engine()
         tools = self.tools()
@@ -296,7 +295,9 @@ class WebUIBackend:
             "killed": bool(engine.is_killed()),
             "tools": len(tools),
             "daemon_running": daemon_reachable(self.state_dir),
-            "policyd_socket": (self.state_dir / "policyd.sock").exists(),
+            # Key kept as "policyd_socket" (status API); its value is
+            # now real reachability, not file existence.
+            "policyd_socket": policyd_reachable(self.state_dir),
             "audit_entries": len(self.audit(limit=MAX_AUDIT_LIMIT * 10)),
             "providers": [p["name"] for p in self.providers()],
         }
