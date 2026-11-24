@@ -7,7 +7,6 @@ including a tamper-after-write case.
 
 import hashlib
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +20,7 @@ from adapters.windows.windows import (  # noqa: E402
     WINDOWS_BLOCKED_COMMANDS,
     screenshot_available as windows_screenshot_available,
 )
+from tests._procutil import force_kill_pid  # noqa: E402
 from tools.definitions import TOOLS, get_tool, list_tools  # noqa: E402
 
 EXPECTED = {
@@ -46,11 +46,10 @@ def ctx(tmp_path):
 def launched_pids():
     pids = []
     yield pids
+    # Platform-aware kill (tests/_procutil.py, BUG-D): os.kill with
+    # SIGKILL is invalid on Windows (WinError 87).
     for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        force_kill_pid(pid)
 
 
 def run(name, args, ctx):

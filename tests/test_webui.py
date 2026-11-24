@@ -5,8 +5,6 @@ with urllib. No network beyond loopback, no framework, no CDN.
 """
 
 import json
-import os
-import signal
 import socket
 import subprocess
 import sys
@@ -20,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from policy.engine import PolicyEngine  # noqa: E402
+from tests._procutil import kill_pid_file  # noqa: E402
 from ui.web import (  # noqa: E402
     create_server,
     load_auth_token,
@@ -260,13 +259,9 @@ def ui_state(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
     yield state
-    pid_path = state / "ui.pid"
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass
+    # Platform-aware kill (tests/_procutil.py, BUG-D): os.kill with
+    # SIGTERM is invalid on Windows (WinError 87).
+    kill_pid_file(state, "ui.pid")
 
 
 def run_cli(state_dir, *args):

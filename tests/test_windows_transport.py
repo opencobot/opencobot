@@ -4,8 +4,9 @@ Unix socket (AF_UNIX, unchanged on Linux) vs Windows named pipe
 (``\\\\.\\pipe\\opencobot-policyd`` / ``\\\\.\\pipe\\opencobot-daemon``).
 The JSON-lines protocol must be byte-identical over both transports;
 the named-pipe client raises clearly on Linux and works against a
-fake pipe; the server side refuses to listen on Windows until the
-``ctypes`` listener with a current-user-only ACL lands.
+fake pipe; the server side is a real ``ctypes`` listener with a
+current-user-only ACL (ADR-010) — it serves on Windows and refuses
+to start only when the Win32 API is unavailable (fail closed).
 """
 
 import io
@@ -81,6 +82,57 @@ def _status_reply():
          "audit_entries": 0})
 
 
+class FakePipeApi:
+    """In-memory stand-in for the Win32 pipe API (server side).
+
+    Implements the interface :class:`NamedPipeListener` uses
+    (``build_security_attributes`` / ``create_pipe`` /
+    ``wait_for_client`` / ``read_available`` / ``write_all`` /
+    ``disconnect`` / ``close``) so the listener's accept loop is
+    verified on Linux, where ``ctypes.windll`` does not exist. Serves
+    one request (``request_bytes``) then reports disconnect; a
+    second ``wait_for_client`` returns False so ``listen()`` exits.
+    """
+
+    def __init__(self, request_bytes: bytes):
+        self._request = request_bytes
+        self._served = False
+        self.written = b""
+        self.pipe_path = None
+        self.security_attributes_built = False
+        self.closed = False
+
+    def build_security_attributes(self):
+        self.security_attributes_built = True
+        return object()  # opaque SECURITY_ATTRIBUTES stand-in
+
+    def create_pipe(self, pipe_path, sa):
+        self.pipe_path = pipe_path
+        assert sa is not None, "pipe must be created with an ACL"
+        return 1  # fake HANDLE
+
+    def wait_for_client(self, handle, stop):
+        if self._served:
+            return False
+        self._served = True
+        return True
+
+    def read_available(self, handle, size):
+        if self._request is None:
+            return b""  # client disconnected
+        request, self._request = self._request, None
+        return request
+
+    def write_all(self, handle, data):
+        self.written += data
+
+    def disconnect(self, handle):
+        pass
+
+    def close(self, handle):
+        self.closed = True
+
+
 @pytest.fixture()
 def auth_state(tmp_path):
     """State dir with a policyd auth file (no server running)."""
@@ -142,6 +194,10 @@ def test_decode_message_rejects_bad_input():
         decode_message(b"[1, 2]\n")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Unix-only: the echo server binds socket.AF_UNIX, which does "
+    "not exist on Windows; pipe-side framing is covered by "
+    "test_named_pipe_client_check_against_fake_pipe"))
 def test_protocol_framing_identical_over_both_transports(unix_echo_server):
     state, captured = unix_echo_server
     unix_client = PolicyClient(state)
@@ -175,6 +231,10 @@ def test_named_pipe_client_check_against_fake_pipe(auth_state):
 # Unix client unchanged on Linux
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Unix-only: UnixSocketTransport is the POSIX default; on "
+    "Windows PolicyClient selects NamedPipeTransport (see "
+    "test_named_pipe_client_selected_on_windows)"))
 def test_unix_client_defaults_on_linux(auth_state):
     client = PolicyClient(auth_state)
     assert isinstance(client._transport, UnixSocketTransport)
@@ -198,6 +258,9 @@ def test_unix_client_unavailable_without_server(auth_state):
 # Named-pipe client: clear failure on Linux, Windows shape
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Linux-only: asserts the Linux refusal message; on Windows "
+    "the named-pipe transport is available"))
 def test_named_pipe_client_raises_clearly_on_linux(auth_state):
     transport = NamedPipeTransport()
     with pytest.raises(TransportNotAvailableError,
@@ -222,24 +285,66 @@ def test_named_pipe_client_selected_on_windows(auth_state, windows_platform):
         client.status()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Linux-only: asserts the Linux refusal message; on Windows "
+    "the named-pipe listener is available"))
 def test_named_pipe_listener_raises_on_linux():
     with pytest.raises(TransportNotAvailableError,
                        match="not available on this platform"):
         NamedPipeListener(POLICYD_PIPE_PATH).listen()
 
 
-def test_named_pipe_listener_fails_closed_on_windows(windows_platform):
+def test_named_pipe_listener_refuses_without_win32_api_on_windows(windows_platform):
+    """Fail closed, ADR-010: on Windows the listener refuses to start
+    when the Win32 API is unavailable (this Linux host has no
+    ``ctypes.windll``) — an ACL-less pipe is never served. The
+    refusal is about the missing API, not about Windows as such:
+    see test_named_pipe_listener_serves_request_with_fake_api_on_windows.
+    """
     with pytest.raises(NotImplementedError, match="CreateNamedPipeW"):
-        NamedPipeListener(POLICYD_PIPE_PATH).listen()
+        NamedPipeListener(POLICYD_PIPE_PATH).listen(
+            handler=lambda req: {"ok": True})
     with pytest.raises(NotImplementedError, match="ACL"):
-        NamedPipeListener(DAEMON_PIPE_PATH).listen()
+        NamedPipeListener(DAEMON_PIPE_PATH).listen(
+            handler=lambda req: {"ok": True})
+
+
+def test_named_pipe_listener_serves_request_with_fake_api_on_windows(windows_platform):
+    """ADR-010: the listener EXISTS on Windows now — with a Win32 API
+    available it serves requests over the pipe instead of refusing.
+    The fake API stands in for ``ctypes.windll`` (absent on Linux);
+    the listener must still build the ACL before creating the pipe.
+    """
+    request = encode_message({"op": "status", "auth": "a" * 64})
+    api = FakePipeApi(request)
+    stop = threading.Event()
+    listener = NamedPipeListener(POLICYD_PIPE_PATH, api=api)
+    listener.listen(handler=lambda req: {"ok": True, "echo": req.get("op")},
+                    stop=stop)
+    assert api.pipe_path == POLICYD_PIPE_PATH
+    assert api.security_attributes_built is True
+    assert api.written == encode_message({"ok": True, "echo": "status"})
+    assert api.closed is True
+
+
+def test_named_pipe_listener_requires_handler_on_windows(windows_platform):
+    """Fail closed: even with a Win32 API, the listener refuses to
+    serve without a request handler."""
+    api = FakePipeApi(b"")
+    with pytest.raises(ValueError, match="handler"):
+        NamedPipeListener(POLICYD_PIPE_PATH, api=api).listen()
 
 
 # ---------------------------------------------------------------------------
 # Server side: listener selection by platform (mocked)
 # ---------------------------------------------------------------------------
 
-def test_policyd_serve_refuses_on_windows(tmp_path, windows_platform):
+def test_policyd_serve_refuses_without_win32_api_on_windows(tmp_path, windows_platform):
+    """Fail closed: policyd on Windows refuses to start when the
+    Win32 API is unavailable (this Linux host) — no ACL-less pipe
+    is ever served. The refusal is about the missing API, not
+    about Windows as such (see the _uses_named_pipe_listener test
+    below)."""
     state = tmp_path / "state"
     state.mkdir()
     stop = threading.Event()
@@ -247,12 +352,78 @@ def test_policyd_serve_refuses_on_windows(tmp_path, windows_platform):
         serve(state, stop)
 
 
-def test_daemon_serve_forever_refuses_on_windows(tmp_path, windows_platform):
+def test_policyd_serve_uses_named_pipe_listener_on_windows(tmp_path, windows_platform, monkeypatch):
+    """ADR-010: policyd on Windows serves through NamedPipeListener
+    instead of refusing. The listener is stubbed (no Win32 on this
+    host) to capture how serve() wires it; the captured handler is
+    then exercised with the real auth token serve() just created.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    captured = {}
+
+    class CapturingListener:
+        def __init__(self, pipe_path, api=None):
+            captured["pipe_path"] = pipe_path
+
+        def listen(self, handler=None, stop=None):
+            captured["handler"] = handler
+            captured["stop"] = stop
+
+    monkeypatch.setattr("policy.policyd.NamedPipeListener",
+                        CapturingListener)
+    stop = threading.Event()
+    serve(state, stop)
+    assert captured["pipe_path"] == POLICYD_PIPE_PATH
+    assert callable(captured["handler"])
+    assert captured["stop"] is stop
+    auth = (state / "policyd.auth").read_text(encoding="utf-8").strip()
+    reply = captured["handler"]({"op": "status", "auth": auth})
+    assert reply["ok"] is True
+    assert reply["socket"] == POLICYD_PIPE_PATH
+
+
+def test_daemon_serve_forever_refuses_without_win32_api_on_windows(tmp_path, windows_platform):
+    """Fail closed: the daemon on Windows refuses to start when the
+    Win32 API is unavailable (this Linux host) — no ACL-less pipe
+    is ever served. The refusal is about the missing API, not
+    about Windows as such (see the _uses_named_pipe_listener test
+    below)."""
     state = tmp_path / "state"
     state.mkdir()
     daemon = Daemon(state)
     with pytest.raises(NotImplementedError, match="CreateNamedPipeW"):
         daemon.serve_forever()
+
+
+def test_daemon_serve_forever_uses_named_pipe_listener_on_windows(tmp_path, windows_platform, monkeypatch):
+    """ADR-010: the daemon on Windows serves through NamedPipeListener
+    instead of refusing. The listener is stubbed (no Win32 on this
+    host) to capture how serve_forever() wires it; the captured
+    handler is then exercised with the daemon's real auth token.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    captured = {}
+
+    class CapturingListener:
+        def __init__(self, pipe_path, api=None):
+            captured["pipe_path"] = pipe_path
+
+        def listen(self, handler=None, stop=None):
+            captured["handler"] = handler
+            captured["stop"] = stop
+
+    monkeypatch.setattr("core.daemon.NamedPipeListener",
+                        CapturingListener)
+    daemon = Daemon(state)
+    daemon.serve_forever()
+    assert captured["pipe_path"] == DAEMON_PIPE_PATH
+    assert captured["handler"] == daemon.handle_request
+    assert captured["stop"] is daemon._stop
+    reply = captured["handler"]({"op": "status", "auth": daemon.auth_token})
+    assert reply["ok"] is True
+    assert reply["policyd_reachable"] is False
 
 
 def test_daemon_remove_stale_socket_noop_on_windows(tmp_path,
@@ -298,6 +469,10 @@ def test_handle_request_status_reports_pipe_on_windows(tmp_path,
     assert reply["socket"] == POLICYD_PIPE_PATH
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Unix-only: asserts a Unix socket path in status output; on "
+    "Windows status reports the pipe path (see "
+    "test_handle_request_status_reports_pipe_on_windows)"))
 def test_handle_request_status_reports_socket_on_linux(tmp_path):
     state = tmp_path / "state"
     state.mkdir()

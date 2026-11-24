@@ -5,28 +5,38 @@ AttributeError. These tests simulate Windows by deleting os.getuid
 before the CLI starts (in a subprocess, so the real CLI code path is
 exercised) and assert doctor completes and reports the
 policy-boundary identity check as skipped instead of crashing.
+The deletion is guarded (``try/except AttributeError``) so the
+simulation also works on a real Windows host, where os.getuid
+does not exist to delete in the first place.
 """
 
 import json
-import os
-import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+sys.path.insert(0, str(REPO_ROOT))
+
+from tests._procutil import kill_pid_file, reap_pid_file  # noqa: E402
+
 # Wrapper run with `python -c`: deletes os.getuid first (as on
 # Windows), then runs the real CLI main() with the remaining argv.
-# Nothing else in the CLI or policy code calls os.getuid, so this
-# isolates exactly the doctor identity check.
+# The deletion is guarded: on real Windows os.getuid does not exist,
+# so a bare `del os.getuid` would raise AttributeError before the
+# CLI even starts. Nothing else in the CLI or policy code calls
+# os.getuid, so this isolates exactly the doctor identity check.
 _NO_GETUID_WRAPPER = (
-    "import os, sys; del os.getuid; "
-    "from cli.opencobot_cli import main; "
-    "raise SystemExit(main(sys.argv[1:]))"
+    "import os, sys\n"
+    "try:\n"
+    "    del os.getuid\n"
+    "except AttributeError:\n"
+    "    pass  # already absent, as on real Windows\n"
+    "from cli.opencobot_cli import main\n"
+    "raise SystemExit(main(sys.argv[1:]))\n"
 )
 
 
@@ -36,33 +46,12 @@ def state_dir(tmp_path):
     state.mkdir()
     yield state
     # Teardown: stop anything this test started (policyd).
+    # Platform-aware kill (tests/_procutil.py, BUG-D): os.kill with
+    # SIGTERM is invalid on Windows (WinError 87).
     for pid_file in ("policyd.pid", "daemon.pid"):
-        pid_path = state / pid_file
-        if not pid_path.exists():
-            continue
-        try:
-            pid = int(pid_path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-    deadline = time.time() + 2.0
+        kill_pid_file(state, pid_file)
     for pid_file in ("policyd.pid", "daemon.pid"):
-        pid_path = state / pid_file
-        if not pid_path.exists():
-            continue
-        try:
-            pid = int(pid_path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            continue
-        while time.time() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.05)
+        reap_pid_file(state, pid_file, timeout=2.0)
 
 
 def _run_doctor_without_getuid(state, *extra_args):

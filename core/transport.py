@@ -53,7 +53,13 @@ from pathlib import Path
 # be checked on Linux too.
 _DWORD = ctypes.c_uint32
 _BOOL = ctypes.c_int32
-_HANDLE = ctypes.c_void_p
+# HANDLE is ULONG_PTR: an *unsigned* pointer-sized int. It must NOT
+# be ``c_void_p``: ``GetCurrentProcess()`` returns the pseudo-handle
+# 0xffffffffffffffff (-1), and passing that Python int through a
+# ``c_void_p`` argtype raises OverflowError on 64-bit Windows.
+# ``c_size_t`` holds the full unsigned range, so -1 / INVALID_HANDLE
+# round-trips. (BUG-A/B/C fix: wrong-DLL prototypes + HANDLE overflow.)
+_HANDLE = ctypes.c_size_t
 _LPCWSTR = ctypes.c_wchar_p
 
 __all__ = [
@@ -404,6 +410,18 @@ class _CtypesWindowsPipeApi:
     # -- prototypes ---------------------------------------------------
 
     def _setup_prototypes(self) -> None:
+        # DLL OWNERSHIP RULE (do not regress — a prototype set on the
+        # wrong DLL object silently does nothing there, and the call
+        # on the owning DLL then runs with no argtypes, which
+        # overflows on 64-bit handles / fails with AttributeError):
+        # advapi32 owns the token/SID/ACL functions — OpenProcessToken,
+        # GetTokenInformation, CreateWellKnownSid, SetEntriesInAclW,
+        # InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
+        # GetLengthSid; kernel32 owns the process/pipe/file functions
+        # — GetCurrentProcess, CreateNamedPipeW, CreateEventW,
+        # ConnectNamedPipe, WaitForSingleObject, GetOverlappedResult,
+        # CancelIoEx, ReadFile, WriteFile, DisconnectNamedPipe,
+        # CloseHandle, LocalFree.
         k = self._kernel32
         a = self._advapi32
         H = _HANDLE
@@ -413,10 +431,10 @@ class _CtypesWindowsPipeApi:
         LPDWORD = ctypes.POINTER(DWORD)
         k.GetCurrentProcess.restype = H
         k.GetCurrentProcess.argtypes = []
-        k.OpenProcessToken.restype = BOOL
-        k.OpenProcessToken.argtypes = [H, DWORD, ctypes.POINTER(H)]
-        k.GetLengthSid.restype = DWORD
-        k.GetLengthSid.argtypes = [LPVOID]
+        a.OpenProcessToken.restype = BOOL
+        a.OpenProcessToken.argtypes = [H, DWORD, ctypes.POINTER(H)]
+        a.GetLengthSid.restype = DWORD
+        a.GetLengthSid.argtypes = [LPVOID]
         a.GetTokenInformation.restype = BOOL
         a.GetTokenInformation.argtypes = [H, DWORD, LPVOID, DWORD, LPDWORD]
         a.CreateWellKnownSid.restype = BOOL
@@ -483,7 +501,7 @@ class _CtypesWindowsPipeApi:
                     token, self._TOKEN_USER, buf, size, ctypes.byref(size)):
                 raise self._fail("GetTokenInformation")
             user = _TokenUser.from_buffer(buf)
-            sid_len = self._kernel32.GetLengthSid(user.User.Sid)
+            sid_len = self._advapi32.GetLengthSid(user.User.Sid)
             return ctypes.string_at(user.User.Sid, sid_len)
         finally:
             self._kernel32.CloseHandle(token)

@@ -6,8 +6,6 @@ is terminated in teardown (see the ``state_dir`` fixture).
 """
 
 import json
-import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -17,21 +15,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = [sys.executable, "-m", "cli.opencobot_cli"]
 
+sys.path.insert(0, str(REPO_ROOT))
 
-def _kill_pid_file(state_dir, name):
-    pid_path = Path(state_dir) / name
-    if not pid_path.exists():
-        return
-    try:
-        pid = int(pid_path.read_text(encoding="utf-8").strip())
-    except ValueError:
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        pass
+from tests._procutil import kill_pid_file, reap_pid_file  # noqa: E402
 
 
 @pytest.fixture()
@@ -40,29 +26,13 @@ def state_dir(tmp_path):
     state.mkdir()
     yield state
     # Teardown: stop anything this test started (policyd / daemon).
+    # Platform-aware kill (tests/_procutil.py, BUG-D): os.kill with
+    # SIGTERM/SIGKILL is invalid on Windows (WinError 87).
     for pid_file in ("policyd.pid", "daemon.pid"):
-        _kill_pid_file(state, pid_file)
-    # Give them a moment, then SIGKILL leftovers.
-    import time
-    deadline = time.time() + 2.0
+        kill_pid_file(state, pid_file)
+    # Give them a moment, then force-kill leftovers.
     for pid_file in ("policyd.pid", "daemon.pid"):
-        pid_path = state / pid_file
-        if pid_path.exists():
-            try:
-                pid = int(pid_path.read_text(encoding="utf-8").strip())
-            except ValueError:
-                continue
-            while time.time() < deadline:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.05)
-            else:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+        reap_pid_file(state, pid_file, timeout=2.0)
 
 
 def run_cli(state_dir, *args, timeout=60):
@@ -214,3 +184,61 @@ def test_daemon_status_reports_not_running(state_dir):
     proc = run_cli(state_dir, "daemon", "status")
     assert proc.returncode != 0
     assert "not running" in proc.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# _terminate_pid (BUG-D): daemon/UI stop must not use SIGTERM on Windows
+# ---------------------------------------------------------------------------
+
+def test_terminate_pid_uses_taskkill_on_windows(monkeypatch):
+    import cli.opencobot_cli as cli_mod
+
+    calls = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli_mod.subprocess, "run",
+                        lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(cli_mod, "_pid_alive", lambda pid: False)
+    cli_mod._terminate_pid(1234)
+    assert calls == [["taskkill", "/F", "/PID", "1234"]]
+
+
+def test_terminate_pid_posix_exits_after_sigterm(monkeypatch):
+    import os as _os
+    import signal as _signal
+
+    import cli.opencobot_cli as cli_mod
+
+    sent = []
+    alive = {"n": 0}
+
+    def fake_alive(pid):
+        alive["n"] += 1
+        return alive["n"] <= 2  # alive through the wait loop, then gone
+
+    monkeypatch.setattr(_os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(sys, "platform", "linux")
+    cli_mod._terminate_pid(1234)
+    assert sent == [_signal.SIGTERM]
+
+
+def test_terminate_pid_posix_sigkill_when_stubborn(monkeypatch):
+    import os as _os
+    import signal as _signal
+    import time as _time
+
+    import cli.opencobot_cli as cli_mod
+
+    sent = []
+    clock = {"t": 0.0}
+
+    def fake_time():
+        clock["t"] += 6.0  # jump past the 5s deadline immediately
+        return clock["t"]
+
+    monkeypatch.setattr(_os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(cli_mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_time, "time", fake_time)
+    monkeypatch.setattr(sys, "platform", "linux")
+    cli_mod._terminate_pid(1234)
+    assert sent == [_signal.SIGTERM, _signal.SIGKILL]

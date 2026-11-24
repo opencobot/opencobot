@@ -7,7 +7,6 @@ ADR-006 and docs/risks.md (token network flag).
 """
 
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -21,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy import PolicyAuthError, PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
 from policy.policyd import serve  # noqa: E402
+from tests._procutil import kill_pid_file  # noqa: E402
 from tools.definitions import get_tool, is_network_call, list_tools  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -171,13 +171,10 @@ def cli_state(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
     yield state
+    # Platform-aware kill (tests/_procutil.py, BUG-D): os.kill with
+    # SIGTERM (15) is invalid on Windows (WinError 87).
     for pid_file in ("policyd.pid", "daemon.pid"):
-        pid_path = state / pid_file
-        if pid_path.exists():
-            try:
-                os.kill(int(pid_path.read_text().strip()), 15)
-            except (ValueError, ProcessLookupError, PermissionError):
-                pass
+        kill_pid_file(state, pid_file)
 
 
 def _run_cli(state, *args):
