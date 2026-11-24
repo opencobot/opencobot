@@ -8,7 +8,14 @@ model output cannot execute anything.
 
 Safety rules (repo AGENTS.md rule 6, SECURITY.md):
   * argv arrays only -- ``shell`` is never True and commands are never
-    built by string concatenation.
+    built by string concatenation. One documented exception: on Windows
+    a .bat/.cmd provider must go through cmd.exe /c as a single
+    verbatim command string (see _windows_batch_command) -- passing the
+    pre-quoted /c string as a list element makes list2cmdline
+    backslash-escape the quotes and cmd.exe rejects it as a UNC path.
+    The string is still built only from the allowlisted binary and
+    elements double-quoted by _batch_command_line (``"``/CR/LF refused),
+    never from unquoted model text.
   * The binary comes from the provider config's allowlist only, never
     from model output or tool results. A bare name must be in
     ``ALLOWED_BINARIES``; an absolute path is accepted only when its
@@ -243,7 +250,7 @@ def builtin_cli_config(name: str, **overrides) -> "ProviderConfig":
 # Windows only: a CLI installed via npm (or a test fake) is a .bat/.cmd
 # file, not a PE executable, and CreateProcess cannot run it directly
 # (WinError 193). It must go through cmd.exe /c -- see
-# _windows_batch_argv. Real CLIs installed as .exe need no wrapping.
+# _windows_batch_command. Real CLIs installed as .exe need no wrapping.
 _WINDOWS_BATCH_SUFFIXES = (".bat", ".cmd")
 
 # Suffixes a Windows executable file may carry; the allowlist is about
@@ -328,21 +335,43 @@ def _batch_command_line(argv: list[str]) -> str:
     return '"' + ' '.join(f'"{elem}"' for elem in argv) + '"'
 
 
-def _windows_batch_argv(argv: list[str]) -> list[str]:
-    """Wrap a resolved .bat/.cmd provider argv for cmd.exe /c (Windows)."""
-    return [_comspec(), "/c", _batch_command_line(argv)]
+def _windows_batch_command(argv: list[str]) -> str:
+    """Build the verbatim command line for a .bat/.cmd provider (Windows).
+
+    Returns a single string -- ``"<comspec>" /c "<bat>" "<args>"`` --
+    which the caller passes to subprocess as ``str``. A string bypasses
+    Python's ``list2cmdline``: as a list element, the pre-quoted /c
+    string gets its quotes backslash-escaped (``\\"``), which cmd.exe
+    reads as a UNC path (``\\\\``) and rejects with "The network path
+    was not found" (exit 1) -- proven on a real Windows host (laptop
+    round 4). The /c string itself comes from _batch_command_line, so
+    every element stays double-quoted and metacharacters stay literal.
+
+    The direct-argv alternative ``[comspec, "/c", bat, *args]`` is NOT
+    a fix: with a spaced .bat path list2cmdline quotes it, so the /c
+    string starts with a quote and cmd's /c quote-stripping rule mangles
+    it; and an arg with a metacharacter but no space (``a&b``) is passed
+    unquoted, so cmd treats ``&`` as a command separator. Both failure
+    modes are pinned by tests (see test_windows_direct_argv_form_is_unsafe).
+    """
+    return f'"{_comspec()}" /c {_batch_command_line(argv)}'
 
 
 def _build_argv(
     config: "ProviderConfig", prompt: str, bin_dirs: tuple[str, ...] | None = None
-) -> tuple[list[str], str | None]:
-    """Build the argv array and the temp-file path (if any) for a call.
+) -> tuple[list[str] | str, str | None]:
+    """Build the command and the temp-file path (if any) for a call.
 
-    Returns (argv, temp_path). The prompt is substituted only into the
-    single "{prompt}" placeholder when ``cli_prompt_via == "arg"``; for
-    "file" the placeholder is replaced with a temp-file path holding the
-    prompt; for "stdin" the prompt is fed on stdin and never appears in
-    argv. The caller must delete ``temp_path`` when set.
+    Returns (command, temp_path). ``command`` is normally an argv list;
+    on Windows for a .bat/.cmd provider it is a single verbatim command
+    string (see _windows_batch_command) -- subprocess must receive it as
+    ``str``, because passing the pre-quoted /c string as a list element
+    makes list2cmdline backslash-escape the quotes and cmd.exe rejects
+    it as a UNC path. The prompt is substituted only into the single
+    "{prompt}" placeholder when ``cli_prompt_via == "arg"``; for "file"
+    the placeholder is replaced with a temp-file path holding the prompt;
+    for "stdin" the prompt is fed on stdin and never appears in argv.
+    The caller must delete ``temp_path`` when set.
     """
     binary = _resolve_binary(config.cli_binary or "", bin_dirs=bin_dirs)
     template = list(config.cli_argv_template or ["{prompt}"])
@@ -366,8 +395,9 @@ def _build_argv(
             and Path(argv[0]).suffix.lower() in _WINDOWS_BATCH_SUFFIXES):
         # A .bat/.cmd file is not a PE executable: CreateProcess cannot
         # run it directly (WinError 193). It goes through cmd.exe /c
-        # with the safe quoting of _batch_command_line.
-        argv = _windows_batch_argv(argv)
+        # as a verbatim command string (see _windows_batch_command) --
+        # a list would break under list2cmdline (UNC-path failure).
+        return _windows_batch_command(argv), temp_path
     return argv, temp_path
 
 
@@ -415,18 +445,22 @@ def run_cli_provider(
         raise CliProviderError(f"provider {config.name!r} is not a CLI provider")
     # R-012: resolve the binary against the pinned dirs only.
     bin_dirs = _pinned_bin_dirs(getattr(config, "cli_binary_dirs", None))
-    argv, temp_path = _build_argv(config, prompt, bin_dirs=bin_dirs)
+    command, temp_path = _build_argv(config, prompt, bin_dirs=bin_dirs)
     try:
         # R-010: the child gets a scrubbed environment (allowlist only),
         # never the ambient os.environ with its API keys and tokens.
         run_env = _scrubbed_env(env, bin_dirs)
         try:
             proc = subprocess.run(
-                argv,
+                command,
                 input=prompt.encode("utf-8") if config.cli_prompt_via == "stdin" else None,
                 capture_output=True,
                 timeout=timeout,
-                shell=False,  # never a shell: argv array only
+                # Never a shell: an argv list, or on Windows a verbatim
+                # cmd.exe command string for .bat/.cmd providers (str
+                # bypasses list2cmdline; cmd.exe is the explicit
+                # program, not a shell).
+                shell=False,
                 env=run_env,
             )
         except subprocess.TimeoutExpired as exc:

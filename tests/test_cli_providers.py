@@ -4,6 +4,7 @@ scripts on a monkeypatched PATH stand in for opencode / q / gpt."""
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from core.cli_providers import (  # noqa: E402
     _build_argv,
     _comspec,
     _resolve_binary,
-    _windows_batch_argv,
+    _windows_batch_command,
     builtin_cli_config,
     run_cli_provider,
 )
@@ -59,7 +60,7 @@ def cli_config(name="opencode", **overrides):
 # ---------------------------------------------------------------- happy paths
 
 def test_opencode_fake_script_arg_mode(bin_dir):
-    write_cli_fake(bin_dir, "opencode", 'printf "opencode-reply: %s\\n" "$*"\n', "@echo opencode-reply: %ARGS%\n")
+    write_cli_fake(bin_dir, "opencode", 'printf "opencode-reply: %s\\n" "$*"\n', "@echo opencode-reply: !ARGS!\n")
     out = run_cli_provider(cli_config(), "hello world")
     assert out == "opencode-reply: hello world"
 
@@ -84,7 +85,7 @@ def test_prompt_via_file(bin_dir):
 
 
 def test_custom_cli_template(bin_dir):
-    write_cli_fake(bin_dir, "custom-cli", 'printf "custom:%s\\n" "$*"\n', "@echo custom:%ARGS%\n")
+    write_cli_fake(bin_dir, "custom-cli", 'printf "custom:%s\\n" "$*"\n', "@echo custom:!ARGS!\n")
     cfg = cli_config(
         "custom-cli",
         cli_argv_template=["answer", "--mode", "fast", "{prompt}"],
@@ -94,7 +95,7 @@ def test_custom_cli_template(bin_dir):
 
 def test_stdin_prompt_never_appears_in_argv(bin_dir):
     # The script echoes its argv; the prompt must not be among them.
-    write_cli_fake(bin_dir, "gpt", 'printf "argv:%s\\n" "$*"\n', "@echo argv:%ARGS%\n")
+    write_cli_fake(bin_dir, "gpt", 'printf "argv:%s\\n" "$*"\n', "@echo argv:!ARGS!\n")
     cfg = cli_config("gpt", cli_prompt_via="stdin",
                      cli_argv_template=["run"])
     out = run_cli_provider(cfg, "top-secret-prompt")
@@ -145,7 +146,7 @@ def test_non_cli_kind_rejected(bin_dir):
 # ---------------------------------------------------------------- safety
 
 def test_shell_metacharacters_treated_as_data(bin_dir, tmp_path):
-    write_cli_fake(bin_dir, "opencode", 'printf "got:%s\\n" "$*"\n', "@echo got:%ARGS%\n")
+    write_cli_fake(bin_dir, "opencode", 'printf "got:%s\\n" "$*"\n', "@echo got:!ARGS!\n")
     marker = tmp_path / "pwned"
     prompt = f"$(touch {marker}); `touch {marker}.2`; hello"
     out = run_cli_provider(cli_config(), prompt)
@@ -171,7 +172,7 @@ def test_binary_not_in_pinned_dirs_raises(monkeypatch):
 
 
 def test_absolute_path_binary_with_allowlisted_basename(bin_dir, tmp_path):
-    script = write_cli_fake(bin_dir, "opencode", 'printf "abs:%s\\n" "$*"\n', "@echo abs:%ARGS%\n")
+    script = write_cli_fake(bin_dir, "opencode", 'printf "abs:%s\\n" "$*"\n', "@echo abs:!ARGS!\n")
     cfg = cli_config(cli_binary=str(script))
     assert run_cli_provider(cfg, "hi") == "abs:hi"
 
@@ -264,10 +265,40 @@ def test_windows_comspec_env_and_fallback(monkeypatch):
     assert "System32" in result
 
 
-def test_windows_batch_argv_wraps_with_comspec(monkeypatch):
+def test_windows_batch_command_returns_verbatim_string(monkeypatch):
+    # The win32 batch invocation is ONE verbatim string, not a list:
+    # a list element carrying the pre-quoted /c string is mangled by
+    # list2cmdline (see test_windows_batch_list_form_is_broken_by_list2cmdline).
     monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
-    argv = _windows_batch_argv(["opencode.bat", "hi"])
-    assert argv == ["/fake/cmd.exe", "/c", '""opencode.bat" "hi""']
+    command = _windows_batch_command(["opencode.bat", "hi"])
+    assert isinstance(command, str)
+    assert command == '"/fake/cmd.exe" /c ""opencode.bat" "hi""'
+
+
+def test_windows_batch_list_form_is_broken_by_list2cmdline():
+    # Regression proof for the laptop round-4 failure: as a list
+    # element, list2cmdline backslash-escapes the /c string's quotes,
+    # and cmd.exe reads the result as a UNC path ("The network path
+    # was not found", exit 1). list2cmdline is pure Python, so this
+    # runs on Linux too.
+    line = _batch_command_line(["opencode.bat", "hello world"])
+    cmdline = subprocess.list2cmdline(["cmd.exe", "/c", line])
+    assert '\\"' in cmdline  # backslash-escaped quotes: the UNC trigger
+
+
+def test_windows_direct_argv_form_is_unsafe():
+    # The direct-argv alternative [comspec, "/c", bat, *args] is NOT a
+    # fix. With a spaced .bat path list2cmdline quotes it, so the /c
+    # string starts with a quote and cmd's /c quote-stripping rule
+    # mangles it:
+    spaced = subprocess.list2cmdline(
+        ["cmd.exe", "/c", "C:\\My Dir\\opencode.bat", "hello"])
+    assert spaced.split("/c ", 1)[1].startswith('"')
+    # And an arg with a metacharacter but no space (a&b) is passed
+    # unquoted, so cmd treats & as a command separator:
+    meta = subprocess.list2cmdline(
+        ["cmd.exe", "/c", "opencode.bat", "a&b"])
+    assert meta.endswith("a&b")  # unquoted: & is live to cmd.exe
 
 
 def test_write_cli_fake_writes_bat_on_win32(bin_dir, monkeypatch):
@@ -281,7 +312,10 @@ def test_write_cli_fake_writes_bat_on_win32(bin_dir, monkeypatch):
     assert "@echo hi" in text
 
 
-def test_write_cli_fake_writes_sh_on_posix(bin_dir):
+def test_write_cli_fake_writes_sh_on_posix(bin_dir, monkeypatch):
+    # BUG (laptop round 4): without the platform patch this test reads
+    # the real host platform and fails on Windows (writes a .bat).
+    monkeypatch.setattr(sys, "platform", "linux")
     script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
     assert script == bin_dir / "opencode"
     assert script.exists()
@@ -314,9 +348,13 @@ def test_windows_resolve_bare_name_finds_bat_via_pathext(bin_dir, monkeypatch):
     monkeypatch.setenv("PATHEXT",
                        os.pathsep.join([".COM", ".EXE", ".BAT", ".CMD"]))
     write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
-    assert _resolve_binary("opencode") == str(bin_dir / "opencode.bat")
+    # BUG (laptop round 4): shutil.which returns the path with the
+    # extension cased exactly as in PATHEXT (.BAT), so a plain == with
+    # ".bat" fails on real Windows -- compare case-insensitively.
+    expected = os.path.normcase(str(bin_dir / "opencode.bat"))
+    assert os.path.normcase(_resolve_binary("opencode")) == expected
     # The extension itself is fine too: the allowlist is about the stem.
-    assert _resolve_binary("opencode.bat") == str(bin_dir / "opencode.bat")
+    assert os.path.normcase(_resolve_binary("opencode.bat")) == expected
 
 
 def test_windows_resolve_absolute_bat_path(bin_dir, monkeypatch):
@@ -328,15 +366,72 @@ def test_windows_resolve_absolute_bat_path(bin_dir, monkeypatch):
 
 
 def test_windows_build_argv_wraps_bat_through_cmd(bin_dir, monkeypatch):
+    # _build_argv returns a single verbatim command STRING for a .bat
+    # provider on win32 (list form breaks under list2cmdline -- see
+    # test_windows_batch_list_form_is_broken_by_list2cmdline).
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
     script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
-    argv, temp_path = _build_argv(cli_config(cli_binary=str(script)),
-                                  "hello world")
+    command, temp_path = _build_argv(cli_config(cli_binary=str(script)),
+                                     "hello world")
     assert temp_path is None
-    assert argv[0] == "/fake/cmd.exe"
-    assert argv[1] == "/c"
-    assert argv[2] == '"' + f'"{script}" "hello world"' + '"'
+    assert isinstance(command, str)
+    assert command == '"/fake/cmd.exe" /c ' + '"' + f'"{script}" "hello world"' + '"'
+
+
+def test_windows_run_cli_provider_passes_string_to_subprocess(bin_dir, monkeypatch):
+    # End-to-end (mocked subprocess): on win32 a .bat provider reaches
+    # subprocess.run as one verbatim string with shell=False -- never
+    # as a list, which list2cmdline would mangle (UNC-path failure).
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", "/fake/cmd.exe")
+    script = write_cli_fake(bin_dir, "opencode", "echo hi\n", "@echo hi\n")
+
+    class _FakeProc:
+        returncode = 0
+        stdout = b"reply\n"
+        stderr = b""
+
+    seen = {}
+
+    def _fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    out = run_cli_provider(cli_config(cli_binary=str(script)), "hello world")
+    assert out == "reply"
+    assert seen["args"] == f'"/fake/cmd.exe" /c ""{script}" "hello world""'
+    assert seen["kwargs"]["shell"] is False
+
+
+def test_windows_fake_preamble_cannot_execute_hostile_args(bin_dir, monkeypatch):
+    # The .bat preamble must never strip quotes with percent expansion
+    # (%ARGS:"=%) -- that re-exposes & and | to cmd.exe (laptop round 4:
+    # `hello & whoami` really executed whoami). Delayed expansion only:
+    # the quote-strip and the !ARGS! echo both happen after cmd.exe
+    # parses the line, so a metacharacter in an argument stays literal.
+    monkeypatch.setattr(sys, "platform", "win32")
+    script = write_cli_fake(bin_dir, "opencode", "echo hi\n",
+                            "@echo opencode-reply: !ARGS!\n")
+    text = script.read_text(encoding="utf-8")
+    assert 'set "ARGS=%ARGS:"=%"' not in text
+    assert "%ARGS%" not in text
+    assert "EnableDelayedExpansion" in text
+    assert '!ARGS:"=!' in text  # quote-strip via delayed substitution
+    assert "!ARGS!" in text
+
+
+def test_cli_fake_hostile_arg_is_literal(bin_dir):
+    # `hello & whoami` must echo literally and never execute anything.
+    # Runs on Linux through the .sh twin and on the Windows laptop
+    # through the real .bat under cmd.exe -- same expected output on
+    # both, because the preamble strips quotes via delayed expansion.
+    write_cli_fake(bin_dir, "opencode", 'printf "opencode-reply: %s\\n" "$*"\n',
+                   "@echo opencode-reply: !ARGS!\n")
+    out = run_cli_provider(cli_config(), "hello & whoami")
+    assert out == "opencode-reply: hello & whoami"
 
 
 def test_windows_build_argv_leaves_exe_unwrapped(bin_dir, monkeypatch):

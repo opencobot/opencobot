@@ -169,7 +169,7 @@ def test_r012_path_spoofing_ignored(tmp_path, monkeypatch):
 
 def test_r012_config_binary_dirs_honored(bin_dir, monkeypatch):
     # Per-provider cli_binary_dirs beats the ambient PATH too.
-    write_cli_fake(bin_dir, "opencode", 'printf "pinned:%s\\n" "$*"\n', "@echo pinned:%ARGS%\n")
+    write_cli_fake(bin_dir, "opencode", 'printf "pinned:%s\\n" "$*"\n', "@echo pinned:!ARGS!\n")
     monkeypatch.delenv("OPENCOBOT_CLI_BIN_DIRS", raising=False)
     monkeypatch.setenv("PATH", "/nonexistent-dir")
     cfg = cli_config(cli_binary_dirs=(str(bin_dir),))
@@ -177,7 +177,7 @@ def test_r012_config_binary_dirs_honored(bin_dir, monkeypatch):
 
 
 def test_r012_env_var_override_honored(bin_dir, monkeypatch):
-    write_cli_fake(bin_dir, "opencode", 'printf "envdir:%s\\n" "$*"\n', "@echo envdir:%ARGS%\n")
+    write_cli_fake(bin_dir, "opencode", 'printf "envdir:%s\\n" "$*"\n', "@echo envdir:!ARGS!\n")
     monkeypatch.setenv("OPENCOBOT_CLI_BIN_DIRS", str(bin_dir))
     monkeypatch.setenv("PATH", "/nonexistent-dir")
     assert run_cli_provider(cli_config(), "hi") == "envdir:hi"
