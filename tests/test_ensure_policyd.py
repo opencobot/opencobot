@@ -110,6 +110,8 @@ def _posix_listener(state):
     return srv
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live listener; Windows tested via Named Pipe")
 def test_posix_socket_exists_does_not_spawn(tmp_path, monkeypatch):
     """POSIX: a live policyd.sock listener means running, with no
     spawn and no client probe."""
@@ -141,6 +143,8 @@ def test_posix_stale_socket_file_spawns(tmp_path, monkeypatch):
     assert status == "failed"  # the fake proc never becomes reachable
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live listener; Windows tested via Named Pipe")
 def test_posix_socket_appears_after_spawn(tmp_path, monkeypatch):
     """POSIX: the wait loop polls the live probe and reports running
     once policyd starts listening."""
