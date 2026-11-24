@@ -421,6 +421,13 @@ def test_windows_fake_preamble_cannot_execute_hostile_args(bin_dir, monkeypatch)
     assert "EnableDelayedExpansion" in text
     assert '!ARGS:"=!' in text  # quote-strip via delayed substitution
     assert "!ARGS!" in text
+    # No quotes around ARGS= on the capture line: cmd.exe pairs quotes
+    # left-to-right, so `set "ARGS=%*"` with a quoted metachar argument
+    # (`"hello & whoami"`) pairs `"ARGS=` with `"hello` and leaves
+    # ` & whoami` outside quotes -- whoami really executes (laptop
+    # round 5). `set ARGS=%*` keeps the argument's own quotes paired.
+    assert "set ARGS=%*\n" in text
+    assert 'set "ARGS=%*"' not in text
 
 
 def test_cli_fake_hostile_arg_is_literal(bin_dir):

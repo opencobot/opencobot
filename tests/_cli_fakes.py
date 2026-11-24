@@ -33,9 +33,16 @@ from pathlib import Path
 # an argument is never re-parsed as a command separator. Never go back
 # to %ARGS:"=% (percent-expansion stripping) or %ARGS% (percent
 # expansion): both re-expose & and | to cmd.exe execution.
+# NOTE the capture line has NO quotes around ARGS=: cmd.exe pairs
+# quotes left-to-right, so `set "ARGS=%*"` with a quoted metachar
+# argument (`"hello & whoami"`) pairs `"ARGS=` with `"hello`, leaving
+# ` & whoami` outside quotes during line parsing -- whoami really
+# executes (laptop round 5). %* is already quoted by
+# _batch_command_line, so `set ARGS=%*` keeps the argument's own
+# quotes paired correctly and the & stays inside them.
 _WINDOWS_PREAMBLE = (
     "setlocal EnableDelayedExpansion\n"
-    'set "ARGS=%*"\n'
+    "set ARGS=%*\n"
     'set ARGS=!ARGS:"=!\n'
 )
 
