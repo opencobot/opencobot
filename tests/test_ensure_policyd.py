@@ -1,12 +1,15 @@
 """Tests for ``cli._compat.ensure_policyd`` readiness (BUG-K).
 
-On POSIX readiness is the ``policyd.sock`` file; on Windows policyd
-serves on a named pipe and never creates a socket file, so readiness
-must be probed with a real ``PolicyClient.status()`` call. The tests
-fake the platform, the client and the spawned process — they run on
-Linux and on real Windows alike.
+On POSIX readiness is a real connect probe on ``policyd.sock`` — a
+bare file with no listener behind it is a stale socket, not a running
+policyd. On Windows policyd serves on a named pipe and never creates
+a socket file, so readiness must be probed with a real
+``PolicyClient.status()`` call. The tests fake the platform, the
+client and the spawned process — they run on Linux and on real
+Windows alike.
 """
 
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -98,34 +101,66 @@ def test_windows_never_ready_reports_failed(tmp_path, monkeypatch):
     assert isinstance(proc, _FakeProc)
 
 
+def _posix_listener(state):
+    """Bind a real AF_UNIX listener at policyd.sock (no accept loop:
+    a bare-connect probe completes against the listen backlog)."""
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(state / "policyd.sock"))
+    srv.listen(5)
+    return srv
+
+
 def test_posix_socket_exists_does_not_spawn(tmp_path, monkeypatch):
-    """POSIX behaviour unchanged: an existing policyd.sock means
-    running, with no spawn and no client probe."""
+    """POSIX: a live policyd.sock listener means running, with no
+    spawn and no client probe."""
     monkeypatch.setattr(core.transport, "is_windows", lambda: False)
     state = tmp_path / "state"
     state.mkdir()
-    (state / "policyd.sock").touch()
+    srv = _posix_listener(state)
+    try:
+        popen_calls = _fake_popen(monkeypatch)
+        status, proc = ensure_policyd(state)
+        assert (status, proc) == ("running", None)
+        assert popen_calls == []
+    finally:
+        srv.close()
+
+
+def test_posix_stale_socket_file_spawns(tmp_path, monkeypatch):
+    """POSIX: a bare policyd.sock file with no listener behind it is
+    a stale socket, not a running policyd — ensure_policyd must
+    spawn instead of trusting the file."""
+    monkeypatch.setattr(core.transport, "is_windows", lambda: False)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "policyd.sock").write_text("stale", encoding="utf-8")
     popen_calls = _fake_popen(monkeypatch)
-    status, proc = ensure_policyd(state)
-    assert (status, proc) == ("running", None)
-    assert popen_calls == []
+    status, proc = ensure_policyd(state, wait_seconds=0.3)
+    assert isinstance(proc, _FakeProc)
+    assert len(popen_calls) == 1
+    assert status == "failed"  # the fake proc never becomes reachable
 
 
 def test_posix_socket_appears_after_spawn(tmp_path, monkeypatch):
-    """POSIX behaviour unchanged: the wait loop watches the socket
-    file and reports running once it appears."""
+    """POSIX: the wait loop polls the live probe and reports running
+    once policyd starts listening."""
     monkeypatch.setattr(core.transport, "is_windows", lambda: False)
     state = tmp_path / "state"
     state.mkdir()
+    servers = []
 
     def fake_popen(*args, **kwargs):
-        (state / "policyd.sock").touch()
+        servers.append(_posix_listener(state))
         return _FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    status, proc = ensure_policyd(state, wait_seconds=5.0)
-    assert status == "running"
-    assert isinstance(proc, _FakeProc)
+    try:
+        status, proc = ensure_policyd(state, wait_seconds=5.0)
+        assert status == "running"
+        assert isinstance(proc, _FakeProc)
+    finally:
+        for srv in servers:
+            srv.close()
 
 
 def test_raises_when_policyd_module_missing(tmp_path, monkeypatch):
