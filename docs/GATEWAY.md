@@ -141,6 +141,45 @@ configuration — it only changes which model/endpoint already-configured
 providers use; API keys are never read from it (they still come from
 environment variables at call time).
 
+### Pinned CLI binary dirs per provider (`cli_binary_dirs`)
+
+A provider entry may declare `cli_binary_dirs` — the directories a bare
+CLI binary name may resolve from (R-012, ADR-009). It beats the
+`OPENCOBOT_CLI_BIN_DIRS` env var, which beats the built-in defaults
+(`/usr/local/bin`, `/usr/bin`, `/bin`); the ambient PATH is never
+consulted. This is how an operator points a CLI provider at a
+non-standard install location (for example an npm global bin dir)
+without touching the environment:
+
+```json
+{"providers": [{"name": "opencode", "kind": "cli",
+                "cli_binary": "opencode",
+                "cli_argv_template": ["run", "{prompt}"],
+                "cli_prompt_via": "arg", "cli_output": "stdout",
+                "cli_binary_dirs": ["/home/ayush/.npm-global/bin"]}]}
+```
+
+A file-defined CLI provider also declares its binary and argv template
+(the same fields `builtin_cli_config()` sets); `cli_binary_dirs` on its
+own only changes where the binary is looked for. The binary name must
+be allowlisted (`opencode`, `kiro`, `gpt`, `q`, `custom-cli`) — the
+allowlist is still enforced when the provider runs, so a typo'd binary
+fails loudly there instead of silently resolving to something else.
+
+Rules, enforced when the file is loaded (a bad value fails loudly,
+never silently ignored):
+
+- The value must be a **list of existing directories** — a bare string,
+  a non-string entry, or a directory that does not exist raises
+  `ValueError`.
+- A bare binary name resolved from these dirs still needs an
+  **allowlisted basename** (`opencode`, `kiro`, `gpt`, `q`,
+  `custom-cli`); an absolute path still needs an allowlisted basename
+  and an executable file. `cli_binary_dirs` changes *where* a binary
+  is looked for, never *which* binaries are allowed.
+- On Windows, use Windows paths (`C:\tools\bin`); the entries are
+  checked with `Path.is_dir()` on the host that loads the file.
+
 ### Timeouts and cold model loads
 
 Every provider has a `timeout` in seconds (default 30) that bounds one
