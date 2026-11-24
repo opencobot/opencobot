@@ -168,6 +168,8 @@ def _patch_windows(monkeypatch, transport=None):
 # daemon_reachable
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live socket server; Windows tested via Named Pipe")
 def test_daemon_reachable_posix_live_server(state_dir):
     with _UnixDaemonServer(state_dir / "daemon.sock"):
         assert daemon_mod.daemon_reachable(state_dir) is True
@@ -200,6 +202,8 @@ def test_daemon_reachable_windows_pipe_absent(state_dir, monkeypatch):
 # query_daemon
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live socket server; Windows tested via Named Pipe")
 def test_query_daemon_posix_returns_reply(state_dir):
     (state_dir / "daemon.auth").write_text("tok-123", encoding="utf-8")
     reply = b'{"ok": true, "tools": 3}\n'
@@ -215,6 +219,8 @@ def test_query_daemon_posix_no_socket(state_dir):
     assert daemon_mod.query_daemon(state_dir, "status") is None
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live socket server; Windows tested via Named Pipe")
 def test_query_daemon_posix_invalid_reply(state_dir):
     with _UnixDaemonServer(state_dir / "daemon.sock", b"not json\n"):
         assert daemon_mod.query_daemon(state_dir, "status") is None
@@ -274,6 +280,30 @@ def test_cmd_daemon_start_windows_reports_pipe(state_dir, monkeypatch, capsys):
     assert payload["pid"] == 4321
     assert payload["pipe"] == DAEMON_PIPE_PATH
     assert "socket" not in payload
+
+
+def test_cmd_daemon_start_windows_second_probe_fails_still_succeeds(
+        state_dir, monkeypatch, capsys):
+    # Laptop round (PR #16): with max_instances=1 the pipe listener
+    # needs a beat between disconnect and the next ConnectNamedPipe,
+    # so an immediate second probe right after a successful one can
+    # fail with ERROR_PIPE_BUSY. Start must trust the first answer
+    # instead of re-probing and reporting a false timeout (which also
+    # unlinked daemon.pid and orphaned the live daemon).
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    answers = iter([True, False])
+    monkeypatch.setattr(cli_mod, "_daemon_reachable",
+                        lambda state: next(answers))
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(pid=4321))
+    rc = cli_mod.cmd_daemon_start(_ns(state_dir))
+    assert rc == 0
+    assert (state_dir / "daemon.pid").read_text(encoding="utf-8") == "4321"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] is True
+    assert payload["pid"] == 4321
 
 
 def test_cmd_daemon_start_windows_daemon_dies(state_dir, monkeypatch, capsys):
@@ -341,7 +371,9 @@ def test_cmd_daemon_status_windows_pid_alive_but_silent(state_dir, monkeypatch, 
     # A live PID that is NOT the test runner's own: the state_dir
     # fixture's teardown kills whatever daemon.pid names, so writing
     # os.getpid() here would SIGTERM pytest itself.
-    sleeper = subprocess.Popen(["sleep", "30"])
+    # No "sleep" executable exists on Windows; use the interpreter.
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"])
     (state_dir / "daemon.pid").write_text(str(sleeper.pid),
                                           encoding="utf-8")
     monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: False)
@@ -461,6 +493,8 @@ def test_webui_status_daemon_running_false(state_dir):
     assert WebUIBackend(state_dir).status()["daemon_running"] is False
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live socket server; Windows tested via Named Pipe")
 def test_webui_status_daemon_running_live_socket(state_dir):
     from ui.web import WebUIBackend
 
@@ -512,6 +546,8 @@ def test_doctor_daemon_check_windows_reports_pipe(state_dir, monkeypatch):
     assert "named pipe" in by_name["policyd.sock perms"]["detail"]
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX AF_UNIX live socket server; Windows tested via Named Pipe")
 def test_doctor_daemon_check_posix_live_socket(state_dir, monkeypatch):
     with _UnixDaemonServer(state_dir / "daemon.sock"):
         rc, checks = _doctor_checks(state_dir, monkeypatch, windows=False)
