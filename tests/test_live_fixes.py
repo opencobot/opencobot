@@ -241,6 +241,21 @@ def test_config_file_overrides_default_model(tmp_path, monkeypatch):
     assert configs[1].name == "openai-compatible"
 
 
+def test_config_file_utf8_bom_loads(tmp_path):
+    # Windows editors and PowerShell Set-Content -Encoding UTF8 write a
+    # UTF-8 BOM; the loader must accept it (llama3.1:8b laptop run failed
+    # on "Unexpected UTF-8 BOM" before this fix).
+    path = tmp_path / "gateway.json"
+    payload = json.dumps(
+        {"providers": [{"name": "ollama-local", "model": "llama3.1:8b",
+                        "timeout": 120}]}).encode("utf-8")
+    path.write_bytes(b"\xef\xbb\xbf" + payload)
+    configs = load_gateway_configs(str(path))
+    assert configs[0].name == "ollama-local"
+    assert configs[0].model == "llama3.1:8b"
+    assert configs[0].timeout == 120
+
+
 def test_config_file_env_var(monkeypatch, tmp_path):
     path = tmp_path / "gateway.json"
     path.write_text(json.dumps(
