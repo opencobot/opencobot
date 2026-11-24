@@ -320,20 +320,46 @@ def _policyd_module_available():
     return _find_spec("policy.policyd") is not None
 
 
+def _policyd_ready(state_dir):
+    """True when a ``policyd`` is already reachable from ``state_dir``.
+
+    BUG-K: on POSIX the Unix socket file is the readiness signal,
+    but on Windows policyd serves on a named pipe and never creates
+    a socket file — so on Windows probe it with a real
+    ``PolicyClient.status()`` call instead. A missing pipe, a missing
+    auth file and a rejected token all mean "not ready yet". Imports
+    are lazy: this module must stay importable without the policy
+    package (see :func:`get_policy_client`).
+    """
+    from core.transport import is_windows
+
+    if not is_windows():
+        return (Path(state_dir) / "policyd.sock").exists()
+    try:
+        from policy.client import PolicyClient
+    except ImportError:
+        return False
+    try:
+        PolicyClient(state_dir).status()
+    except Exception:
+        return False
+    return True
+
+
 def ensure_policyd(state_dir, wait_seconds=5.0):
     """Make sure ``policyd`` is reachable.
 
-    Returns ``(status, proc)`` where status is ``"running"`` (socket
-    exists, or the real ``policyd`` was just started) or ``"failed"``
-    (the real ``policyd`` was started but its socket did not appear
-    within ``wait_seconds``). Raises :class:`PolicyUnavailable` when
-    the real ``policyd`` module is not installed — there is no
+    Returns ``(status, proc)`` where status is ``"running"`` (a
+    policyd is already reachable, or the real ``policyd`` was just
+    started and became reachable) or ``"failed"`` (the real
+    ``policyd`` was started but did not become reachable within
+    ``wait_seconds``). Raises :class:`PolicyUnavailable` when the
+    real ``policyd`` module is not installed — there is no
     in-process fallback any more (R-009).
     """
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
-    sock = state_dir / "policyd.sock"
-    if sock.exists():
+    if _policyd_ready(state_dir):
         return "running", None
     if not _policyd_module_available():
         raise PolicyUnavailable(
@@ -351,12 +377,12 @@ def ensure_policyd(state_dir, wait_seconds=5.0):
     (state_dir / "policyd.pid").write_text(str(proc.pid), encoding="utf-8")
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
-        if sock.exists():
+        if _policyd_ready(state_dir):
             return "running", proc
         if proc.poll() is not None:
             return "failed", proc
         time.sleep(0.1)
-    return ("running", proc) if sock.exists() else ("failed", proc)
+    return ("running", proc) if _policyd_ready(state_dir) else ("failed", proc)
 
 
 # ---------------------------------------------------------------------------

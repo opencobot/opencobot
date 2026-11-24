@@ -912,7 +912,7 @@ def cmd_doctor(args):
     try:
         status, _proc = ensure_policyd(state_dir)
         if status == "running":
-            checks.append(("policyd", "PASS", "reachable (socket)", True))
+            checks.append(("policyd", "PASS", "reachable", True))
         else:
             checks.append(("policyd", "FAIL", "could not start; see policyd.log", True))
     except PolicyUnavailable as exc:
