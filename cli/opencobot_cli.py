@@ -244,6 +244,30 @@ def _pid_alive(pid):
         return False
 
 
+def _terminate_pid(pid):
+    """Stop a daemon/UI process, portably (BUG-D: SIGTERM is invalid on Windows).
+
+    POSIX: SIGTERM, wait up to 5s for exit, then SIGKILL. Windows:
+    ``taskkill /F`` — ``os.kill`` there accepts only CTRL_C_EVENT /
+    CTRL_BREAK_EVENT, so any other signal raises WinError 87; taskkill
+    is the only reliable kill. Returns after the process is gone or
+    the wait expires.
+    """
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and _pid_alive(pid):
+            time.sleep(0.1)
+        return
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and _pid_alive(pid):
+        time.sleep(0.1)
+    if _pid_alive(pid):
+        os.kill(pid, signal.SIGKILL)
+
+
 def cmd_daemon_start(args):
     state_dir = _state_dir(args)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -305,12 +329,7 @@ def cmd_daemon_stop(args):
         _err(f"corrupt PID file {pid_path}")
         return 1
     if _pid_alive(pid):
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + 5.0
-        while time.time() < deadline and _pid_alive(pid):
-            time.sleep(0.1)
-        if _pid_alive(pid):
-            os.kill(pid, signal.SIGKILL)
+        _terminate_pid(pid)
     pid_path.unlink(missing_ok=True)
     if sock_path.exists() and not _pid_alive(pid):
         sock_path.unlink(missing_ok=True)
@@ -777,12 +796,7 @@ def cmd_ui_stop(args):
         _err(f"corrupt PID file {pid_path}")
         return 1
     if _pid_alive(pid):
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + 5.0
-        while time.time() < deadline and _pid_alive(pid):
-            time.sleep(0.1)
-        if _pid_alive(pid):
-            os.kill(pid, signal.SIGKILL)
+        _terminate_pid(pid)
     pid_path.unlink(missing_ok=True)
     _emit({"running": False, "pid": pid}, args.json,
           [f"web UI stopped (pid {pid})"])

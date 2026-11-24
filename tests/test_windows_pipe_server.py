@@ -35,7 +35,9 @@ from core.transport import (  # noqa: E402
     POLICYD_PIPE_PATH,
     NamedPipeListener,
     TransportNotAvailableError,
+    _CtypesWindowsPipeApi,
     _ExplicitAccess,
+    _HANDLE,
     _Overlapped,
     _SecurityAttributes,
     _TokenUser,
@@ -122,6 +124,85 @@ class FakeWindowsPipeApi:
         self.calls.append(("close", handle))
 
 
+# ---------------------------------------------------------------------------
+# Fake windll: enforces DLL ownership (BUG-A/B/C regression guard)
+# ---------------------------------------------------------------------------
+#
+# The listener-level fake above cannot catch a prototype set on the
+# wrong DLL: real ``ctypes`` happily lets you set
+# ``kernel32.OpenProcessToken.restype`` (it just creates an attribute
+# on the wrong function object) while the real ``advapi32`` call then
+# runs with no argtypes. That is exactly how BUG-A/B/C shipped. This
+# windll-level fake only exposes each Win32 function on the DLL that
+# really owns it, so any wrong-DLL access — including a prototype
+# assignment in ``_CtypesWindowsPipeApi._setup_prototypes`` — raises
+# ``AttributeError`` loudly instead of silently doing nothing.
+
+class _FakeWin32Function:
+    """Stand-in for one ctypes foreign function.
+
+    Setting ``restype`` / ``argtypes`` works (that is what the
+    prototype setup does); calling it raises, since no test here
+    drives a real Win32 call.
+    """
+
+    def __init__(self):
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *args, **kwargs):  # pragma: no cover - guard
+        raise NotImplementedError("fake Win32 function must not be called")
+
+
+# advapi32 owns the token/SID/ACL functions; kernel32 owns the
+# process/pipe/file functions (see the rule comment in
+# _CtypesWindowsPipeApi._setup_prototypes).
+_ADVAPI32_FUNCTIONS = (
+    "OpenProcessToken",
+    "GetTokenInformation",
+    "CreateWellKnownSid",
+    "SetEntriesInAclW",
+    "InitializeSecurityDescriptor",
+    "SetSecurityDescriptorDacl",
+    "GetLengthSid",
+)
+_KERNEL32_FUNCTIONS = (
+    "GetCurrentProcess",
+    "CreateNamedPipeW",
+    "CreateEventW",
+    "ConnectNamedPipe",
+    "WaitForSingleObject",
+    "GetOverlappedResult",
+    "CancelIoEx",
+    "ReadFile",
+    "WriteFile",
+    "DisconnectNamedPipe",
+    "CloseHandle",
+    "LocalFree",
+)
+
+
+class _FakeDll:
+    """One fake DLL object: exposes ONLY the functions it owns.
+
+    No ``__getattr__`` fallback: accessing any other function name
+    raises ``AttributeError``, exactly as real ``ctypes.windll``
+    does for a function the DLL does not export.
+    """
+
+    def __init__(self, function_names):
+        for name in function_names:
+            setattr(self, name, _FakeWin32Function())
+
+
+class _FakeWindll:
+    """Fake ``ctypes.windll`` with DLL ownership enforced."""
+
+    def __init__(self):
+        self.kernel32 = _FakeDll(_KERNEL32_FUNCTIONS)
+        self.advapi32 = _FakeDll(_ADVAPI32_FUNCTIONS)
+
+
 def _echo_handler(calls):
     def handler(request):
         calls.append(request)
@@ -190,11 +271,85 @@ def test_win32_struct_layouts_match_64bit_windows():
     assert ctypes.sizeof(_TokenUser) == 16
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="ctypes.windll always exists on real Windows; the no-windll "
+    "path is Linux-only",
+)
 def test_load_windows_api_fails_closed_without_windll():
     # On this Linux host ctypes.windll does not exist: the same
     # NotImplementedError the shape-only listener raised.
     with pytest.raises(NotImplementedError, match="CreateNamedPipeW"):
         _load_windows_api()
+
+
+# ---------------------------------------------------------------------------
+# ctypes prototypes: DLL ownership (BUG-A/B/C regression tests)
+# ---------------------------------------------------------------------------
+
+def test_fake_dll_refuses_functions_owned_by_the_other_dll():
+    """The fake windll raises AttributeError for a wrong-DLL access —
+    the guard that would have caught BUG-A/B/C in the mock tests."""
+    windll = _FakeWindll()
+    # advapi32-only functions are not on kernel32 ...
+    with pytest.raises(AttributeError):
+        windll.kernel32.OpenProcessToken
+    with pytest.raises(AttributeError):
+        windll.kernel32.GetLengthSid
+    with pytest.raises(AttributeError):
+        windll.kernel32.GetTokenInformation
+    # ... and kernel32-only functions are not on advapi32.
+    with pytest.raises(AttributeError):
+        windll.advapi32.CreateNamedPipeW
+    with pytest.raises(AttributeError):
+        windll.advapi32.CloseHandle
+    with pytest.raises(AttributeError):
+        windll.advapi32.GetCurrentProcess
+    # A wrong-DLL *prototype assignment* fails loudly too, instead
+    # of silently creating an attribute on the wrong function object.
+    with pytest.raises(AttributeError):
+        windll.kernel32.OpenProcessToken.restype = ctypes.c_int32
+    with pytest.raises(AttributeError):
+        windll.advapi32.CreateNamedPipeW.argtypes = []
+
+
+def test_ctypes_prototypes_land_on_the_correct_dll():
+    """Regression test for BUG-A/B/C: constructing the real API
+    against the ownership-enforcing fake windll succeeds only if
+    every prototype is set on the DLL that owns the function."""
+    windll = _FakeWindll()
+    api = _CtypesWindowsPipeApi(windll)  # raises AttributeError if wrong
+    # The two previously wrong prototypes now live on advapi32 ...
+    assert api._advapi32.OpenProcessToken.restype is not None
+    assert api._advapi32.OpenProcessToken.argtypes is not None
+    assert api._advapi32.GetLengthSid.restype is not None
+    assert api._advapi32.GetLengthSid.argtypes is not None
+    # ... and kernel32 exposes neither of them at all.
+    assert not hasattr(windll.kernel32, "OpenProcessToken")
+    assert not hasattr(windll.kernel32, "GetLengthSid")
+    # The rest of the ownership split, both directions.
+    for name in _ADVAPI32_FUNCTIONS:
+        assert hasattr(windll.advapi32, name), name
+        assert not hasattr(windll.kernel32, name), name
+    for name in _KERNEL32_FUNCTIONS:
+        assert hasattr(windll.kernel32, name), name
+        assert not hasattr(windll.advapi32, name), name
+    # Every prototype was actually set (not left at the None default).
+    for dll in (windll.kernel32, windll.advapi32):
+        for name in vars(dll):
+            fn = getattr(dll, name)
+            assert fn.restype is not None, name
+            assert fn.argtypes is not None, name
+
+
+def test_handle_type_holds_the_pseudo_handle():
+    """Regression test for the HANDLE overflow (BUG-C): ``_HANDLE``
+    must be the unsigned ``c_size_t`` (ULONG_PTR), not ``c_void_p``,
+    so the ``GetCurrentProcess()`` pseudo-handle 0xffffffffffffffff
+    round-trips instead of overflowing."""
+    assert _HANDLE is ctypes.c_size_t
+    assert _HANDLE(0xFFFFFFFFFFFFFFFF).value == 0xFFFFFFFFFFFFFFFF
+    assert _HANDLE(-1).value == 0xFFFFFFFFFFFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +364,11 @@ def test_listener_builds_acl_before_creating_pipe(windows_platform):
     assert ("close", 1001) in api.calls
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the platform guard only refuses on non-Windows hosts; on "
+    "Windows the listener accepts a fake API and serves",
+)
 def test_listener_refuses_on_linux_even_with_fake_api():
     api = FakeWindowsPipeApi(connections=[])
     with pytest.raises(TransportNotAvailableError,
