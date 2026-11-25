@@ -6,7 +6,7 @@ This file is for AI coding agents (for example Muse AI) and for humans who super
 
 OpenCobot is a local-first, model-agnostic platform that lets AI models control Windows, Linux and macOS computers safely. Its value comes from enforced safety, verified execution, a policy-aware model router and safe remote control. Because it controls real computers, code written here is security-critical.
 
-Source of truth, in order: `SECURITY.md` (invariants), `ARCHITECTURE.md`, `docs/adr/`, then the Claude Doc spec exported to `docs/SPEC.md` if present. Current phase: **Phase 0** (docs only). Do not write product code until the maintainer says Phase 1 has started.
+Source of truth, in order: `SECURITY.md` (invariants), `ARCHITECTURE.md`, `docs/adr/`, then the Claude Doc spec exported to `docs/SPEC.md` if present. Current phase: Phases 1–3 are merged (Linux MVP, gateway + CLI-model providers, Windows adapter — see `docs/STATUS.md` for what is built and tested). Phase 0 (docs only) is done.
 
 ## 2. Hard rules
 

@@ -246,6 +246,34 @@ class PolicyClient:
         )
         return str(reply["approval_id"])
 
+    def get_readonly(self) -> bool:
+        """Effective read-only flag from policyd (R-022)."""
+        return bool(self._request("readonly")["readonly"])
+
+    def readonly_info(self) -> dict:
+        """Effective read-only flag and where it comes from.
+
+        Returns ``{"readonly": bool, "source": "env" | "file"}`` — the
+        web UI status page reports both.
+        """
+        reply = self._request("readonly")
+        return {
+            "readonly": bool(reply["readonly"]),
+            "source": str(reply.get("source", "file")),
+        }
+
+    def set_readonly(self, enabled: bool) -> bool:
+        """Persist the read-only flag via policyd; returns the new value."""
+        reply = self._request("readonly", enabled=bool(enabled))
+        return bool(reply["readonly"])
+
+    def revoke_approval(self, approval_id: str) -> bool:
+        """Remove an approval by id; True when one was removed."""
+        reply = self._request(
+            "revoke_approval", approval_id=str(approval_id)
+        )
+        return bool(reply["revoked"])
+
     def taint(self, token_id: str) -> bool:
         return bool(self._request("taint", token_id=token_id)["tainted"])
 

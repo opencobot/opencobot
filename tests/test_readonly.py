@@ -13,6 +13,8 @@ import os
 import stat
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -21,7 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.daemon import Daemon  # noqa: E402
 from core.runtime import Runtime  # noqa: E402
+from policy.client import PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
+from policy.policyd import _load_or_create_auth, serve  # noqa: E402
+from tests.test_policy import _RecordingTransport  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = [sys.executable, "-m", "cli.opencobot_cli"]
@@ -158,22 +163,97 @@ def test_runtime_readonly_l0_allowed_l1_denied(state_dir, scope):
 # -- daemon ops -------------------------------------------------------------
 
 def test_daemon_readonly_ops(state_dir):
+    # R-022: daemon writes go through policyd, so policyd must be
+    # running for the set to succeed. The daemon itself is created
+    # after policyd is up (its PolicyClient is cached on first use).
+    state_dir.mkdir(parents=True, exist_ok=True)
+    stop = threading.Event()
+    thread = threading.Thread(target=serve, args=(state_dir, stop),
+                              daemon=True)
+    thread.start()
+    try:
+        deadline = time.time() + 10
+        while True:
+            try:
+                PolicyClient(state_dir).status()
+                break
+            except (PolicyUnavailable, OSError):
+                if time.time() > deadline:
+                    raise AssertionError("policyd did not start")
+                time.sleep(0.05)
+        daemon = Daemon(state_dir=state_dir)
+        get = {"auth": daemon.auth_token, "op": "readonly_get"}
+        assert daemon.handle_request(get) == {"ok": True, "readonly": False}
+        set_on = {"auth": daemon.auth_token, "op": "readonly_set",
+                  "enabled": True}
+        assert daemon.handle_request(set_on) == {"ok": True, "readonly": True}
+        assert daemon.handle_request(get) == {"ok": True, "readonly": True}
+        assert daemon.is_readonly() is True
+        # Status exposes the flag, and a fresh daemon reads it via policyd.
+        status = daemon.handle_request({"auth": daemon.auth_token,
+                                        "op": "status"})
+        assert status["readonly"] is True
+        assert Daemon(state_dir=state_dir).is_readonly() is True
+        bad = {"auth": daemon.auth_token, "op": "readonly_set",
+               "enabled": "yes"}
+        assert daemon.handle_request(bad)["ok"] is False
+        daemon.handle_request({"auth": daemon.auth_token, "op": "readonly_set",
+                               "enabled": False})
+        assert daemon.is_readonly() is False
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
+def test_daemon_readonly_set_fails_closed_without_policyd(state_dir,
+                                                          monkeypatch):
+    """Without policyd, daemon writes do nothing (R-022).
+
+    Reads keep the direct file fallback (plus the env override), so the
+    daemon still knows the mode it must enforce when policyd is down.
+    """
+    monkeypatch.delenv("OPENCOBOT_READONLY", raising=False)
     daemon = Daemon(state_dir=state_dir)
-    get = {"auth": daemon.auth_token, "op": "readonly_get"}
-    assert daemon.handle_request(get) == {"ok": True, "readonly": False}
-    set_on = {"auth": daemon.auth_token, "op": "readonly_set", "enabled": True}
-    assert daemon.handle_request(set_on) == {"ok": True, "readonly": True}
-    assert daemon.handle_request(get) == {"ok": True, "readonly": True}
-    assert daemon.is_readonly() is True
-    # Status exposes the flag, and a fresh daemon loads it from disk.
-    status = daemon.handle_request({"auth": daemon.auth_token, "op": "status"})
-    assert status["readonly"] is True
-    assert Daemon(state_dir=state_dir).is_readonly() is True
-    bad = {"auth": daemon.auth_token, "op": "readonly_set", "enabled": "yes"}
-    assert daemon.handle_request(bad)["ok"] is False
-    daemon.handle_request({"auth": daemon.auth_token, "op": "readonly_set",
-                           "enabled": False})
     assert daemon.is_readonly() is False
+    assert daemon.set_readonly(True) is False
+    # No direct write happened: the flag file was never created.
+    assert not (state_dir / "readonly.json").exists()
+    assert daemon.is_readonly() is False
+    # The env override still applies to reads when policyd is down.
+    monkeypatch.setenv("OPENCOBOT_READONLY", "1")
+    assert daemon.is_readonly() is True
+    monkeypatch.setenv("OPENCOBOT_READONLY", "0")
+    assert daemon.is_readonly() is False
+    # ... and a persisted flag is still read from the file.
+    (state_dir / "readonly.json").write_text('{"readonly": true}')
+    monkeypatch.delenv("OPENCOBOT_READONLY", raising=False)
+    assert Daemon(state_dir=state_dir).is_readonly() is True
+
+
+def test_daemon_readonly_uses_client_not_engine(state_dir, monkeypatch):
+    """is_readonly/set_readonly talk to policyd, never policy.engine.
+
+    The engine import is blocked outright; the client runs over a
+    recording fake transport so the exact ops can be asserted.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _load_or_create_auth(state_dir)
+    fake = _RecordingTransport([
+        {"ok": True, "readonly": False, "source": "file"},
+        {"ok": True, "readonly": True, "source": "file"},
+        {"ok": True, "readonly": True, "source": "file"},
+    ])
+    client = PolicyClient(state_dir, transport=fake)
+    monkeypatch.setattr(Daemon, "_policy_client", lambda self: client)
+    monkeypatch.setitem(sys.modules, "policy.engine", None)
+    daemon = Daemon(state_dir=state_dir)
+    assert daemon.is_readonly() is False
+    assert daemon.set_readonly(True) is True
+    assert daemon.is_readonly() is True
+    assert [r["op"] for r in fake.requests] == ["readonly"] * 3
+    assert fake.requests[1]["enabled"] is True
+    # The set only happened on the fake policyd: no file was written.
+    assert not (state_dir / "readonly.json").exists()
 
 
 def test_daemon_readonly_requires_auth(state_dir):

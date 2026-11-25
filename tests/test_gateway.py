@@ -138,12 +138,14 @@ def test_api_key_read_from_env_at_call_time_and_sent_as_bearer(monkeypatch):
                             "big-model", api_key_env="OPENCOBOT_TEST_KEY_XYZ")
     gw = Gateway(configs=[config], transport=transport)
     monkeypatch.setenv("OPENCOBOT_TEST_KEY_XYZ", "test-key-123")
-    assert gw.chat("executor", MESSAGES)["ok"] is True
+    # This test exercises API-key handling, not the cloud gate: the
+    # caller explicitly pre-approves the cloud call (R-021).
+    assert gw.chat("executor", MESSAGES, preapproved=True)["ok"] is True
     assert seen.get("Authorization") == "Bearer test-key-123"
 
     monkeypatch.delenv("OPENCOBOT_TEST_KEY_XYZ")
     seen.clear()
-    assert gw.chat("executor", MESSAGES)["ok"] is True
+    assert gw.chat("executor", MESSAGES, preapproved=True)["ok"] is True
     assert "Authorization" not in seen
 
 

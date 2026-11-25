@@ -264,24 +264,40 @@ class Daemon:
         return False
 
     # -- read-only mode (Phase 2) ----------------------------------------
-    def _readonly_engine(self):
-        """A PolicyEngine over this state dir, or None if unavailable.
+    def _readonly_env_override(self) -> bool | None:
+        """The OPENCOBOT_READONLY override, read directly.
 
-        The engine reads the persisted flag from disk on every check,
-        so this is always the live value -- no caching.
+        Mirrors ``policy.engine._env_readonly_override`` (same variable
+        name and truthy/falsy sets) so the fallback below keeps its
+        exact semantics without importing ``policy.engine``.
         """
-        try:
-            from policy.engine import PolicyEngine  # type: ignore[import-not-found]
-
-            return PolicyEngine(self.state_dir)
-        except Exception:
+        raw = os.environ.get("OPENCOBOT_READONLY")
+        if raw is None:
             return None
+        normalized = raw.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+        return None
 
     def is_readonly(self) -> bool:
-        """Effective read-only state (env override wins, else persisted)."""
-        engine = self._readonly_engine()
-        if engine is not None:
-            return bool(engine.is_readonly())
+        """Effective read-only state (env override wins, else the flag).
+
+        Asked of policyd first (R-022). When policyd is unreachable the
+        read falls back to a direct read of ``readonly.json`` — read-only
+        and safe: the daemon must know the mode to enforce it even when
+        policyd is down.
+        """
+        client = self._policy_client()
+        if client is not None:
+            try:
+                return bool(client.get_readonly())
+            except Exception:
+                pass
+        override = self._readonly_env_override()
+        if override is not None:
+            return override
         try:
             data = json.loads((self.state_dir / "readonly.json").read_text())
             return bool(data.get("readonly", False))
@@ -289,20 +305,20 @@ class Daemon:
             return False
 
     def set_readonly(self, enabled: bool) -> bool:
-        """Persist the read-only flag; returns the new persisted value."""
-        engine = self._readonly_engine()
-        if engine is not None:
-            return bool(engine.set_readonly(bool(enabled)))
-        path = self.state_dir / "readonly.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"readonly": bool(enabled)}), encoding="utf-8"
-        )
+        """Persist the read-only flag via policyd; returns the new value.
+
+        Writes fail closed when policyd is unreachable: the daemon
+        never writes ``readonly.json`` directly, so a set that policyd
+        did not see (and audit) cannot happen. (Reads keep the file
+        fallback above; writes deliberately do not.)
+        """
+        client = self._policy_client()
+        if client is None:
+            return False
         try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-        return bool(enabled)
+            return bool(client.set_readonly(bool(enabled)))
+        except Exception:
+            return False
 
     # -- request handling -------------------------------------------------
 
