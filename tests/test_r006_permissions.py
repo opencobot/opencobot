@@ -23,7 +23,7 @@ from policy import PolicyAuthError, PolicyClient, PolicyUnavailable  # noqa: E40
 from policy.audit import enforce_state_permissions  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
 from policy.policyd import serve  # noqa: E402
-from tests._procutil import kill_pid_file  # noqa: E402
+from tests._procutil import kill_pid_file, unique_policyd_pipe  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = [sys.executable, "-m", "cli.opencobot_cli"]
@@ -54,7 +54,8 @@ def test_engine_startup_tightens_state_dir(tmp_path):
     assert _mode(state / "audit.jsonl") == 0o600
 
 
-def test_policyd_startup_sets_socket_and_files_0600(tmp_path):
+def test_policyd_startup_sets_socket_and_files_0600(tmp_path, monkeypatch):
+    unique_policyd_pipe(monkeypatch)
     state = tmp_path / "daemon-state"
     state.mkdir()
     os.chmod(state, 0o755)

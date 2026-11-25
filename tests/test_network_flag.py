@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy import PolicyAuthError, PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
 from policy.policyd import serve  # noqa: E402
-from tests._procutil import kill_pid_file  # noqa: E402
+from tests._procutil import kill_pid_file, unique_policyd_pipe  # noqa: E402
 from tools.definitions import get_tool, is_network_call, list_tools  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -125,7 +125,8 @@ def test_network_token_still_needs_approval(tmp_path):
 # -- policyd round-trip ---------------------------------------------------
 
 @pytest.fixture()
-def policyd_server(tmp_path):
+def policyd_server(tmp_path, monkeypatch):
+    unique_policyd_pipe(monkeypatch)
     state = tmp_path / "daemon-state"
     state.mkdir()
     stop = threading.Event()

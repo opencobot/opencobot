@@ -24,6 +24,7 @@ from policy import (  # noqa: E402
     PolicyUnavailable,
 )
 from policy.policyd import _load_or_create_auth, serve  # noqa: E402
+from tests._procutil import unique_policyd_pipe  # noqa: E402
 
 
 @pytest.fixture()
@@ -253,8 +254,9 @@ def test_engine_audits_every_decision_and_chain_verifies(engine, token):
 # -- policyd round-trip ---------------------------------------------------
 
 @pytest.fixture()
-def policyd_server(tmp_path):
+def policyd_server(tmp_path, monkeypatch):
     """Start policyd in a thread on a tmp state dir; yield (state_dir, client)."""
+    unique_policyd_pipe(monkeypatch)
     state = tmp_path / "daemon-state"
     state.mkdir()
     stop = threading.Event()

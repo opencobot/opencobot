@@ -34,10 +34,10 @@ from .audit import PRIVATE_FILE_MODE, enforce_state_permissions
 from .engine import PolicyEngine, _default_state_dir
 from .tokens import CapabilityToken
 from core.transport import (
-    POLICYD_PIPE_PATH,
     NamedPipeListener,
     decode_message,
     is_windows,
+    policyd_pipe_path,
     send_message,
 )
 
@@ -182,7 +182,7 @@ def handle_request(
                 "ok": True,
                 "killed": engine.is_killed(),
                 "socket": (
-                    POLICYD_PIPE_PATH
+                    policyd_pipe_path()
                     if is_windows()
                     else str(engine.state_dir / "policyd.sock")
                 ),
@@ -210,7 +210,7 @@ def serve(state_dir: Path, stop: threading.Event | None = None) -> None:
     auth_token = _load_or_create_auth(state_dir)
     engine = PolicyEngine(state_dir)
     if is_windows():
-        NamedPipeListener(POLICYD_PIPE_PATH).listen(
+        NamedPipeListener(policyd_pipe_path()).listen(
             handler=lambda req: handle_request(engine, auth_token, req),
             stop=stop,
         )

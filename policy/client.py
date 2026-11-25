@@ -20,12 +20,12 @@ import time
 from pathlib import Path
 
 from core.transport import (
-    POLICYD_PIPE_PATH,
     NamedPipeTransport,
     TransportNotAvailableError,
     UnixSocketTransport,
     decode_message,
     is_windows,
+    policyd_pipe_path,
     send_message,
 )
 from .engine import Decision, _default_state_dir
@@ -49,7 +49,7 @@ def policyd_reachable(state_dir, timeout=1.0) -> bool:
 
     A bare connect (no request, no auth) — the mirror of
     ``core.daemon.daemon_reachable`` for policyd: POSIX checks the
-    Unix socket, Windows the named pipe (``POLICYD_PIPE_PATH``).
+    Unix socket, Windows the named pipe (``policyd_pipe_path()``).
     A stale socket file with no listener behind it counts as NOT
     reachable — unlike a bare ``Path.exists()`` check, which would
     lie about it — and on Windows there is never a socket file at
@@ -60,7 +60,7 @@ def policyd_reachable(state_dir, timeout=1.0) -> bool:
     state_dir = Path(state_dir)
     try:
         if is_windows():
-            stream = NamedPipeTransport(POLICYD_PIPE_PATH).connect()
+            stream = NamedPipeTransport(policyd_pipe_path()).connect()
         else:
             stream = UnixSocketTransport(
                 state_dir / "policyd.sock", timeout=timeout).connect()
@@ -90,7 +90,7 @@ class PolicyClient:
         self.sock_path: Path | None = (
             None if is_windows() else self.state_dir / "policyd.sock"
         )
-        self.pipe_path = POLICYD_PIPE_PATH
+        self.pipe_path = policyd_pipe_path()
         self._auth = self._read_auth()
         self._transport = transport if transport is not None \
             else self._default_transport()

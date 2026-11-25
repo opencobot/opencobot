@@ -19,11 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy import PolicyAuthError, PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine, argument_hash  # noqa: E402
 from policy.policyd import serve  # noqa: E402
+from tests._procutil import unique_policyd_pipe  # noqa: E402
 
 
 @pytest.fixture()
-def policyd_server(tmp_path):
+def policyd_server(tmp_path, monkeypatch):
     """Start policyd in a thread on a tmp state dir; yield (state, client)."""
+    unique_policyd_pipe(monkeypatch)
     state = tmp_path / "daemon-state"
     state.mkdir()
     stop = threading.Event()
