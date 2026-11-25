@@ -261,24 +261,24 @@ the results file from the recording section above alongside it.
 
 - [ ] **Real named-pipe ACL behaviour** — the different-user
   negative check in §6b (another local account must NOT connect).
-  Result: _(PASS/FAIL, paste the output or "no second account")_
-- [ ] **PowerShell tool execution** — §5 hostile-input check
+  Result: _NOT RUN (different-user check skipped: second local account `Ayush` exists in `Get-LocalUser`, alongside current user `Ayush Kumar`, disabled `Administrator`/`Guest`, and `CodexSandbox*` accounts, but no password is available to run non-interactive `runas /user:Ayush` in this automated session). Same-user §6b connect PASSED: `PolicyClient.status()` -> `{'killed': False, 'socket': '\\\\.\\pipe\\opencobot-policyd', 'audit_entries': 15}`; live pipe DACL SDDL via `GetSecurityInfo`: `D:(D;;0x12019f;;;SU)(A;;0x12019f;;;S-1-5-21-683957593-4088474031-550077339-1001)(A;;0x12019f;;;BA)`; §6c after stopping `policyd`: `cannot connect to named pipe: \\.\pipe\opencobot-policyd`._
+- [x] **PowerShell tool execution** — §5 hostile-input check
   (metacharacters stay literal) and the blocklist check
   (`format` refused).
-  Result: _(PASS/FAIL, paste the output)_
+  Result: _PASS — `run_powershell(["Write-Output", "hello; $(whoami) `pwned`"])` -> `rc=0 out='hello; $(whoami) `pwned`'` (literal, `whoami` did not execute); `run_powershell(["format", "C:"])` -> `ValueError: blocked command: 'format'`._
 - [ ] **Daemon start / stop / status over the named pipe** — §9 and
   `daemon start` → `daemon status` → `daemon stop` → `daemon
   status` (see `docs/STATUS.md` daemon row).
-  Result: _(PASS/FAIL, paste the output)_
-- [ ] **Web UI session login** — `opencobot ui start`, open
+  Result: _FAIL — `daemon start` PASS (`rc=0`, `daemon started (pid 380, pipe \\.\pipe\opencobot-daemon)`) and `daemon status` (while up) PASS (`rc=0`, `daemon running (pid 380)`, `status: {"ok": true, "tools": 22, "killed": false, "policyd_reachable": false, "readonly": false}`), EXCEPT `daemon stop` printed `rc=0 daemon stopped (pid 380)` and removed `daemon.pid` while leaving the daemon running (`daemon status` after stop returned `rc=0`, `daemon running` without pid, because `_pid_alive(pid)` calls `os.kill(pid, 0)` which raises `OSError: [WinError 87] The parameter is incorrect` on Windows for `start_new_session=True` processes so `_terminate_pid()` is never called, and `.venv` launcher spawns a child `C:\Program Files\Python312\python.exe`). Also §9 `tool run list_dir` and `tool run run_command ... --approve` FAILED (`rc=1`, `PolicyUnavailable: cannot connect to named pipe: \\.\pipe\opencobot-policyd` / `OSError: [Errno 22] Invalid argument`) because back-to-back pipe connects after `ensure_policyd`'s `PolicyClient.status()` hit the single-instance pipe disconnect/reconnect window; in-process `get_tool('list_dir').execute(...)` PASS (`['path', 'entries', 'count']`)._
+- [x] **Web UI session login** — `opencobot ui start`, open
   http://127.0.0.1:8765, sign in with `POST /login` (token in the
   body only), confirm the status page loads, then `POST /logout`
   and confirm the session is gone.
-  Result: _(PASS/FAIL, paste what you saw)_
+  Result: _PASS (login/status/logout) — `ui start` -> `rc=0 web UI started (pid 25128) at http://127.0.0.1:8765/`; unauth `GET /` -> HTTP `401` with login form; `POST /login` (token in form body, `Accept: text/html`) -> HTTP `200` at `/` (`OpenCobot — local status`, `opencobot_session` cookie set); `POST /logout` -> redirected to `/` HTTP `401` (login form); post-logout `GET /` -> HTTP `401`. (Note: `ui stop` printed `rc=0 web UI stopped (pid 25128)` but `GET /` immediately returned `HTTP 401` because `cmd_ui_stop` uses the same `_pid_alive` `os.kill(pid, 0)` `[WinError 87]` path.)_
 - [ ] **Kill switch** — with `policyd` running, `opencobot kill`,
   then a `tool run list_dir` must be denied ("kill switch
   active"); `opencobot unkill` must let it run again.
-  Result: _(PASS/FAIL, paste the output)_
+  Result: _FAIL — with `policyd` running on `\\.\pipe\opencobot-policyd`, `opencobot kill` PASS (`rc=0 kill switch ON — all tool runs blocked`) and `opencobot unkill` PASS (`rc=0 kill switch OFF`), EXCEPT `opencobot tool run list_dir --args-json '{"path": "."}'` while killed (and after unkill) failed (`rc=1`) before reaching `check()` with `OSError: [Errno 22] Invalid argument: '\\\\.\\pipe\\opencobot-policyd'` -> `policy.client.PolicyUnavailable: cannot connect to named pipe: \\.\pipe\opencobot-policyd` (single-instance pipe connect failure immediately after `ensure_policyd`'s `PolicyClient.status()` probe)._
 
 ## What to report back
 
