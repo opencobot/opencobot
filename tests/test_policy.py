@@ -337,6 +337,134 @@ def test_policyd_unknown_op_rejected(policyd_server):
         client._request("explode")
 
 
+# -- readonly + revoke_approval ops (R-022) -------------------------------
+
+def test_policyd_readonly_get_set_round_trip(policyd_server):
+    _state, client = policyd_server
+    assert client.get_readonly() is False
+    assert client.readonly_info() == {"readonly": False, "source": "file"}
+    assert client.set_readonly(True) is True
+    assert client.get_readonly() is True
+    assert client.readonly_info()["source"] == "file"
+    assert client.set_readonly(False) is False
+    assert client.get_readonly() is False
+
+
+def test_policyd_readonly_rejects_non_bool(policyd_server):
+    _state, client = policyd_server
+    with pytest.raises(PolicyError, match="readonly needs enabled"):
+        client._request("readonly", enabled="yes")
+    # The rejected set did not change the flag.
+    assert client.get_readonly() is False
+
+
+def test_policyd_revoke_approval_round_trip(policyd_server):
+    state, client = policyd_server
+    engine = PolicyEngine(state)
+    approval_id = engine.approve("tok-1", "read_file", 0, {}, 600)
+    assert engine.has_approval("tok-1", "read_file", 0, {}) is True
+    assert client.revoke_approval(approval_id) is True
+    assert engine.has_approval("tok-1", "read_file", 0, {}) is False
+    # Revoking again, or an unknown id, reports False (nothing removed).
+    assert client.revoke_approval(approval_id) is False
+    assert client.revoke_approval("no-such-id") is False
+
+
+def test_policyd_readonly_and_revoke_reject_wrong_auth(policyd_server):
+    state, client = policyd_server
+    bad = PolicyClient(state)
+    bad._auth = "0" * 64
+    with pytest.raises(PolicyAuthError):
+        bad.get_readonly()
+    with pytest.raises(PolicyAuthError):
+        bad.set_readonly(True)
+    with pytest.raises(PolicyAuthError):
+        bad.revoke_approval("whatever")
+    # The rejected calls changed nothing.
+    assert client.get_readonly() is False
+
+
+# -- PolicyClient over a fake transport (R-022) ---------------------------
+
+
+class _RecordingTransport:
+    """Stand-in for a policyd connection: records requests, replays replies.
+
+    Implements the transport API (``connect`` returns the stream) and
+    the stream API core.transport uses (write/flush/readline) plus the
+    context-manager protocol PolicyClient._request uses.
+    """
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.requests = []
+
+    def connect(self):
+        return self
+
+    def write(self, data: bytes) -> None:
+        self.requests.append(json.loads(data.decode("utf-8")))
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> bytes:
+        if not self.replies:
+            return b""
+        return (json.dumps(self.replies.pop(0)) + "\n").encode("utf-8")
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _client_with_fake_transport(state_dir, replies):
+    """A PolicyClient whose transport is a recording fake.
+
+    ``PolicyClient`` takes the transport in its constructor, so no
+    socket is opened and no monkeypatching is needed.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    auth = _load_or_create_auth(state_dir)
+    fake = _RecordingTransport(replies)
+    return PolicyClient(state_dir, transport=fake), fake, auth
+
+
+def test_client_readonly_methods_send_readonly_op(state_dir):
+    client, fake, auth = _client_with_fake_transport(state_dir, [
+        {"ok": True, "readonly": False, "source": "file"},
+        {"ok": True, "readonly": True, "source": "file"},
+        {"ok": True, "readonly": False, "source": "file"},
+        {"ok": True, "readonly": True, "source": "env"},
+    ])
+    assert client.get_readonly() is False
+    assert client.set_readonly(True) is True
+    assert client.set_readonly(False) is False
+    assert client.readonly_info() == {"readonly": True, "source": "env"}
+    assert [(r["op"], r.get("enabled")) for r in fake.requests] == [
+        ("readonly", None), ("readonly", True),
+        ("readonly", False), ("readonly", None),
+    ]
+    assert all(r["auth"] == auth for r in fake.requests)
+
+
+def test_client_revoke_approval_sends_op(state_dir):
+    client, fake, _auth = _client_with_fake_transport(state_dir, [
+        {"ok": True, "revoked": True},
+        {"ok": True, "revoked": False},
+    ])
+    assert client.revoke_approval("appr-1") is True
+    assert client.revoke_approval("nope") is False
+    assert [(r["op"], r["approval_id"]) for r in fake.requests] == [
+        ("revoke_approval", "appr-1"), ("revoke_approval", "nope"),
+    ]
+
+
 def test_client_unavailable_when_no_daemon(tmp_path):
     client_state = tmp_path / "no-daemon"
     client_state.mkdir()

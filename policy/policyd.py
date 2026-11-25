@@ -140,6 +140,31 @@ def handle_request(
                 int(request.get("duration_seconds", 600)),
             )
             return {"ok": True, "approval_id": approval_id}
+        if op == "readonly":
+            # R-022: the daemon and the web UI used to build a
+            # PolicyEngine in-process for this flag. The effective value
+            # (env override wins, else the persisted flag) and the
+            # "source" ("env" or "file") come from the engine, so the
+            # web UI status page keeps reporting them unchanged.
+            if "enabled" in request:
+                enabled = request.get("enabled")
+                if not isinstance(enabled, bool):
+                    raise ValueError("readonly needs enabled: true/false")
+                return {
+                    "ok": True,
+                    "readonly": engine.set_readonly(enabled),
+                    "source": engine.readonly_source(),
+                }
+            return {
+                "ok": True,
+                "readonly": engine.is_readonly(),
+                "source": engine.readonly_source(),
+            }
+        if op == "revoke_approval":
+            revoked = engine.revoke_approval(
+                str(request.get("approval_id", ""))
+            )
+            return {"ok": True, "revoked": revoked}
         if op == "taint":
             engine.mark_tainted(str(request.get("token_id", "")))
             return {"ok": True, "tainted": True}
