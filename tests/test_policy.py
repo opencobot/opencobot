@@ -338,6 +338,55 @@ def test_policyd_unknown_op_rejected(policyd_server):
         client._request("explode")
 
 
+# -- readonly + revoke_approval ops (R-022) -------------------------------
+# Restored by agent/restore-r022-tests-status: these tests were added by
+# PR #31 and lost when PR #32's merge kept its own version of this file.
+
+def test_policyd_readonly_get_set_round_trip(policyd_server):
+    _state, client = policyd_server
+    assert client.get_readonly() is False
+    assert client.readonly_info() == {"readonly": False, "source": "file"}
+    assert client.set_readonly(True) is True
+    assert client.get_readonly() is True
+    assert client.readonly_info()["source"] == "file"
+    assert client.set_readonly(False) is False
+    assert client.get_readonly() is False
+
+
+def test_policyd_readonly_rejects_non_bool(policyd_server):
+    _state, client = policyd_server
+    with pytest.raises(PolicyError, match="readonly needs enabled"):
+        client._request("readonly", enabled="yes")
+    # The rejected set did not change the flag.
+    assert client.get_readonly() is False
+
+
+def test_policyd_revoke_approval_round_trip(policyd_server):
+    state, client = policyd_server
+    engine = PolicyEngine(state)
+    approval_id = engine.approve("tok-1", "read_file", 0, {}, 600)
+    assert engine.has_approval("tok-1", "read_file", 0, {}) is True
+    assert client.revoke_approval(approval_id) is True
+    assert engine.has_approval("tok-1", "read_file", 0, {}) is False
+    # Revoking again, or an unknown id, reports False (nothing removed).
+    assert client.revoke_approval(approval_id) is False
+    assert client.revoke_approval("no-such-id") is False
+
+
+def test_policyd_readonly_and_revoke_reject_wrong_auth(policyd_server):
+    state, client = policyd_server
+    bad = PolicyClient(state)
+    bad._auth = "0" * 64
+    with pytest.raises(PolicyAuthError):
+        bad.get_readonly()
+    with pytest.raises(PolicyAuthError):
+        bad.set_readonly(True)
+    with pytest.raises(PolicyAuthError):
+        bad.revoke_approval("whatever")
+    # The rejected calls changed nothing.
+    assert client.get_readonly() is False
+
+
 # -- PolicyClient over a fake transport (Windows pipe race) ---------------
 
 
@@ -443,6 +492,44 @@ def test_client_does_not_retry_mid_request_failure(state_dir):
     with pytest.raises(PolicyError, match="closed the connection"):
         client.status()
     assert fake.connect_attempts == 1
+
+
+# -- readonly + revoke_approval client methods (R-022) -------------------
+# Restored by agent/restore-r022-tests-status: added by PR #31, lost in
+# the PR #32 merge. Adapted to PR #32's helper shape, which returns
+# (client, fake) — the auth token is reloaded below for the assertion
+# (the helper creates it once; reloading returns the same token).
+
+
+def test_client_readonly_methods_send_readonly_op(state_dir):
+    client, fake = _client_with_fake_transport(state_dir, [
+        {"ok": True, "readonly": False, "source": "file"},
+        {"ok": True, "readonly": True, "source": "file"},
+        {"ok": True, "readonly": False, "source": "file"},
+        {"ok": True, "readonly": True, "source": "env"},
+    ])
+    auth = _load_or_create_auth(state_dir)
+    assert client.get_readonly() is False
+    assert client.set_readonly(True) is True
+    assert client.set_readonly(False) is False
+    assert client.readonly_info() == {"readonly": True, "source": "env"}
+    assert [(r["op"], r.get("enabled")) for r in fake.requests] == [
+        ("readonly", None), ("readonly", True),
+        ("readonly", False), ("readonly", None),
+    ]
+    assert all(r["auth"] == auth for r in fake.requests)
+
+
+def test_client_revoke_approval_sends_op(state_dir):
+    client, fake = _client_with_fake_transport(state_dir, [
+        {"ok": True, "revoked": True},
+        {"ok": True, "revoked": False},
+    ])
+    assert client.revoke_approval("appr-1") is True
+    assert client.revoke_approval("nope") is False
+    assert [(r["op"], r["approval_id"]) for r in fake.requests] == [
+        ("revoke_approval", "appr-1"), ("revoke_approval", "nope"),
+    ]
 
 
 def test_client_unavailable_when_no_daemon(tmp_path):
