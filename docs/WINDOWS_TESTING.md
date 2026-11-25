@@ -13,6 +13,30 @@ from the repo root. Call the venv Python directly
 the venv — `Activate.ps1` can be blocked by a restrictive execution
 policy.
 
+## Recording a test run (do this for every run)
+
+`evals/record_run.py` runs the suite and writes a results file with
+measured output only — OS and Python version, git commit and whether
+the tree was dirty, the exact command, pass/fail/skip counts, the
+failed and skipped tests with reasons, duration, and who ran it.
+Never hand-edit a results file; re-run the tool to regenerate it.
+`docs/STATUS.md` only counts a "tested" claim when it links to one
+of these files.
+
+```powershell
+# Windows (PowerShell, repo root):
+.\.venv-opencobot\Scripts\python.exe -m evals.record_run --by human
+```
+
+```bash
+# Linux:
+.venv-opencobot/bin/python -m evals.record_run --by human
+```
+
+The file lands in `docs/test-results/<YYYY-MM-DD>-<os>-<shortsha>.md`
+— commit it with your run. A chat message saying "it passed" is not
+evidence; the committed file is.
+
 ## 1. Clone, venv, install
 
 ```powershell
@@ -228,6 +252,34 @@ Extra check, no policyd involved — the in-process tool call:
 **Pass:** prints the `list_dir` result keys with real entries
 from the repo root.
 
+## 10. Behaviours only a human run can prove
+
+Automated tests (even the mock-based Windows tests in step 2) cannot
+prove the items below — they need a real Windows host, a real user
+session and real processes. Fill in each box from your run and commit
+the results file from the recording section above alongside it.
+
+- [ ] **Real named-pipe ACL behaviour** — the different-user
+  negative check in §6b (another local account must NOT connect).
+  Result: _(PASS/FAIL, paste the output or "no second account")_
+- [ ] **PowerShell tool execution** — §5 hostile-input check
+  (metacharacters stay literal) and the blocklist check
+  (`format` refused).
+  Result: _(PASS/FAIL, paste the output)_
+- [ ] **Daemon start / stop / status over the named pipe** — §9 and
+  `daemon start` → `daemon status` → `daemon stop` → `daemon
+  status` (see `docs/STATUS.md` daemon row).
+  Result: _(PASS/FAIL, paste the output)_
+- [ ] **Web UI session login** — `opencobot ui start`, open
+  http://127.0.0.1:8765, sign in with `POST /login` (token in the
+  body only), confirm the status page loads, then `POST /logout`
+  and confirm the session is gone.
+  Result: _(PASS/FAIL, paste what you saw)_
+- [ ] **Kill switch** — with `policyd` running, `opencobot kill`,
+  then a `tool run list_dir` must be denied ("kill switch
+  active"); `opencobot unkill` must let it run again.
+  Result: _(PASS/FAIL, paste the output)_
+
 ## What to report back
 
 For each step: step number, PASS/FAIL, and the pasted output for
@@ -236,4 +288,6 @@ policy-boundary check is anything other than the expected INFO skip
 (step 8), the `tool run` output (step 9), the execution-policy table (step 4),
 and any full-suite failures (step 3). Also report: Windows
 version/edition, Python version, Ollama model used, and available
-RAM.
+RAM. And commit the results file: a run without
+`docs/test-results/<date>-windows-<shortsha>.md` does not count as
+tested in `docs/STATUS.md`.
