@@ -167,6 +167,55 @@ def test_complex_planning_escalates_when_preapproved():
     assert calls == ["cloud-x"]
 
 
+# ---------------------------------------------------------------- chat() cloud gate (R-021)
+
+def test_chat_cloud_backed_refused_without_preapproval():
+    calls = []
+    gw = gateway_with(calls, configs=[cloud_config()])
+    out = gw.chat("EXECUTOR", [{"role": "user", "content": "hi"}], "public")
+    assert out["ok"] is False
+    assert out["text"] is None
+    assert out["provider"] == "cloud-x"
+    assert out["needs_approval"] is True
+    assert out["cost_estimate"] == 0.05
+    assert "needs approval" in out["error"]
+    assert calls == []  # cloud NOT called without pre-approval
+    assert gw.budget_usage("cloud-x") == 0  # refused call not counted
+
+
+def test_chat_cloud_backed_works_when_preapproved():
+    calls = []
+    gw = gateway_with(calls, configs=[cloud_config()])
+    out = gw.chat("EXECUTOR", [{"role": "user", "content": "hi"}], "public",
+                  preapproved=True)
+    assert out["ok"] is True
+    assert out["text"] == "cloud-x-reply"
+    assert out["provider"] == "cloud-x"
+    assert calls == ["cloud-x"]
+
+
+def test_chat_cloud_backed_works_when_role_assigned():
+    calls = []
+    gw = gateway_with(calls)
+    gw.set_role_provider("EXECUTOR", "cloud-x")
+    out = gw.chat("EXECUTOR", [{"role": "user", "content": "hi"}], "public")
+    assert out["ok"] is True
+    assert out["text"] == "cloud-x-reply"
+    assert out["provider"] == "cloud-x"
+    assert calls == ["cloud-x"]
+
+
+def test_chat_local_only_unchanged():
+    calls = []
+    gw = gateway_with(calls, configs=[local_config()])
+    out = gw.chat("EXECUTOR", [{"role": "user", "content": "hi"}], "public")
+    assert out["ok"] is True
+    assert out["text"] == "ollama-local-reply"
+    assert out["provider"] == "ollama-local"
+    assert "needs_approval" not in out
+    assert calls == ["ollama-local"]
+
+
 def test_schema_fail_twice_triggers_escalation():
     calls = []
     gw = gateway_with(calls)
