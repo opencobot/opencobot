@@ -16,6 +16,7 @@ to the same bytes whichever transport carries it.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from core.transport import (
@@ -109,6 +110,33 @@ class PolicyClient:
             raise PolicyAuthError(f"policyd auth file empty: {auth_path}")
         return token
 
+    # Connect retries (Windows single-instance pipe race): the
+    # named-pipe server has exactly one instance
+    # (``core.transport._PIPE_MAX_INSTANCES = 1``) and serves one
+    # connection at a time; after a client disconnects, the server
+    # must recycle the instance (``DisconnectNamedPipe`` +
+    # ``ConnectNamedPipe``) before the next client can connect. A
+    # readiness probe — or any previous call — that just disconnected
+    # can therefore make the very next connect fail transiently
+    # (ERROR_PIPE_BUSY / EINVAL) even though policyd is healthy;
+    # on the laptop this broke CLI ``tool run`` right after
+    # ``ensure_policyd``. Retry the connect only, bounded, with a
+    # short sleep: a failed connect sent no bytes, so retrying
+    # cannot double-apply a request. Auth failures, bad replies and
+    # mid-request failures are NOT retried.
+    _CONNECT_ATTEMPTS = 5
+    _CONNECT_RETRY_DELAY_S = 0.05
+
+    def _connect_with_retry(self):
+        """Connect, retrying transient failures (see above)."""
+        for attempt in range(self._CONNECT_ATTEMPTS):
+            try:
+                return self._transport.connect()
+            except (TransportNotAvailableError, OSError) as exc:
+                if attempt == self._CONNECT_ATTEMPTS - 1:
+                    raise
+                time.sleep(self._CONNECT_RETRY_DELAY_S)
+
     def _request(self, op: str, **fields: object) -> dict:
         """One request/response round-trip over the selected transport.
 
@@ -118,7 +146,7 @@ class PolicyClient:
         """
         payload = {"op": op, "auth": self._auth, **fields}
         try:
-            stream = self._transport.connect()
+            stream = self._connect_with_retry()
         except TransportNotAvailableError as exc:
             raise PolicyUnavailable(str(exc)) from exc
         except OSError as exc:
