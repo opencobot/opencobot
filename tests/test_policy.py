@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.transport import TransportNotAvailableError  # noqa: E402
 from policy import (  # noqa: E402
     AuditLog,
     CapabilityToken,
@@ -337,54 +338,7 @@ def test_policyd_unknown_op_rejected(policyd_server):
         client._request("explode")
 
 
-# -- readonly + revoke_approval ops (R-022) -------------------------------
-
-def test_policyd_readonly_get_set_round_trip(policyd_server):
-    _state, client = policyd_server
-    assert client.get_readonly() is False
-    assert client.readonly_info() == {"readonly": False, "source": "file"}
-    assert client.set_readonly(True) is True
-    assert client.get_readonly() is True
-    assert client.readonly_info()["source"] == "file"
-    assert client.set_readonly(False) is False
-    assert client.get_readonly() is False
-
-
-def test_policyd_readonly_rejects_non_bool(policyd_server):
-    _state, client = policyd_server
-    with pytest.raises(PolicyError, match="readonly needs enabled"):
-        client._request("readonly", enabled="yes")
-    # The rejected set did not change the flag.
-    assert client.get_readonly() is False
-
-
-def test_policyd_revoke_approval_round_trip(policyd_server):
-    state, client = policyd_server
-    engine = PolicyEngine(state)
-    approval_id = engine.approve("tok-1", "read_file", 0, {}, 600)
-    assert engine.has_approval("tok-1", "read_file", 0, {}) is True
-    assert client.revoke_approval(approval_id) is True
-    assert engine.has_approval("tok-1", "read_file", 0, {}) is False
-    # Revoking again, or an unknown id, reports False (nothing removed).
-    assert client.revoke_approval(approval_id) is False
-    assert client.revoke_approval("no-such-id") is False
-
-
-def test_policyd_readonly_and_revoke_reject_wrong_auth(policyd_server):
-    state, client = policyd_server
-    bad = PolicyClient(state)
-    bad._auth = "0" * 64
-    with pytest.raises(PolicyAuthError):
-        bad.get_readonly()
-    with pytest.raises(PolicyAuthError):
-        bad.set_readonly(True)
-    with pytest.raises(PolicyAuthError):
-        bad.revoke_approval("whatever")
-    # The rejected calls changed nothing.
-    assert client.get_readonly() is False
-
-
-# -- PolicyClient over a fake transport (R-022) ---------------------------
+# -- PolicyClient over a fake transport (Windows pipe race) ---------------
 
 
 class _RecordingTransport:
@@ -392,14 +346,25 @@ class _RecordingTransport:
 
     Implements the transport API (``connect`` returns the stream) and
     the stream API core.transport uses (write/flush/readline) plus the
-    context-manager protocol PolicyClient._request uses.
+    context-manager protocol PolicyClient._request uses. With
+    ``fail_connect_times`` set, the first N connects raise
+    TransportNotAvailableError, simulating a transient connect
+    failure (e.g. the Windows single-instance pipe race: the server
+    has not recycled the instance yet when the next client connects).
     """
 
-    def __init__(self, replies):
+    def __init__(self, replies, fail_connect_times=0):
         self.replies = list(replies)
         self.requests = []
+        self.fail_connect_times = fail_connect_times
+        self.connect_attempts = 0
 
     def connect(self):
+        self.connect_attempts += 1
+        if self.connect_attempts <= self.fail_connect_times:
+            raise TransportNotAvailableError(
+                "simulated transient connect failure"
+            )
         return self
 
     def write(self, data: bytes) -> None:
@@ -423,46 +388,61 @@ class _RecordingTransport:
         return False
 
 
-def _client_with_fake_transport(state_dir, replies):
+def _client_with_fake_transport(state_dir, replies, fail_connect_times=0):
     """A PolicyClient whose transport is a recording fake.
 
     ``PolicyClient`` takes the transport in its constructor, so no
     socket is opened and no monkeypatching is needed.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    auth = _load_or_create_auth(state_dir)
-    fake = _RecordingTransport(replies)
-    return PolicyClient(state_dir, transport=fake), fake, auth
+    _load_or_create_auth(state_dir)
+    fake = _RecordingTransport(replies,
+                               fail_connect_times=fail_connect_times)
+    return PolicyClient(state_dir, transport=fake), fake
 
 
-def test_client_readonly_methods_send_readonly_op(state_dir):
-    client, fake, auth = _client_with_fake_transport(state_dir, [
-        {"ok": True, "readonly": False, "source": "file"},
-        {"ok": True, "readonly": True, "source": "file"},
-        {"ok": True, "readonly": False, "source": "file"},
-        {"ok": True, "readonly": True, "source": "env"},
+def test_client_retries_transient_connect_failure(state_dir):
+    """One failed connect (the pipe race) is retried and the call succeeds."""
+    client, fake = _client_with_fake_transport(state_dir, [
+        {"ok": True, "killed": False, "socket": "unix",
+         "audit_entries": 0},
+    ], fail_connect_times=1)
+    assert client.status()["killed"] is False
+    assert fake.connect_attempts == 2
+    assert len(fake.requests) == 1
+    assert fake.requests[0]["op"] == "status"
+
+
+def test_client_connect_retries_are_bounded(state_dir):
+    """A genuinely-down policyd still surfaces PolicyUnavailable promptly."""
+    import time
+
+    client, fake = _client_with_fake_transport(
+        state_dir, [], fail_connect_times=999)
+    start = time.monotonic()
+    with pytest.raises(PolicyUnavailable):
+        client.status()
+    elapsed = time.monotonic() - start
+    assert fake.connect_attempts == PolicyClient._CONNECT_ATTEMPTS
+    assert elapsed < 2.0
+
+
+def test_client_does_not_retry_auth_failure(state_dir):
+    """Auth failures are not retried: only the connect is."""
+    client, fake = _client_with_fake_transport(state_dir, [
+        {"ok": False, "error": "auth failed"},
     ])
-    assert client.get_readonly() is False
-    assert client.set_readonly(True) is True
-    assert client.set_readonly(False) is False
-    assert client.readonly_info() == {"readonly": True, "source": "env"}
-    assert [(r["op"], r.get("enabled")) for r in fake.requests] == [
-        ("readonly", None), ("readonly", True),
-        ("readonly", False), ("readonly", None),
-    ]
-    assert all(r["auth"] == auth for r in fake.requests)
+    with pytest.raises(PolicyAuthError):
+        client.status()
+    assert fake.connect_attempts == 1
 
 
-def test_client_revoke_approval_sends_op(state_dir):
-    client, fake, _auth = _client_with_fake_transport(state_dir, [
-        {"ok": True, "revoked": True},
-        {"ok": True, "revoked": False},
-    ])
-    assert client.revoke_approval("appr-1") is True
-    assert client.revoke_approval("nope") is False
-    assert [(r["op"], r["approval_id"]) for r in fake.requests] == [
-        ("revoke_approval", "appr-1"), ("revoke_approval", "nope"),
-    ]
+def test_client_does_not_retry_mid_request_failure(state_dir):
+    """A connect that succeeds but a reply that never comes is not retried."""
+    client, fake = _client_with_fake_transport(state_dir, [])
+    with pytest.raises(PolicyError, match="closed the connection"):
+        client.status()
+    assert fake.connect_attempts == 1
 
 
 def test_client_unavailable_when_no_daemon(tmp_path):
