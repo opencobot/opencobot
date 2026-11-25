@@ -905,14 +905,42 @@ class Gateway:
         role: str,
         messages: list[dict],
         sensitivity: str = "public",
+        *,
+        preapproved: bool = False,
     ) -> dict:
         """Send messages to the routed provider.
 
         Returns {"ok", "text", "provider", "error"}. Connection failures
         and malformed responses return ok False, never raise. A secret
         routing failure (no local provider) raises ValueError by design.
+
+        A cloud-backed routed provider is only called when it is the
+        role's explicitly assigned provider or ``preapproved`` is True --
+        the same gate ``complete()``/``escalate()`` enforce (R-021).
+        Otherwise the call is refused WITHOUT calling the provider and
+        the result additionally carries "needs_approval": True and
+        "cost_estimate": the estimated cost of the refused call.
         """
         config = self.route(role, sensitivity)
+        assigned = self._role_providers.get(role.upper())
+        if (
+            config.is_cloud_backed
+            and not preapproved
+            and config.name != assigned
+        ):
+            # Cloud call needs approval: show the cost, do not call --
+            # and do not count the refused call against the budget.
+            return {
+                "ok": False,
+                "text": None,
+                "provider": config.name,
+                "error": (
+                    "cloud provider needs approval: "
+                    f"estimated cost {config.cost_per_call}"
+                ),
+                "needs_approval": True,
+                "cost_estimate": config.cost_per_call,
+            }
         if self._budget_exceeded(config.name):
             return {
                 "ok": False,
