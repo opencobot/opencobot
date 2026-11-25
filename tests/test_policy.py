@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.transport import TransportNotAvailableError  # noqa: E402
 from policy import (  # noqa: E402
     AuditLog,
     CapabilityToken,
@@ -335,6 +336,113 @@ def test_policyd_unknown_op_rejected(policyd_server):
     state, client = policyd_server
     with pytest.raises(PolicyError):
         client._request("explode")
+
+
+# -- PolicyClient over a fake transport (Windows pipe race) ---------------
+
+
+class _RecordingTransport:
+    """Stand-in for a policyd connection: records requests, replays replies.
+
+    Implements the transport API (``connect`` returns the stream) and
+    the stream API core.transport uses (write/flush/readline) plus the
+    context-manager protocol PolicyClient._request uses. With
+    ``fail_connect_times`` set, the first N connects raise
+    TransportNotAvailableError, simulating a transient connect
+    failure (e.g. the Windows single-instance pipe race: the server
+    has not recycled the instance yet when the next client connects).
+    """
+
+    def __init__(self, replies, fail_connect_times=0):
+        self.replies = list(replies)
+        self.requests = []
+        self.fail_connect_times = fail_connect_times
+        self.connect_attempts = 0
+
+    def connect(self):
+        self.connect_attempts += 1
+        if self.connect_attempts <= self.fail_connect_times:
+            raise TransportNotAvailableError(
+                "simulated transient connect failure"
+            )
+        return self
+
+    def write(self, data: bytes) -> None:
+        self.requests.append(json.loads(data.decode("utf-8")))
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> bytes:
+        if not self.replies:
+            return b""
+        return (json.dumps(self.replies.pop(0)) + "\n").encode("utf-8")
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _client_with_fake_transport(state_dir, replies, fail_connect_times=0):
+    """A PolicyClient whose transport is a recording fake.
+
+    ``PolicyClient`` takes the transport in its constructor, so no
+    socket is opened and no monkeypatching is needed.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _load_or_create_auth(state_dir)
+    fake = _RecordingTransport(replies,
+                               fail_connect_times=fail_connect_times)
+    return PolicyClient(state_dir, transport=fake), fake
+
+
+def test_client_retries_transient_connect_failure(state_dir):
+    """One failed connect (the pipe race) is retried and the call succeeds."""
+    client, fake = _client_with_fake_transport(state_dir, [
+        {"ok": True, "killed": False, "socket": "unix",
+         "audit_entries": 0},
+    ], fail_connect_times=1)
+    assert client.status()["killed"] is False
+    assert fake.connect_attempts == 2
+    assert len(fake.requests) == 1
+    assert fake.requests[0]["op"] == "status"
+
+
+def test_client_connect_retries_are_bounded(state_dir):
+    """A genuinely-down policyd still surfaces PolicyUnavailable promptly."""
+    import time
+
+    client, fake = _client_with_fake_transport(
+        state_dir, [], fail_connect_times=999)
+    start = time.monotonic()
+    with pytest.raises(PolicyUnavailable):
+        client.status()
+    elapsed = time.monotonic() - start
+    assert fake.connect_attempts == PolicyClient._CONNECT_ATTEMPTS
+    assert elapsed < 2.0
+
+
+def test_client_does_not_retry_auth_failure(state_dir):
+    """Auth failures are not retried: only the connect is."""
+    client, fake = _client_with_fake_transport(state_dir, [
+        {"ok": False, "error": "auth failed"},
+    ])
+    with pytest.raises(PolicyAuthError):
+        client.status()
+    assert fake.connect_attempts == 1
+
+
+def test_client_does_not_retry_mid_request_failure(state_dir):
+    """A connect that succeeds but a reply that never comes is not retried."""
+    client, fake = _client_with_fake_transport(state_dir, [])
+    with pytest.raises(PolicyError, match="closed the connection"):
+        client.status()
+    assert fake.connect_attempts == 1
 
 
 def test_client_unavailable_when_no_daemon(tmp_path):
