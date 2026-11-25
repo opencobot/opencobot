@@ -9,6 +9,7 @@ real AF_UNIX server thread; Windows tests fake the platform
 proven on the laptop, not here.
 """
 
+import ctypes
 import io
 import json
 import os
@@ -408,6 +409,158 @@ def test_cmd_daemon_stop_windows_no_pid_not_running(state_dir, monkeypatch, caps
     assert rc == 1
     # JSON mode emits the payload, not the human message.
     assert json.loads(capsys.readouterr().out)["running"] is False
+
+
+# ---------------------------------------------------------------------------
+# _pid_alive / _terminate_pid on Windows (stop skipped the kill)
+# ---------------------------------------------------------------------------
+
+def _fake_kernel32(exit_codes=(), open_error=0):
+    """Minimal kernel32 stand-in for _pid_alive_windows tests.
+
+    ``exit_codes`` is the sequence GetExitCodeProcess returns (one
+    per call; exhausted -> 0, i.e. exited). ``open_error`` is the
+    Win32 error GetLastError returns when OpenProcess returns NULL
+    (0 means OpenProcess succeeds and returns a fake handle).
+    The functions are plain closures (not bound methods) so the
+    implementation can set restype/argtypes attributes on them.
+    """
+    state = {"exit_codes": list(exit_codes), "opened": [], "closed": []}
+
+    def open_process(access, inherit, pid):
+        state["opened"].append(pid)
+        if open_error:
+            return 0
+        return 12345  # fake non-null handle
+
+    def get_exit_code(handle, out):
+        code = state["exit_codes"].pop(0) if state["exit_codes"] else 0
+        ctypes.cast(out,
+                    ctypes.POINTER(ctypes.c_ulong)).contents.value = code
+        return True
+
+    def close_handle(handle):
+        state["closed"].append(handle)
+        return True
+
+    def get_last_error():
+        return open_error
+
+    return types.SimpleNamespace(
+        OpenProcess=open_process,
+        GetExitCodeProcess=get_exit_code,
+        CloseHandle=close_handle,
+        GetLastError=get_last_error,
+        _state=state,
+    )
+
+
+def _patch_fake_windll(monkeypatch, kernel32):
+    """Install a fake ctypes.windll (absent on Linux) for the CLI."""
+    import cli.opencobot_cli as cli_mod
+
+    monkeypatch.setattr(cli_mod.ctypes, "windll",
+                        types.SimpleNamespace(kernel32=kernel32),
+                        raising=False)
+
+
+def test_cmd_daemon_stop_windows_kills_live_process_despite_winerror87(
+        state_dir, monkeypatch, capsys):
+    """The reported bug: os.kill(pid, 0) raises WinError 87 for a
+    start_new_session process, so the old _pid_alive said "dead" and
+    daemon stop skipped the kill while printing "daemon stopped".
+    The ctypes check says alive, so the process tree is terminated."""
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+
+    def fake_kill(pid, sig):
+        err = OSError(87, "The parameter is incorrect")
+        err.winerror = 87
+        raise err
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    # First liveness probe (the stop decision): alive. Second (the
+    # wait loop after taskkill): gone, so the loop exits at once.
+    kernel32 = _fake_kernel32(exit_codes=[259, 0])
+    _patch_fake_windll(monkeypatch, kernel32)
+    calls = []
+    monkeypatch.setattr(cli_mod.subprocess, "run",
+                        lambda argv, **kw: calls.append(argv))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 0
+    assert calls == [["taskkill", "/T", "/F", "/PID", "380"]]
+    assert not (state_dir / "daemon.pid").exists()
+    assert json.loads(capsys.readouterr().out)["running"] is False
+
+
+def test_cmd_ui_stop_windows_kills_live_process_despite_winerror87(
+        state_dir, monkeypatch, capsys):
+    """Same bug, same helpers, through ui stop."""
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+
+    def fake_kill(pid, sig):
+        err = OSError(87, "The parameter is incorrect")
+        err.winerror = 87
+        raise err
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    kernel32 = _fake_kernel32(exit_codes=[259, 0])
+    _patch_fake_windll(monkeypatch, kernel32)
+    calls = []
+    monkeypatch.setattr(cli_mod.subprocess, "run",
+                        lambda argv, **kw: calls.append(argv))
+    (state_dir / "ui.pid").write_text("381", encoding="utf-8")
+    rc = cli_mod.cmd_ui_stop(_ns(state_dir))
+    assert rc == 0
+    assert calls == [["taskkill", "/T", "/F", "/PID", "381"]]
+    assert not (state_dir / "ui.pid").exists()
+
+
+def test_terminate_pid_windows_kills_tree(monkeypatch):
+    """taskkill gets /T: the recorded pid is the .venv launcher, the
+    real daemon is its child."""
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    calls = []
+    monkeypatch.setattr(cli_mod.subprocess, "run",
+                        lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(cli_mod, "_pid_alive", lambda pid: False)
+    cli_mod._terminate_pid(1234)
+    assert calls == [["taskkill", "/T", "/F", "/PID", "1234"]]
+
+
+def test_pid_alive_windows_dead_pid_is_dead(monkeypatch):
+    """OpenProcess failing (here: error 87, no such process) is dead —
+    the WinError-87 catch was rejected for exactly this reason."""
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    _patch_fake_windll(monkeypatch, _fake_kernel32(open_error=87))
+    assert cli_mod._pid_alive(999999) is False
+
+
+def test_pid_alive_windows_access_denied_is_alive(monkeypatch):
+    """OpenProcess failing with access-denied means the process exists
+    (fail closed: alive)."""
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    _patch_fake_windll(monkeypatch, _fake_kernel32(open_error=5))
+    assert cli_mod._pid_alive(999999) is True
+
+
+def test_pid_alive_windows_exited_process_is_dead(monkeypatch):
+    """A handle whose exit code is not STILL_ACTIVE is dead."""
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    _patch_fake_windll(monkeypatch, _fake_kernel32(exit_codes=[0]))
+    assert cli_mod._pid_alive(999999) is False
 
 
 # ---------------------------------------------------------------------------

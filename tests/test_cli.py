@@ -199,7 +199,9 @@ def test_terminate_pid_uses_taskkill_on_windows(monkeypatch):
                         lambda argv, **kw: calls.append(argv))
     monkeypatch.setattr(cli_mod, "_pid_alive", lambda pid: False)
     cli_mod._terminate_pid(1234)
-    assert calls == [["taskkill", "/F", "/PID", "1234"]]
+    # /T: kill the whole process tree — the recorded pid is the .venv
+    # launcher, the real daemon is its child.
+    assert calls == [["taskkill", "/T", "/F", "/PID", "1234"]]
 
 
 def test_terminate_pid_posix_exits_after_sigterm(monkeypatch):
