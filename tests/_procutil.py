@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "force_kill_pid",
     "kill_pid_file",
     "reap_pid_file",
+    "unique_policyd_pipe",
 ]
 
 
@@ -121,3 +123,26 @@ def reap_pid_file(state_dir, name: str, timeout: float = 2.0) -> None:
             return
         time.sleep(0.05)
     force_kill_pid(pid)
+
+
+def unique_policyd_pipe(monkeypatch) -> str:
+    """Point policyd at a fresh named pipe for this test only.
+
+    Sets ``OPENCOBOT_POLICYD_PIPE`` (via ``monkeypatch``, so the
+    value is undone when the test ends) to a unique per-test pipe
+    name, and returns it. Every fixture / test that starts a real
+    policyd server (``policy.policyd.serve`` in a thread, or a
+    subprocess spawned while the fixture is live) must call this
+    BEFORE starting the server, so a leaked or un-reaped server from
+    an earlier test cannot hold the single global pipe and block the
+    next server — the Windows full-suite failure in
+    docs/test-results/2026-11-25-windows-ffa7b3c.md (13 webui ERRORs
+    + policyd/daemon FAILs). On Linux the pipe path is unused (the
+    Unix socket is used), so the call is harmless there. The server
+    and its clients all read the address through
+    ``core.transport.policyd_pipe_path()``, including subprocesses,
+    which inherit the environment.
+    """
+    name = rf"\\.\pipe\opencobot-policyd-test-{uuid.uuid4().hex[:12]}"
+    monkeypatch.setenv("OPENCOBOT_POLICYD_PIPE", name)
+    return name

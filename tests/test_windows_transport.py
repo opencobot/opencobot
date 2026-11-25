@@ -12,6 +12,7 @@ to start only when the Win32 API is unavailable (fail closed).
 import ctypes
 import io
 import json
+import os
 import socket
 import threading
 import types
@@ -34,6 +35,7 @@ from core.transport import (  # noqa: E402
     UnixSocketTransport,
     decode_message,
     encode_message,
+    policyd_pipe_path,
 )
 from policy import (  # noqa: E402
     PolicyAuthError,
@@ -42,6 +44,7 @@ from policy import (  # noqa: E402
 )
 from policy.engine import PolicyEngine  # noqa: E402
 from policy.policyd import handle_request, serve  # noqa: E402
+from tests._procutil import unique_policyd_pipe  # noqa: E402
 
 
 class FakePipe:
@@ -284,6 +287,45 @@ def test_named_pipe_client_selected_on_windows(auth_state, windows_platform):
     with pytest.raises(PolicyUnavailable,
                        match="cannot connect to named pipe"):
         client.status()
+
+
+# ---------------------------------------------------------------------------
+# policyd_pipe_path(): env override for per-test isolation
+# ---------------------------------------------------------------------------
+
+def test_policyd_pipe_path_defaults_to_fixed_pipe(monkeypatch):
+    """No env var: the fixed global pipe, production behaviour."""
+    monkeypatch.delenv("OPENCOBOT_POLICYD_PIPE", raising=False)
+    assert policyd_pipe_path() == POLICYD_PIPE_PATH
+
+
+def test_policyd_pipe_path_uses_env_override(monkeypatch):
+    monkeypatch.setenv("OPENCOBOT_POLICYD_PIPE",
+                       r"\\.\pipe\opencobot-policyd-test-abc")
+    assert policyd_pipe_path() == r"\\.\pipe\opencobot-policyd-test-abc"
+
+
+def test_policy_client_picks_up_env_pipe(auth_state, windows_platform,
+                                         monkeypatch):
+    """PolicyClient (and, through it, the daemon and the web UI, which
+    construct their client internally) talks to the env-set pipe."""
+    unique = r"\\.\pipe\opencobot-policyd-test-abc"
+    monkeypatch.setenv("OPENCOBOT_POLICYD_PIPE", unique)
+    client = PolicyClient(auth_state)
+    assert client.pipe_path == unique
+    assert isinstance(client._transport, NamedPipeTransport)
+    assert client._transport.pipe_path == unique
+
+
+def test_unique_policyd_pipe_helper_yields_distinct_names(monkeypatch):
+    """The fixture helper hands out a different pipe name per call,
+    and leaves the env var pointing at the latest one."""
+    first = unique_policyd_pipe(monkeypatch)
+    second = unique_policyd_pipe(monkeypatch)
+    assert first != second
+    assert first.startswith("\\\\.\\pipe\\opencobot-policyd-test-")
+    assert second.startswith("\\\\.\\pipe\\opencobot-policyd-test-")
+    assert os.environ["OPENCOBOT_POLICYD_PIPE"] == second
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason=(

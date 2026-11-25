@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy.client import PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
 from policy.policyd import _load_or_create_auth, serve  # noqa: E402
-from tests._procutil import kill_pid_file  # noqa: E402
+from tests._procutil import kill_pid_file, unique_policyd_pipe  # noqa: E402
 from tests.test_policy import _RecordingTransport  # noqa: E402
 from ui.web import (  # noqa: E402
     WebUIBackend,
@@ -36,7 +36,8 @@ CLI = [sys.executable, "-m", "cli.opencobot_cli"]
 
 
 @pytest.fixture()
-def server(tmp_path):
+def server(tmp_path, monkeypatch):
+    unique_policyd_pipe(monkeypatch)
     state_dir = tmp_path / "state"
     # R-022: the UI routes policy writes through policyd, so policyd
     # must be running for approve/readonly/kill to work.

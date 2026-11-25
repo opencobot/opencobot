@@ -26,6 +26,7 @@ from core.runtime import Runtime  # noqa: E402
 from policy.client import PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
 from policy.policyd import _load_or_create_auth, serve  # noqa: E402
+from tests._procutil import unique_policyd_pipe  # noqa: E402
 from tests.test_policy import _RecordingTransport  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -162,10 +163,11 @@ def test_runtime_readonly_l0_allowed_l1_denied(state_dir, scope):
 
 # -- daemon ops -------------------------------------------------------------
 
-def test_daemon_readonly_ops(state_dir):
+def test_daemon_readonly_ops(state_dir, monkeypatch):
     # R-022: daemon writes go through policyd, so policyd must be
     # running for the set to succeed. The daemon itself is created
     # after policyd is up (its PolicyClient is cached on first use).
+    unique_policyd_pipe(monkeypatch)
     state_dir.mkdir(parents=True, exist_ok=True)
     stop = threading.Event()
     thread = threading.Thread(target=serve, args=(state_dir, stop),

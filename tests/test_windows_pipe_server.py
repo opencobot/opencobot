@@ -23,6 +23,7 @@ docs/WINDOWS_TESTING.md §6.
 import platform
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,7 @@ from core.transport import (  # noqa: E402
     encode_message,
 )
 from policy.policyd import serve as policyd_serve  # noqa: E402
+from tests._procutil import unique_policyd_pipe  # noqa: E402
 
 import ctypes  # noqa: E402
 
@@ -217,6 +219,37 @@ def _listen(api, pipe_path=POLICYD_PIPE_PATH, handler=None, stop=None):
         handler = _echo_handler(calls)
     NamedPipeListener(pipe_path, api=api).listen(handler=handler, stop=stop)
     return calls
+
+
+class _RegistryFakeApi(FakeWindowsPipeApi):
+    """Fake Win32 pipe API with a shared registry of bound pipe names.
+
+    Models the real ``CreateNamedPipeW`` behaviour: creating a second
+    pipe with a name that is already bound fails, and closing the
+    handle releases the name. ``wait_for_client`` blocks until the
+    listener is stopped, so the pipe stays bound while the listener
+    thread is alive. The registry is class-level (the OS pipe
+    namespace is process-wide), so tests must clear it first/last.
+    """
+
+    bound: set = set()
+
+    def create_pipe(self, pipe_path, sa):
+        if pipe_path in type(self).bound:
+            raise OSError(f"pipe {pipe_path} is already bound")
+        type(self).bound.add(pipe_path)
+        self._bound_path = pipe_path
+        return super().create_pipe(pipe_path, sa)
+
+    def close(self, handle):
+        type(self).bound.discard(getattr(self, "_bound_path", None))
+        super().close(handle)
+
+    def wait_for_client(self, handle, stop):
+        if stop is not None:
+            while not stop.is_set():
+                time.sleep(0.01)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -580,3 +613,94 @@ def test_daemon_serve_forever_hands_listener_its_handler(
     assert reply["policyd_reachable"] is False
     assert listener.handler(
         {"op": "status", "auth": "wrong"})["error"] == "unauthorized"
+
+
+# ---------------------------------------------------------------------------
+# Per-test pipe isolation (Windows full-suite failures, PR #36)
+# ---------------------------------------------------------------------------
+
+def test_two_unique_pipes_coexist_and_bound_name_collides(windows_platform):
+    """Collision mechanism, mock-proven: two listeners on two unique
+    pipe names both start; a second listener on an already-bound name
+    fails; after the first stops, its name can be bound again.
+
+    This is the mechanism behind the Windows full-suite failures in
+    docs/test-results/2026-11-25-windows-ffa7b3c.md: every fixture
+    server bound the same fixed global pipe, so a leaked server
+    blocked the next one. The fix (a unique OPENCOBOT_POLICYD_PIPE
+    per test) makes each server hold only its own name.
+    """
+    _RegistryFakeApi.bound.clear()
+    try:
+        name_a = r"\\.\pipe\opencobot-policyd-test-aaaa"
+        name_b = r"\\.\pipe\opencobot-policyd-test-bbbb"
+        stop_a, stop_b = threading.Event(), threading.Event()
+        errors: list = []
+
+        def _run(api, name, stop):
+            try:
+                _listen(api, name, None, stop)
+            except Exception as exc:  # noqa: BLE001 - recorded for assert
+                errors.append(exc)
+
+        thread_a = threading.Thread(
+            target=_run, args=(_RegistryFakeApi(), name_a, stop_a),
+            daemon=True)
+        thread_b = threading.Thread(
+            target=_run, args=(_RegistryFakeApi(), name_b, stop_b),
+            daemon=True)
+        thread_a.start()
+        thread_b.start()
+        try:
+            deadline = time.time() + 5
+            while {name_a, name_b} - _RegistryFakeApi.bound:
+                assert time.time() < deadline, "listener did not bind in time"
+                time.sleep(0.01)
+            assert errors == []
+            # Second listener on the already-bound name fails.
+            with pytest.raises(TransportNotAvailableError):
+                _listen(_RegistryFakeApi(), name_a, None, threading.Event())
+            # After the first stops, its name can be bound again.
+            stop_a.set()
+            thread_a.join(timeout=5)
+            assert not thread_a.is_alive()
+            assert name_a not in _RegistryFakeApi.bound
+            stop_a2 = threading.Event()
+            thread_a2 = threading.Thread(
+                target=_run, args=(_RegistryFakeApi(), name_a, stop_a2),
+                daemon=True)
+            thread_a2.start()
+            deadline = time.time() + 5
+            while name_a not in _RegistryFakeApi.bound:
+                assert time.time() < deadline, "re-bind did not happen in time"
+                time.sleep(0.01)
+            stop_a2.set()
+            thread_a2.join(timeout=5)
+            assert not thread_a2.is_alive()
+            assert errors == []
+        finally:
+            stop_a.set()
+            stop_b.set()
+            thread_a.join(timeout=5)
+            thread_b.join(timeout=5)
+    finally:
+        _RegistryFakeApi.bound.clear()
+
+
+def test_policyd_serve_passes_env_pipe_to_listener(
+        tmp_path, windows_platform, stub_listener, monkeypatch):
+    """serve() listens on the OPENCOBOT_POLICYD_PIPE override, and the
+    status reply reports that same pipe — client and server agree."""
+    unique = unique_policyd_pipe(monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    stop = threading.Event()
+    policyd_serve(state, stop)
+    assert len(stub_listener.instances) == 1
+    listener = stub_listener.instances[0]
+    assert listener.pipe_path == unique
+    assert listener.stop is stop
+    token = (state / "policyd.auth").read_text(encoding="utf-8").strip()
+    reply = listener.handler({"op": "status", "auth": token})
+    assert reply["ok"] is True
+    assert reply["socket"] == unique

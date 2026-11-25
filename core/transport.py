@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import platform
 import socket
 import sys
@@ -66,6 +67,7 @@ __all__ = [
     "POLICYD_PIPE_PATH",
     "DAEMON_PIPE_PATH",
     "PIPE_PATH_PREFIX",
+    "policyd_pipe_path",
     "TransportNotAvailableError",
     "is_windows",
     "transport_kind",
@@ -81,6 +83,23 @@ __all__ = [
 POLICYD_PIPE_PATH = r"\\.\pipe\opencobot-policyd"
 DAEMON_PIPE_PATH = r"\\.\pipe\opencobot-daemon"
 PIPE_PATH_PREFIX = "\\\\.\\pipe\\"  # literal: \\.\pipe\
+
+
+def policyd_pipe_path() -> str:
+    """Named-pipe address policyd listens on / clients connect to.
+
+    Default is the fixed global pipe (``POLICYD_PIPE_PATH``).
+    Tests may set ``OPENCOBOT_POLICYD_PIPE`` to a unique per-test
+    name so fixture servers do not collide on the single global pipe
+    on Windows (see docs/test-results/2026-11-25-windows-ffa7b3c.md:
+    13 webui ERRORs + policyd/daemon FAILs from a leaked fixture
+    server holding the global pipe). Production never sets it, and
+    the real policyd keeps the fixed global pipe — the single-instance
+    property is deliberate (PR #32); raising max_instances stays
+    rejected. Follows the existing ``OPENCOBOT_READONLY`` /
+    ``OPENCOBOT_STATE`` env-override precedent.
+    """
+    return os.environ.get("OPENCOBOT_POLICYD_PIPE") or POLICYD_PIPE_PATH
 
 
 class TransportNotAvailableError(OSError):
