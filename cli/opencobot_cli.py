@@ -17,6 +17,7 @@ The policyd auth secret is never printed.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import signal
@@ -214,7 +215,68 @@ def _daemon_reachable(state_dir):
     return daemon_reachable(state_dir)
 
 
+def _pid_alive_windows(pid):
+    """True when a Windows process with this pid is running.
+
+    ``os.kill(pid, 0)`` cannot be used here: on Windows it only
+    accepts CTRL_C_EVENT / CTRL_BREAK_EVENT, and for a process
+    started with ``start_new_session=True`` (its own process group,
+    no shared console) it raises ``OSError: [WinError 87]`` even
+    though the process is alive — so the old check reported every
+    daemon/UI process as dead, ``daemon stop`` / ``ui stop`` skipped
+    the kill entirely, and ``daemon start`` unlinked a live pid file
+    and started a second daemon. Query the process directly instead:
+    ``OpenProcess`` + ``GetExitCodeProcess`` (``STILL_ACTIVE``).
+
+    A WinError 87 from ``os.kill`` is NOT used as the liveness
+    signal: it fires for a dead pid too, so treating it as "alive"
+    would make the stop wait loop burn the full 5 s and a stale pid
+    file block ``daemon start``. ``OpenProcess`` distinguishes:
+    access-denied (5) means the process exists but cannot be
+    queried (fail closed: alive); anything else on a NULL handle
+    means no such process.
+
+    Prototypes are set explicitly — ctypes would otherwise truncate
+    64-bit handles (default restype int); same rule as
+    ``core/transport.py`` ``_CtypesWindowsPipeApi._setup_prototypes``.
+    The error is read with the raw ``GetLastError`` API call right
+    after the failed ``OpenProcess`` (``ctypes.get_last_error()`` is
+    not used: it is only reliable for DLLs loaded with
+    ``use_last_error=True``).
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+    except Exception:
+        return True  # cannot check: fail closed (assume alive)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [
+        ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_bool
+    kernel32.GetExitCodeProcess.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.GetLastError.restype = ctypes.c_ulong
+    kernel32.GetLastError.argtypes = []
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_ACCESS_DENIED (5): exists, cannot query.
+        return kernel32.GetLastError() == 5
+    try:
+        exit_code = ctypes.c_ulong(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # cannot read the exit code: fail closed
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid):
+    if sys.platform == "win32":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -226,13 +288,15 @@ def _terminate_pid(pid):
     """Stop a daemon/UI process, portably (BUG-D: SIGTERM is invalid on Windows).
 
     POSIX: SIGTERM, wait up to 5s for exit, then SIGKILL. Windows:
-    ``taskkill /F`` — ``os.kill`` there accepts only CTRL_C_EVENT /
+    ``taskkill /T /F`` — ``os.kill`` there accepts only CTRL_C_EVENT /
     CTRL_BREAK_EVENT, so any other signal raises WinError 87; taskkill
-    is the only reliable kill. Returns after the process is gone or
-    the wait expires.
+    is the only reliable kill. ``/T`` terminates the whole process
+    tree: the recorded pid is the ``.venv`` launcher, the real daemon
+    is its child, and ``/F`` alone leaves the child running. Returns
+    after the process is gone or the wait expires.
     """
     if sys.platform == "win32":
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.time() + 5.0
         while time.time() < deadline and _pid_alive(pid):
