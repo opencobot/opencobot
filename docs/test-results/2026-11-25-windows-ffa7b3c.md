@@ -13,7 +13,7 @@ Do not hand-edit this file; re-run the tool to regenerate it.
 ## Command
 
 ```
-D:\Programming\Projects\opencobot\.venv-opencobot\Scripts\python.exe -m pytest -q -rs
+D:\Programming\Projects\opencobot\.venv-opencobot\Scripts\python.exe -m pytest -q -rfEs
 ```
 
 ## Result
@@ -22,12 +22,54 @@ D:\Programming\Projects\opencobot\.venv-opencobot\Scripts\python.exe -m pytest -
 - Failed: 30
 - Skipped: 26
 - Errors: 13
-- Duration: 335.39s
-- Summary line: `30 failed, 590 passed, 26 skipped, 18 warnings, 13 errors in 334.79s (0:05:34)`
+- Duration: 316.83s
+- Summary line: `30 failed, 590 passed, 26 skipped, 18 warnings, 13 errors in 316.42s (0:05:16)`
 
 ## Failed tests
 
-None.
+- `FAILED tests/test_audit.py::test_concurrent_appends_from_two_processes_keep_chain`
+- `FAILED tests/test_audit_windows.py::test_real_module_restored_after_blocked_imports`
+- `FAILED tests/test_cli.py::test_tool_run_list_dir_succeeds_and_is_verified - A...`
+- `FAILED tests/test_cli.py::test_terminate_pid_posix_sigkill_when_stubborn - At...`
+- `FAILED tests/test_evals.py::test_task_suite_all_pass - AssertionError: failin...`
+- `FAILED tests/test_network_flag.py::test_cli_token_issue_network_flag - Assert...`
+- `FAILED tests/test_network_flag.py::test_cli_network_tool_allowed_with_flag - ...`
+- `FAILED tests/test_policy.py::test_approvals_file_is_0600 - assert 438 == 384`
+- `FAILED tests/test_policy.py::test_deny_symlink_escape_via_resolved_path - OSE...`
+- `FAILED tests/test_policy.py::test_allow_symlink_staying_inside_scope - OSErro...`
+- `FAILED tests/test_policy.py::test_policyd_wrong_auth_rejected - policy.client...`
+- `FAILED tests/test_policy.py::test_policyd_auth_file_reused_and_0600 - Asserti...`
+- `FAILED tests/test_policy.py::test_policyd_unknown_op_rejected - policy.client...`
+- `FAILED tests/test_policy.py::test_policyd_readonly_rejects_non_bool - policy....`
+- `FAILED tests/test_policy.py::test_policyd_readonly_and_revoke_reject_wrong_auth`
+- `FAILED tests/test_r006_permissions.py::test_enforce_state_permissions_tightens_wide_bits`
+- `FAILED tests/test_r006_permissions.py::test_engine_startup_tightens_state_dir`
+- `FAILED tests/test_r006_permissions.py::test_policyd_startup_sets_socket_and_files_0600`
+- `FAILED tests/test_r006_permissions.py::test_doctor_reports_same_user_boundary`
+- `FAILED tests/test_r006_permissions.py::test_doctor_reports_permission_bits - ...`
+- `FAILED tests/test_r006_permissions.py::test_doctor_tightens_wide_permissions`
+- `FAILED tests/test_r006_permissions.py::test_separate_state_dir_is_respected`
+- `FAILED tests/test_readonly.py::test_readonly_persists_across_engine_restart`
+- `FAILED tests/test_readonly.py::test_daemon_readonly_ops - AssertionError: pol...`
+- `FAILED tests/test_runtime.py::test_daemon_status_list_tools_and_policyd_unavailable`
+- `FAILED tests/test_tools.py::test_symlink_escape_denied - OSError: [WinError 1...`
+- `FAILED tests/test_tools.py::test_list_dir_and_verify - AssertionError: assert...`
+- `FAILED tests/test_webui.py::test_backend_status_falls_back_when_policyd_down`
+- `FAILED tests/test_windows_transport.py::test_unix_client_unavailable_without_server`
+- `FAILED tests/test_windows_transport.py::test_named_pipe_client_selected_on_windows`
+- `ERROR tests/test_webui.py::test_missing_token_rejected - AssertionError: poli...`
+- `ERROR tests/test_webui.py::test_wrong_token_rejected - AssertionError: policy...`
+- `ERROR tests/test_webui.py::test_token_in_query_param_rejected - AssertionErro...`
+- `ERROR tests/test_webui.py::test_unauthenticated_root_serves_login_form - Asse...`
+- `ERROR tests/test_webui.py::test_status_page_and_api_status - AssertionError: ...`
+- `ERROR tests/test_webui.py::test_tools_and_providers - AssertionError: policyd...`
+- `ERROR tests/test_webui.py::test_benchmark_endpoint_returns_report - Assertion...`
+- `ERROR tests/test_webui.py::test_unknown_path_404 - AssertionError: policyd di...`
+- `ERROR tests/test_webui.py::test_readonly_toggle_through_ui - AssertionError: ...`
+- `ERROR tests/test_webui.py::test_readonly_post_needs_boolean - AssertionError:...`
+- `ERROR tests/test_webui.py::test_kill_through_ui - AssertionError: policyd did...`
+- `ERROR tests/test_webui.py::test_approvals_list_approve_deny - AssertionError:...`
+- `ERROR tests/test_webui.py::test_audit_endpoint_shows_actions - AssertionError...`
 
 ## Skipped tests (with reasons)
 
