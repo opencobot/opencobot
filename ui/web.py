@@ -260,11 +260,44 @@ class WebUIBackend:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
-    # -- policy engine (fresh instance per call: reads files live) -----
-    def _engine(self):
-        from policy.engine import PolicyEngine  # type: ignore[import-not-found]
+    # -- policyd client (fresh instance per call: reads the auth live) --
+    # R-022: the backend used to build a PolicyEngine in-process for
+    # every policy call, bypassing policyd. All policy writes and the
+    # readonly/killed reads now go through the PolicyClient instead, so
+    # policy state is only ever changed by the separate policyd
+    # process. This buys process separation, not file secrecy: the
+    # client reads the same state dir, and a same-user attacker could
+    # still read those files directly (R-006 — unchanged).
+    def _policyd(self):
+        """A PolicyClient for this state dir, or None if unusable.
 
-        return PolicyEngine(self.state_dir)
+        None when policyd has never run (no auth file yet) or the
+        client cannot be constructed; callers that need a live policyd
+        raise, callers that can degrade fall back to direct reads.
+        """
+        try:
+            from policy.client import PolicyClient  # lazy: heavy import
+
+            return PolicyClient(self.state_dir)
+        except Exception:
+            return None
+
+    def _readonly_env_override(self) -> bool | None:
+        """The OPENCOBOT_READONLY override, read directly.
+
+        Mirrors ``policy.engine._env_readonly_override`` (same variable
+        name and truthy/falsy sets) so the status fallback below keeps
+        its exact semantics without importing ``policy.engine``.
+        """
+        raw = os.environ.get("OPENCOBOT_READONLY")
+        if raw is None:
+            return None
+        normalized = raw.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+        return None
 
     def _tool_level(self, tool_name: str) -> int:
         """Registered permission level of a tool (0 when unknown)."""
@@ -286,19 +319,50 @@ class WebUIBackend:
         from core.daemon import daemon_reachable  # lazy: heavy import
         from policy.client import policyd_reachable  # lazy: heavy import
 
-        engine = self._engine()
         tools = self.tools()
+        # Read-only / killed / audit count come from policyd when it
+        # answers. When it does not, the status page must still load,
+        # so these read the state files directly (read-only fallback,
+        # mirroring the daemon's): the env override wins for the flag,
+        # the killswitch file decides "killed". Writes never fall
+        # back — they fail closed (see set_readonly / set_killed).
+        client = self._policyd()
+        if client is not None:
+            try:
+                info = client.readonly_info()
+                policyd_status = client.status()
+                readonly = bool(info["readonly"])
+                readonly_source = str(info.get("source", "file"))
+                killed = bool(policyd_status["killed"])
+                audit_entries = int(policyd_status["audit_entries"])
+            except Exception:
+                client = None
+        if client is None:
+            override = self._readonly_env_override()
+            if override is not None:
+                readonly, readonly_source = override, "env"
+            else:
+                try:
+                    data = json.loads(
+                        (self.state_dir / "readonly.json").read_text()
+                    )
+                    readonly = bool(data.get("readonly", False))
+                except (OSError, ValueError, AttributeError):
+                    readonly = False
+                readonly_source = "file"
+            killed = (self.state_dir / "killswitch").exists()
+            audit_entries = len(self.audit(limit=MAX_AUDIT_LIMIT * 10))
         return {
             "ok": True,
-            "readonly": bool(engine.is_readonly()),
-            "readonly_source": engine.readonly_source(),
-            "killed": bool(engine.is_killed()),
+            "readonly": readonly,
+            "readonly_source": readonly_source,
+            "killed": killed,
             "tools": len(tools),
             "daemon_running": daemon_reachable(self.state_dir),
             # Key kept as "policyd_socket" (status API); its value is
             # now real reachability, not file existence.
             "policyd_socket": policyd_reachable(self.state_dir),
-            "audit_entries": len(self.audit(limit=MAX_AUDIT_LIMIT * 10)),
+            "audit_entries": audit_entries,
             "providers": [p["name"] for p in self.providers()],
         }
 
@@ -318,12 +382,27 @@ class WebUIBackend:
 
     def approve(self, token_id: str, tool_name: str, level: int | None = None,
                 args: dict | None = None, duration: int = 600) -> str:
-        """Approve exactly one call (R-007): (token, tool, level, args)."""
-        return str(self._engine().approve(token_id, tool_name, level,
-                                          args, duration))
+        """Approve exactly one call (R-007): (token, tool, level, args).
+
+        Via policyd (R-022). Raises when policyd is unreachable — the
+        handler turns that into a 500 rather than recording an approval
+        no policy process ever saw.
+        """
+        client = self._policyd()
+        if client is None:
+            from policy.client import PolicyUnavailable  # lazy
+
+            raise PolicyUnavailable("policyd unavailable")
+        return str(client.approve(token_id, tool_name, level, args, duration))
 
     def revoke_approval(self, approval_id: str) -> bool:
-        return bool(self._engine().revoke_approval(approval_id))
+        """Remove an approval by id via policyd (R-022)."""
+        client = self._policyd()
+        if client is None:
+            from policy.client import PolicyUnavailable  # lazy
+
+            raise PolicyUnavailable("policyd unavailable")
+        return bool(client.revoke_approval(approval_id))
 
     def audit(self, limit: int = 50) -> list[dict]:
         from policy.audit import AuditLog  # type: ignore[import-not-found]
@@ -332,12 +411,33 @@ class WebUIBackend:
         return entries[-max(0, limit):]
 
     def set_readonly(self, enabled: bool) -> bool:
-        return bool(self._engine().set_readonly(bool(enabled)))
+        """Persist the read-only flag via policyd (R-022).
+
+        Raises when policyd is unreachable — the handler turns that
+        into a 500 rather than writing readonly.json directly.
+        """
+        client = self._policyd()
+        if client is None:
+            from policy.client import PolicyUnavailable  # lazy
+
+            raise PolicyUnavailable("policyd unavailable")
+        return bool(client.set_readonly(bool(enabled)))
 
     def set_killed(self, killed: bool) -> bool:
-        engine = self._engine()
-        engine.set_kill(bool(killed))
-        return bool(engine.is_killed())
+        """Set/clear the kill switch via policyd (R-022).
+
+        Raises when policyd is unreachable, like set_readonly.
+        """
+        client = self._policyd()
+        if client is None:
+            from policy.client import PolicyUnavailable  # lazy
+
+            raise PolicyUnavailable("policyd unavailable")
+        if killed:
+            client.kill()
+        else:
+            client.unkill()
+        return bool(client.status()["killed"])
 
     def providers(self) -> list[dict]:
         try:

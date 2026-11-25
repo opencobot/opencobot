@@ -8,6 +8,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -17,9 +18,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from policy.client import PolicyClient, PolicyUnavailable  # noqa: E402
 from policy.engine import PolicyEngine  # noqa: E402
+from policy.policyd import _load_or_create_auth, serve  # noqa: E402
 from tests._procutil import kill_pid_file  # noqa: E402
+from tests.test_policy import _RecordingTransport  # noqa: E402
 from ui.web import (  # noqa: E402
+    WebUIBackend,
     create_server,
     load_auth_token,
     start_server_in_thread,
@@ -33,12 +38,32 @@ CLI = [sys.executable, "-m", "cli.opencobot_cli"]
 @pytest.fixture()
 def server(tmp_path):
     state_dir = tmp_path / "state"
-    srv = start_server_in_thread(state_dir, port=0)
-    token = load_auth_token(state_dir)
-    yield {"server": srv, "state_dir": state_dir, "token": token,
-           "port": srv.server_address[1]}
-    srv.shutdown()
-    srv.server_close()
+    # R-022: the UI routes policy writes through policyd, so policyd
+    # must be running for approve/readonly/kill to work.
+    state_dir.mkdir(parents=True, exist_ok=True)
+    stop = threading.Event()
+    thread = threading.Thread(target=serve, args=(state_dir, stop),
+                              daemon=True)
+    thread.start()
+    try:
+        deadline = time.time() + 10
+        while True:
+            try:
+                PolicyClient(state_dir).status()
+                break
+            except (PolicyUnavailable, OSError):
+                if time.time() > deadline:
+                    raise AssertionError("policyd did not start")
+                time.sleep(0.05)
+        srv = start_server_in_thread(state_dir, port=0)
+        token = load_auth_token(state_dir)
+        yield {"server": srv, "state_dir": state_dir, "token": token,
+               "port": srv.server_address[1]}
+        srv.shutdown()
+        srv.server_close()
+    finally:
+        stop.set()
+        thread.join(timeout=5)
 
 
 def fetch(port, path, method="GET", data=None, token="ok", headers=None,
@@ -226,6 +251,70 @@ def test_audit_endpoint_shows_actions(server):
                for e in entries)
     _, body = fetch_auth(server, "/api/audit?limit=1")
     assert len(json.loads(body)["entries"]) == 1
+
+
+# -- policyd routing (R-022) -------------------------------------------------
+
+def test_backend_policy_calls_use_client_not_engine(tmp_path, monkeypatch):
+    """approve/revoke/set_readonly/set_killed/status use PolicyClient.
+
+    The engine import is blocked outright; the client runs over a
+    recording fake transport so the exact ops can be asserted.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _load_or_create_auth(state_dir)
+    fake = _RecordingTransport([
+        {"ok": True, "approval_id": "appr-1"},              # approve
+        {"ok": True, "revoked": True},                      # revoke
+        {"ok": True, "readonly": True, "source": "file"},   # set_readonly
+        {"ok": True, "killed": True},                       # kill
+        {"ok": True, "killed": True, "socket": "unix",
+         "audit_entries": 2},                               # status (set_killed)
+        {"ok": True, "readonly": True, "source": "file"},   # readonly_info
+        {"ok": True, "killed": True, "socket": "unix",
+         "audit_entries": 2},                               # status (status())
+    ])
+    client = PolicyClient(state_dir, transport=fake)
+    backend = WebUIBackend(state_dir)
+    monkeypatch.setattr(backend, "_policyd", lambda: client)
+    monkeypatch.setitem(sys.modules, "policy.engine", None)
+    assert backend.approve("tok-1", "read_file", 0, {}, 600) == "appr-1"
+    assert backend.revoke_approval("appr-1") is True
+    assert backend.set_readonly(True) is True
+    assert backend.set_killed(True) is True
+    payload = backend.status()
+    assert payload["readonly"] is True
+    assert payload["readonly_source"] == "file"
+    assert payload["killed"] is True
+    assert payload["audit_entries"] == 2
+    assert [r["op"] for r in fake.requests] == [
+        "approve", "revoke_approval", "readonly", "kill", "status",
+        "readonly", "status",
+    ]
+    assert fake.requests[0]["token_id"] == "tok-1"
+    assert fake.requests[0]["tool_name"] == "read_file"
+    assert fake.requests[2]["enabled"] is True
+
+
+def test_backend_status_falls_back_when_policyd_down(tmp_path, monkeypatch):
+    """status() still loads with no policyd (direct file reads)."""
+    monkeypatch.delenv("OPENCOBOT_READONLY", raising=False)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    engine = PolicyEngine(state_dir)
+    engine.set_readonly(True)
+    backend = WebUIBackend(state_dir)
+    payload = backend.status()
+    assert payload["readonly"] is True
+    assert payload["readonly_source"] == "file"
+    assert payload["killed"] is False
+    assert payload["policyd_socket"] is False
+    # Writes do NOT fall back: they fail closed.
+    with pytest.raises(PolicyUnavailable):
+        backend.set_readonly(False)
+    with pytest.raises(PolicyUnavailable):
+        backend.approve("tok-1", "read_file", 0, {}, 600)
 
 
 # -- localhost-only binding ---------------------------------------------------
