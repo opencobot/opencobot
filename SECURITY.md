@@ -7,7 +7,6 @@ OpenCobot is designed to control computers on behalf of AI models, so security i
 Please **do not open a public issue** for security problems.
 
 - Use GitHub's private vulnerability reporting: the **Security** tab of this repository, then **Report a vulnerability**.
-- Or email: `REPLACE_WITH_SECURITY_EMAIL`.
 
 Include what you found, steps to reproduce, the affected version or commit, and the impact you expect. We aim to acknowledge reports within 3 business days and to share a fix plan within 14 days. Please give us a reasonable time to fix before public disclosure. Good-faith research is welcome.
 
