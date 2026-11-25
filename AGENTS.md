@@ -68,3 +68,18 @@ Rules for research output: cite sources, state uncertainty, mark what is unverif
 - Tool definitions are JSON Schema. Inputs are validated and never concatenated into shell strings; use argument arrays.
 - Prefer deterministic logic and real-state verification over asking a model whether something worked.
 - Keep functions small, name things for what they do, and write comments that explain why.
+
+## 8. Test evidence (docs/STATUS.md)
+
+- Every PR that runs tests must update `docs/STATUS.md` and commit
+  the results file produced by `python -m evals.record_run --by human`
+  (on the laptop) or `--by agent` (on the server).
+- "Tested" may only be claimed with evidence in `docs/test-results/`.
+  A chat message, a pasted log, or a CI run is not evidence for the
+  STATUS.md table. Windows cells stay NOT VERIFIED (awaiting human
+  run) until a results file produced on the Windows laptop is
+  committed by the human.
+- Never hand-edit a results file; re-run the tool to regenerate it.
+- If a run failed, record the failure and mark the affected row
+  BLOCKED with the reason — do not skip the failing test to make
+  the suite green.
