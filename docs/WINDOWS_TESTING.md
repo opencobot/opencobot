@@ -266,19 +266,19 @@ the results file from the recording section above alongside it.
   (metacharacters stay literal) and the blocklist check
   (`format` refused).
   Result: _PASS — `run_powershell(["Write-Output", "hello; $(whoami) `pwned`"])` -> `rc=0 out='hello; $(whoami) `pwned`'` (literal, `whoami` did not execute); `run_powershell(["format", "C:"])` -> `ValueError: blocked command: 'format'`._
-- [ ] **Daemon start / stop / status over the named pipe** — §9 and
+- [x] **Daemon start / stop / status over the named pipe** — §9 and
   `daemon start` → `daemon status` → `daemon stop` → `daemon
   status` (see `docs/STATUS.md` daemon row).
-  Result: _FAIL — `daemon start` PASS (`rc=0`, `daemon started (pid 380, pipe \\.\pipe\opencobot-daemon)`) and `daemon status` (while up) PASS (`rc=0`, `daemon running (pid 380)`, `status: {"ok": true, "tools": 22, "killed": false, "policyd_reachable": false, "readonly": false}`), EXCEPT `daemon stop` printed `rc=0 daemon stopped (pid 380)` and removed `daemon.pid` while leaving the daemon running (`daemon status` after stop returned `rc=0`, `daemon running` without pid, because `_pid_alive(pid)` calls `os.kill(pid, 0)` which raises `OSError: [WinError 87] The parameter is incorrect` on Windows for `start_new_session=True` processes so `_terminate_pid()` is never called, and `.venv` launcher spawns a child `C:\Program Files\Python312\python.exe`). Also §9 `tool run list_dir` and `tool run run_command ... --approve` FAILED (`rc=1`, `PolicyUnavailable: cannot connect to named pipe: \\.\pipe\opencobot-policyd` / `OSError: [Errno 22] Invalid argument`) because back-to-back pipe connects after `ensure_policyd`'s `PolicyClient.status()` hit the single-instance pipe disconnect/reconnect window; in-process `get_tool('list_dir').execute(...)` PASS (`['path', 'entries', 'count']`)._
+  Result: _PASS — `daemon start` rc=0 (pid 24872, pipe `\\.\pipe\opencobot-daemon`); `daemon status` while up rc=0 (`daemon running (pid 24872)`); `daemon stop` rc=0 (`daemon stopped (pid 24872)`); after stop, running server procs `(none)` — both the `.venv` launcher (24872) and its child `C:\Program Files\Python312\python.exe` (19240) terminated via `taskkill /T /F`; `daemon.pid` removed; `daemon status` after stop rc=1 `daemon not running`. Also §9 `tool run list_dir` and `tool run run_command --approve` both rc=0 (previously FAIL — fixed by PR #32)._
 - [x] **Web UI session login** — `opencobot ui start`, open
   http://127.0.0.1:8765, sign in with `POST /login` (token in the
   body only), confirm the status page loads, then `POST /logout`
   and confirm the session is gone.
-  Result: _PASS (login/status/logout) — `ui start` -> `rc=0 web UI started (pid 25128) at http://127.0.0.1:8765/`; unauth `GET /` -> HTTP `401` with login form; `POST /login` (token in form body, `Accept: text/html`) -> HTTP `200` at `/` (`OpenCobot — local status`, `opencobot_session` cookie set); `POST /logout` -> redirected to `/` HTTP `401` (login form); post-logout `GET /` -> HTTP `401`. (Note: `ui stop` printed `rc=0 web UI stopped (pid 25128)` but `GET /` immediately returned `HTTP 401` because `cmd_ui_stop` uses the same `_pid_alive` `os.kill(pid, 0)` `[WinError 87]` path.)_
-- [ ] **Kill switch** — with `policyd` running, `opencobot kill`,
+  Result: _PASS (login/status/logout) — `ui start` -> `rc=0 web UI started (pid 25128) at http://127.0.0.1:8765/`; unauth `GET /` -> HTTP `401` with login form; `POST /login` (token in form body, `Accept: text/html`) -> HTTP `200` at `/` (`OpenCobot — local status`, `opencobot_session` cookie set); `POST /logout` -> redirected to `/` HTTP `401` (login form); post-logout `GET /` -> HTTP `401`. `ui stop` now also fixed by PR #33 (confirmation run: `ui stop` rc=0, both the `.venv` launcher (25432) and child (23976) terminated, `ui.pid` removed, `ui status` rc=1 `web UI not running`, port 8765 stopped serving)._
+- [x] **Kill switch** — with `policyd` running, `opencobot kill`,
   then a `tool run list_dir` must be denied ("kill switch
   active"); `opencobot unkill` must let it run again.
-  Result: _FAIL — with `policyd` running on `\\.\pipe\opencobot-policyd`, `opencobot kill` PASS (`rc=0 kill switch ON — all tool runs blocked`) and `opencobot unkill` PASS (`rc=0 kill switch OFF`), EXCEPT `opencobot tool run list_dir --args-json '{"path": "."}'` while killed (and after unkill) failed (`rc=1`) before reaching `check()` with `OSError: [Errno 22] Invalid argument: '\\\\.\\pipe\\opencobot-policyd'` -> `policy.client.PolicyUnavailable: cannot connect to named pipe: \\.\pipe\opencobot-policyd` (single-instance pipe connect failure immediately after `ensure_policyd`'s `PolicyClient.status()` probe)._
+  Result: _PASS — `opencobot kill` rc=0 (`kill switch ON`); `tool run list_dir` while killed rc=1, denied (`"kill switch active"`); `opencobot unkill` rc=0 (`kill switch OFF`); `tool run list_dir` after unkill rc=0._
 
 ## What to report back
 
