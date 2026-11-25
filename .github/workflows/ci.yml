@@ -13,3 +13,29 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
+  # Windows job, scoped to the mock-based Windows test files only.
+  # The full suite has Linux-only failures on Windows (~35: POSIX
+  # perms, symlinks, /proc, Unix sockets), so it must NOT run here.
+  # These files are mock-based and were green on a real Windows
+  # laptop per tester reports. If this job fails, do not skip the
+  # failing test — remove the job and open an issue instead.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: >-
+          python -m pytest -q
+          tests/test_windows_adapter.py
+          tests/test_windows_wiring.py
+          tests/test_windows_transport.py
+          tests/test_windows_pipe_server.py
+          tests/test_daemon_transport.py
+          tests/test_policyd_reachable.py
+          tests/test_ensure_policyd.py
+          tests/test_cli_providers.py
+          tests/test_r010_r013.py
+          tests/test_gateway2.py
