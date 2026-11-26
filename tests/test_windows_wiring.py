@@ -53,6 +53,13 @@ def fake_windows(monkeypatch):
     availability; ``calls`` records ``run_powershell`` invocations.
     """
     monkeypatch.setattr(platform, "system", lambda: "Windows")
+    # No tier-1 backend on this fake host: since PR #47 the UIA backend
+    # is real, and on a real Windows host its PowerShell probe succeeds,
+    # so the list_windows tool would take the tier-1 path and never
+    # reach the fake adapter these tests exercise (CI test-windows
+    # failure, 2026-11-26). Neutralising the tier-1 lookup keeps this
+    # file's contract: nothing here executes powershell.exe for real.
+    monkeypatch.setattr(definitions, "_tier1_windows", lambda: None)
     state = {"windows_available": True, "screenshot_available": False}
     calls = []
     fake = types.ModuleType("adapters.windows.windows")

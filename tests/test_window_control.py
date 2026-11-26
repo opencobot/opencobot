@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -27,8 +29,12 @@ import pytest
 
 from core.window_control import (
     AtspiBackend,
+    UiaBackend,
+    WindowControlError,
     WindowControlUnavailable,
     WindowInfo,
+    _UIA_FOCUS_SCRIPT,
+    _UIA_LIST_SCRIPT,
     get_backend,
     reset_backend,
 )
@@ -417,6 +423,10 @@ def test_real_libx11_binds():
         assert hasattr(lib, name), name
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="headless/no-backend premise is Linux-only "
+                           "(libatspi init); on Windows a working "
+                           "PowerShell means a live UIA backend (ADR-012)")
 def test_get_backend_none_headless_and_reset(monkeypatch, tmp_path):
     # Runs in a SUBPROCESS on purpose: libatspi's init is process-global
     # and never recovers in-process after a failed init (verified live
@@ -738,3 +748,265 @@ def test_live_list_windows_tool_uses_tier1(live_desktop, ctx):
     assert result["ok"] is True
     assert result["data"]["backend"] == "tier1"
     assert set(_LIVE_TITLES) <= {w["title"] for w in result["data"]["windows"]}
+
+
+# ---------------------------------------------------------------------------
+# UIA backend (Windows, ADR-012 (b)) — mock tests only.
+#
+# PowerShell cannot run on this Linux host, so every test below drives
+# UiaBackend with a fake runner (argv -> CompletedProcess). The scripts
+# themselves are never executed here; the live run on a real Windows
+# host is a laptop step (STATUS.md Windows column stays NOT VERIFIED
+# until that run is recorded). What IS verified here: the id scheme,
+# the JSON parsing, the fail-closed focus rules, and that no part of a
+# caller-supplied id other than digits can reach the script.
+# ---------------------------------------------------------------------------
+
+_UIA_ROWS = [
+    {"name": "Notepad", "pid": 1234, "hwnd": 98765, "app": "notepad",
+     "x": 10, "y": 20, "width": 800, "height": 600, "active": True},
+    {"name": "VS Code", "pid": 2345, "hwnd": 98766, "app": "Code",
+     "x": 0, "y": 0, "width": 1920, "height": 1040, "active": False},
+]
+
+
+class _FakeRunner:
+    """argv -> CompletedProcess, recording every call.
+
+    ``list_stdout`` is returned for the list script; ``focus_stdout``
+    / ``focus_code`` for the focus script (told apart by FromHandle).
+    """
+
+    def __init__(self, list_stdout="", list_code=0,
+                 focus_stdout="true", focus_code=0, stderr=""):
+        self.list_stdout = list_stdout
+        self.list_code = list_code
+        self.focus_stdout = focus_stdout
+        self.focus_code = focus_code
+        self.stderr = stderr
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, timeout=30):
+        self.calls.append(list(argv))
+        if "FromHandle" in argv[-1]:
+            return SimpleNamespace(returncode=self.focus_code,
+                                   stdout=self.focus_stdout,
+                                   stderr=self.stderr)
+        return SimpleNamespace(returncode=self.list_code,
+                               stdout=self.list_stdout,
+                               stderr=self.stderr)
+
+
+def _uia_backend(**kwargs):
+    return UiaBackend(runner=_FakeRunner(
+        list_stdout=json.dumps(_UIA_ROWS), **kwargs))
+
+
+def _as_windows(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+
+
+def _as_linux(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+
+def test_uia_available_false_on_linux(monkeypatch):
+    _as_linux(monkeypatch)
+    runner = _FakeRunner(list_stdout=json.dumps(_UIA_ROWS))
+    backend = UiaBackend(runner=runner)
+    available, reason = backend.available()
+    assert available is False
+    assert "Windows-only" in reason
+    assert runner.calls == []  # probe never ran
+
+
+def test_uia_available_false_when_powershell_missing(monkeypatch):
+    _as_windows(monkeypatch)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    backend = UiaBackend()  # real runner: the which() check applies
+    available, reason = backend.available()
+    assert available is False
+    assert "powershell.exe not found" in reason
+
+
+def test_uia_available_true_when_probe_succeeds(monkeypatch):
+    _as_windows(monkeypatch)
+    runner = _FakeRunner(list_stdout=json.dumps(_UIA_ROWS))
+    backend = UiaBackend(runner=runner)
+    available, reason = backend.available()
+    assert available is True
+    assert "2 windows" in reason
+    assert len(runner.calls) == 1  # probe ran once...
+    assert backend.available()[0] is True
+    assert len(runner.calls) == 1  # ...and is cached, not re-run
+
+
+def test_uia_available_false_when_probe_fails(monkeypatch):
+    _as_windows(monkeypatch)
+    runner = _FakeRunner(list_stdout="", list_code=1, stderr="boom")
+    backend = UiaBackend(runner=runner)
+    available, reason = backend.available()
+    assert available is False
+    assert "probe failed" in reason
+
+
+def test_uia_list_windows_maps_json():
+    backend = _uia_backend()
+    windows = backend.list_windows()
+    assert [w.id for w in windows] == ["uia:98765", "uia:98766"]
+    assert windows[0].title == "Notepad"
+    assert windows[0].app_name == "notepad"
+    assert windows[0].pid == 1234
+    assert windows[0].bounds == (10, 20, 800, 600)
+    assert windows[0].active is True
+    assert windows[1].active is False
+    assert windows[1].as_dict()["id"] == "uia:98766"
+
+
+def test_uia_list_windows_single_object_json():
+    # ConvertTo-Json emits a bare object (not an array) for one window.
+    backend = UiaBackend(runner=_FakeRunner(
+        list_stdout=json.dumps(_UIA_ROWS[0])))
+    assert [w.id for w in backend.list_windows()] == ["uia:98765"]
+
+
+def test_uia_list_windows_empty_stdout_is_empty():
+    backend = UiaBackend(runner=_FakeRunner(list_stdout=""))
+    assert backend.list_windows() == []
+
+
+def test_uia_list_windows_skips_bad_rows():
+    rows = _UIA_ROWS + [
+        {"name": "no hwnd", "pid": 1},  # missing hwnd
+        {"name": "bad pid", "pid": "x", "hwnd": 111},  # pid not int
+        {"name": "zero hwnd", "pid": 1, "hwnd": 0},
+        "not a dict",
+    ]
+    backend = UiaBackend(runner=_FakeRunner(list_stdout=json.dumps(rows)))
+    assert [w.id for w in backend.list_windows()] == [
+        "uia:98765", "uia:98766"]
+
+
+def test_uia_list_windows_raises_on_bad_json():
+    backend = UiaBackend(runner=_FakeRunner(list_stdout="{not json"))
+    with pytest.raises(WindowControlError, match="not valid JSON"):
+        backend.list_windows()
+
+
+def test_uia_list_windows_raises_on_script_failure():
+    backend = UiaBackend(runner=_FakeRunner(
+        list_stdout="", list_code=1, stderr="Automation failed"))
+    with pytest.raises(WindowControlError, match="exit 1"):
+        backend.list_windows()
+
+
+def test_uia_get_active_window():
+    backend = _uia_backend()
+    assert backend.get_active_window().id == "uia:98765"
+    quiet = UiaBackend(runner=_FakeRunner(list_stdout=json.dumps(
+        [dict(r, active=False) for r in _UIA_ROWS])))
+    assert quiet.get_active_window() is None
+
+
+def test_uia_focus_window_success():
+    runner = _FakeRunner(list_stdout=json.dumps(_UIA_ROWS))
+    backend = UiaBackend(runner=runner)
+    assert backend.focus_window("uia:98765") is True
+    focus_argv = runner.calls[-1]
+    assert focus_argv[0] == "powershell.exe"
+    assert focus_argv[1:4] == ["-NoProfile", "-NonInteractive", "-Command"]
+    # The only caller-controlled text in the script is the digits.
+    assert "-Hwnd" not in focus_argv[-1]
+    assert "98765" in focus_argv[-1]
+    assert "__HWND__" not in focus_argv[-1]
+
+
+def test_uia_focus_window_not_foreground_returns_false():
+    backend = _uia_backend(focus_stdout="false")
+    assert backend.focus_window("uia:98765") is False
+
+
+def test_uia_focus_window_missing_element_returns_false():
+    backend = _uia_backend(focus_stdout="", focus_code=2)
+    assert backend.focus_window("uia:98765") is False
+
+
+def test_uia_focus_window_raises_on_script_error():
+    backend = _uia_backend(focus_stdout="", focus_code=3,
+                           stderr="SetFocus threw")
+    with pytest.raises(WindowControlError, match="exit 3"):
+        backend.focus_window("uia:98765")
+
+
+@pytest.mark.parametrize("bad_id", [
+    "", "98765", "atspi:1234:Notepad", "uia:abc", "uia:-1", "uia:12x",
+    "uia:1; Get-Process", "uia:1 | Format-Table", "uia: 98765",
+    "uia:98765 ", "UIA:98765",
+])
+def test_uia_focus_window_rejects_malformed_ids(bad_id):
+    runner = _FakeRunner(list_stdout=json.dumps(_UIA_ROWS))
+    backend = UiaBackend(runner=runner)
+    assert backend.focus_window(bad_id) is False
+    # Nothing hostile ever reached PowerShell.
+    assert all("FromHandle" not in call[-1] for call in runner.calls)
+
+
+def test_uia_focus_window_rejects_huge_hwnd():
+    backend = _uia_backend()
+    assert backend.focus_window(f"uia:{2**63}") is False
+
+
+def test_uia_window_bounds():
+    backend = _uia_backend()
+    assert backend.window_bounds("uia:98766") == (0, 0, 1920, 1040)
+    assert backend.window_bounds("uia:1") is None
+    assert backend.window_bounds("atspi:1:x") is None
+
+
+def test_uia_scripts_contain_required_api_calls():
+    for token in ("UIAutomationClient", "AutomationElement",
+                  "RootElement", "FindAll", "TreeScope",
+                  "NativeWindowHandle", "BoundingRectangle",
+                  "GetForegroundWindow", "ConvertTo-Json"):
+        assert token in _UIA_LIST_SCRIPT, token
+    for token in ("UIAutomationClient", "FromHandle", "SetFocus",
+                  "GetForegroundWindow"):
+        assert token in _UIA_FOCUS_SCRIPT, token
+    # No model-controlled interpolation: the only placeholder is the
+    # digits-only hwnd token, replaced after int parsing.
+    assert "__HWND__" in _UIA_FOCUS_SCRIPT
+    assert "$(" not in _UIA_FOCUS_SCRIPT.replace(
+        "GetForegroundWindow().ToInt64()", "")
+
+
+def test_uia_get_backend_dispatch_windows(monkeypatch):
+    import core.window_control as wc
+
+    _as_windows(monkeypatch)
+
+    class _FakeUia:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def available(self):
+            return True, "fake UIA"
+
+    monkeypatch.setattr(wc, "UiaBackend", _FakeUia)
+    reset_backend()
+    try:
+        assert isinstance(get_backend(), _FakeUia)
+    finally:
+        reset_backend()
+
+
+def test_uia_tool_focus_uses_backend(monkeypatch, ctx):
+    import core.window_control as wc
+
+    _as_windows(monkeypatch)
+    runner = _FakeRunner(list_stdout=json.dumps(_UIA_ROWS))
+    backend = UiaBackend(runner=runner)
+    monkeypatch.setattr(wc, "get_backend", lambda: backend)
+    result = get_tool("window_focus").execute(
+        {"window_id": "uia:98765"}, ctx)
+    assert result["ok"] is True
+    assert result["data"]["window_id"] == "uia:98765"

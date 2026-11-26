@@ -48,14 +48,34 @@ NEVER unref'd separately. Rects from ``atspi_component_get_extents``
 are freed with ``atspi_rect_free`` when the symbol exists. X11
 displays are opened per operation and closed again (``XCloseDisplay``)
 so no stale display handle survives the X server going away.
+
+The Windows implementation is :class:`UiaBackend`, which reaches UI
+Automation through the adapter's existing fixed-script PowerShell
+path (ADR-012 (b)): a fixed ``powershell.exe -Command`` script (never
+built from model input) loads the .NET ``UIAutomationClient`` wrapper,
+enumerates ``AutomationElement.RootElement`` children, and reports
+name / pid / native window handle / bounding rectangle / foreground
+state as JSON. Focus uses ``AutomationElement.FromHandle(hwnd)`` +
+``SetFocus()`` and then checks the foreground window, so a request
+the window manager ignored reports False instead of claiming success.
+Window ids are ``uia:<hwnd>`` — the handle is the identity, never a
+title substring (R-029). The hwnd that reaches the script is parsed
+to :class:`int` first, so the only characters that can ever appear in
+the command are digits. UIA is mock-tested on Linux only (a fake
+PowerShell runner); it has never run on a real Windows host yet —
+its live run is a laptop step, like every other Windows path.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import json
 import os
 import platform
+import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -65,6 +85,7 @@ __all__ = [
     "WindowControlError",
     "WindowControlUnavailable",
     "AtspiBackend",
+    "UiaBackend",
     "get_backend",
     "reset_backend",
     "list_windows",
@@ -812,6 +833,240 @@ class AtspiBackend:
             lib.g_object_unref(acc)
 
 
+# ---------------------------------------------------------------------------
+# UI Automation backend (Windows, ADR-012 (b))
+# ---------------------------------------------------------------------------
+
+_POWERSHELL_EXE = "powershell.exe"
+_UIA_TIMEOUT_S = 30
+_UIA_ID_RE = re.compile(r"^uia:([0-9]+)$")
+
+# Fixed PowerShell scripts. They are constants: no model input, window
+# title, or tool argument is ever interpolated into them — except the
+# focus script's __HWND__ token, which is replaced with str(int(hwnd))
+# after the id has been parsed to int, so only digits can appear there.
+# Both run as one argv array (subprocess, shell=False), never via cmd.
+_UIA_FOREGROUND_TYPE = (
+    "Add-Type -TypeDefinition 'using System; "
+    "using System.Runtime.InteropServices; "
+    "public static class Win32 { "
+    "[DllImport(\"user32.dll\")] "
+    "public static extern IntPtr GetForegroundWindow(); }'"
+)
+
+_UIA_LIST_SCRIPT = (
+    "Add-Type -AssemblyName UIAutomationClient; "
+    + _UIA_FOREGROUND_TYPE
+    + "; $root = [System.Windows.Automation.AutomationElement]::RootElement; "
+    "$children = $root.FindAll("
+    "[System.Windows.Automation.TreeScope]::Children, "
+    "[System.Windows.Automation.Condition]::TrueCondition); "
+    "$fg = [Win32]::GetForegroundWindow().ToInt64(); $out = @(); "
+    "foreach ($el in $children) { "
+    "try { $hwnd = $el.Current.NativeWindowHandle } catch { continue } "
+    "if ($hwnd -eq 0) { continue } "
+    "try { $name = $el.Current.Name; $pid = $el.Current.ProcessId; "
+    "$r = $el.Current.BoundingRectangle } catch { continue } "
+    "$app = ''; "
+    "try { $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue; "
+    "if ($proc) { $app = $proc.ProcessName } } catch {} "
+    "$out += [pscustomobject]@{ name = $name; pid = $pid; hwnd = $hwnd; "
+    "app = $app; x = [int][Math]::Round($r.X); "
+    "y = [int][Math]::Round($r.Y); "
+    "width = [int][Math]::Round($r.Width); "
+    "height = [int][Math]::Round($r.Height); "
+    "active = ($hwnd -eq $fg) } } "
+    "$out | ConvertTo-Json -Compress"
+)
+
+_UIA_FOCUS_SCRIPT = (
+    "Add-Type -AssemblyName UIAutomationClient; "
+    + _UIA_FOREGROUND_TYPE
+    + "; $el = [System.Windows.Automation.AutomationElement]::FromHandle("
+    "[IntPtr]__HWND__); "
+    "if ($null -eq $el) { exit 2 } "
+    "try { $el.SetFocus() } catch { exit 3 } "
+    "Start-Sleep -Milliseconds 200; "
+    "if ([Win32]::GetForegroundWindow().ToInt64() -eq __HWND__) "
+    "{ 'true' } else { 'false' }"
+)
+
+
+def _uia_run(argv: list[str], timeout: int = _UIA_TIMEOUT_S) -> subprocess.CompletedProcess:
+    """Run an argv array. No shell, ever. Patchable seam for tests."""
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, shell=False,
+    )
+
+
+class UiaBackend:
+    """UI Automation tier-1 backend for Windows (ADR-012 (b)).
+
+    ``runner`` is an injectable ``argv -> CompletedProcess`` seam for
+    tests (same shape as the Windows adapter's runner). By default the
+    real ``powershell.exe`` is invoked. Loading is lazy and the
+    constructor never raises: :meth:`available` reports a missing
+    PowerShell, a non-Windows host, or a failing probe script instead.
+    The probe result is cached per instance — the daemon calls
+    ``available()`` on every tool execute/verify, and re-running
+    PowerShell each time would double the cost of every window call.
+    """
+
+    def __init__(self, runner=None):
+        self._runner = runner if runner is not None else _uia_run
+        self._probed = False
+        self._available = False
+        self._available_reason = "UIA backend not probed yet"
+
+    # -- lifecycle ----------------------------------------------------
+    def _run_script(self, script: str, timeout: int = _UIA_TIMEOUT_S):
+        argv = [_POWERSHELL_EXE, "-NoProfile", "-NonInteractive",
+                "-Command", script]
+        return self._runner(argv, timeout=timeout)
+
+    def available(self) -> tuple[bool, str]:
+        if self._probed:
+            return self._available, self._available_reason
+        self._probed = True
+        if platform.system() != "Windows":
+            self._available_reason = "UIA backend is Windows-only"
+            return False, self._available_reason
+        if self._runner is _uia_run and shutil.which(_POWERSHELL_EXE) is None:
+            self._available_reason = "powershell.exe not found"
+            return False, self._available_reason
+        try:
+            windows = self.list_windows()
+        except WindowControlError as exc:
+            self._available_reason = f"UIA probe failed: {exc}"
+            return False, self._available_reason
+        self._available = True
+        self._available_reason = (
+            f"UIA backend available ({len(windows)} windows)")
+        return True, self._available_reason
+
+    # -- parsing ------------------------------------------------------
+    @staticmethod
+    def _parse_list(stdout: str) -> list[WindowInfo]:
+        """Parse the list script's JSON. One bad row is skipped, never
+        fatal — a window closing mid-enumeration must not lose the rest.
+        """
+        text = (stdout or "").strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise WindowControlError(
+                f"UIA list output is not valid JSON: {exc}") from exc
+        if isinstance(data, dict):
+            data = [data]  # ConvertTo-Json emits an object for 1 window
+        if not isinstance(data, list):
+            raise WindowControlError(
+                "UIA list output is not a JSON array")
+        windows: list[WindowInfo] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            hwnd = row.get("hwnd")
+            pid = row.get("pid")
+            if (isinstance(hwnd, bool) or not isinstance(hwnd, int)
+                    or hwnd <= 0
+                    or isinstance(pid, bool) or not isinstance(pid, int)):
+                continue
+            bounds = None
+            try:
+                bounds = (int(row["x"]), int(row["y"]),
+                          int(row["width"]), int(row["height"]))
+            except (KeyError, TypeError, ValueError):
+                bounds = None
+            title = row.get("name")
+            app = row.get("app")
+            windows.append(WindowInfo(
+                id=f"uia:{hwnd}",
+                title=title if isinstance(title, str) else "",
+                app_name=app if isinstance(app, str) else "",
+                pid=pid,
+                bounds=bounds,
+                active=bool(row.get("active", False)),
+            ))
+        return windows
+
+    @staticmethod
+    def _parse_hwnd(window_id: str) -> int | None:
+        """The hwnd for ``uia:<digits>``, or None when the id is not a
+        well-formed UIA id. Anything else (AT-SPI ids, titles, hostile
+        text) is refused without ever reaching PowerShell (R-029)."""
+        if not isinstance(window_id, str):
+            return None
+        match = _UIA_ID_RE.match(window_id)
+        if match is None:
+            return None
+        hwnd = int(match.group(1))
+        if hwnd <= 0 or hwnd > 2**63 - 1:
+            return None
+        return hwnd
+
+    # -- WindowBackend --------------------------------------------------
+    def list_windows(self) -> list[WindowInfo]:
+        if platform.system() != "Windows" and self._runner is _uia_run:
+            raise WindowControlUnavailable("UIA backend is Windows-only")
+        try:
+            result = self._run_script(_UIA_LIST_SCRIPT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise WindowControlError(
+                f"UIA list failed to run PowerShell: {exc}") from exc
+        if result.returncode != 0:
+            raise WindowControlError(
+                "UIA list script failed "
+                f"(exit {result.returncode}): "
+                f"{(result.stderr or '').strip()}")
+        return self._parse_list(result.stdout or "")
+
+    def get_active_window(self) -> WindowInfo | None:
+        for window in self.list_windows():
+            if window.active:
+                return window
+        return None
+
+    def focus_window(self, window_id: str) -> bool:
+        """Focus by exact hwnd id (ADR-012: ``FromHandle(hwnd).SetFocus()``).
+
+        Returns False when the id is malformed, the window is gone
+        (script exit 2), or the foreground check says the window
+        manager ignored the request. A script error raises
+        :class:`WindowControlError` — the caller reports it honestly
+        instead of claiming success.
+        """
+        hwnd = self._parse_hwnd(window_id)
+        if hwnd is None:
+            return False
+        # __HWND__ is replaced with str(int) only — digits, by
+        # construction. No other part of the id can reach the script.
+        script = _UIA_FOCUS_SCRIPT.replace("__HWND__", str(hwnd))
+        try:
+            result = self._run_script(script)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise WindowControlError(
+                f"UIA focus failed to run PowerShell: {exc}") from exc
+        if result.returncode == 2:
+            return False  # FromHandle returned null: window is gone
+        if result.returncode != 0:
+            raise WindowControlError(
+                "UIA focus script failed "
+                f"(exit {result.returncode}): "
+                f"{(result.stderr or '').strip()}")
+        return (result.stdout or "").strip().lower() == "true"
+
+    def window_bounds(self, window_id: str) -> tuple[int, int, int, int] | None:
+        hwnd = self._parse_hwnd(window_id)
+        if hwnd is None:
+            return None
+        for window in self.list_windows():
+            if window.id == window_id:
+                return window.bounds
+        return None
+
+
 _BACKEND: WindowBackend | None = None
 _BACKEND_TRIED = False
 
@@ -820,9 +1075,9 @@ def get_backend() -> WindowBackend | None:
     """The tier-1 backend for this platform, or None when unavailable.
 
     Linux: the AT-SPI backend (loads the library lazily; a host without
-    AT-SPI gets None). Windows: the UIA backend lands in a later PR
-    (ADR-012); None with the reason recorded until then. Cached per
-    process; :func:`reset_backend` clears the cache (tests).
+    AT-SPI gets None). Windows: the UIA backend (ADR-012 (b)); a host
+    without PowerShell, or where the UIA probe fails, gets None.
+    Cached per process; :func:`reset_backend` clears the cache (tests).
     """
     global _BACKEND, _BACKEND_TRIED
     if _BACKEND_TRIED:
@@ -832,7 +1087,11 @@ def get_backend() -> WindowBackend | None:
         backend = AtspiBackend()
         if backend.available()[0]:
             _BACKEND = backend
-    # Windows/macOS: no tier-1 backend in this round (UIA lands later).
+    elif platform.system() == "Windows":
+        backend: WindowBackend = UiaBackend()
+        if backend.available()[0]:
+            _BACKEND = backend
+    # macOS: no tier-1 backend in this round.
     return _BACKEND
 
 
