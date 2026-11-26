@@ -18,6 +18,6 @@ Notes:
 - `delete_to_trash` never hard-deletes; files go to the trash directory.
 - `run_command` takes an argv array only (`shell=False`); `sudo`/`su`/`doas`/`rm` as argv[0] are blocked, output is truncated, timeout is clamped to 1–60s.
 - `screenshot` and `list_windows` honestly report "unavailable" on a headless server instead of faking success.
-- `window_focus` (ADR-012) is tier-1 only: it needs the AT-SPI backend on Linux (UI Automation on Windows lands later) and refuses when the window id is not found or ambiguous.
+- `window_focus` (ADR-012) is tier-1 only: it needs the AT-SPI backend on Linux or the UI Automation backend on Windows (mock-tested on Linux; live Windows run pending) and refuses when the window id is not found or ambiguous.
 - Every file tool re-checks its paths against the capability-token scope (symlink/`..` escapes are denied).
 - There is no Level 4 tool in Phase 1; Level 4 is enforced by the policy engine and covered by policy tests.
