@@ -27,7 +27,7 @@ EXPECTED = {
     "list_dir": 0, "read_file": 0, "file_info": 0, "file_hash": 0,
     "search_files": 0, "system_info": 0, "list_processes": 0,
     "process_info": 0, "git_status": 0, "git_log": 0, "git_diff": 0,
-    "screenshot": 0, "list_windows": 0, "launch_app": 1, "write_file": 2,
+    "screenshot": 0, "list_windows": 0, "window_focus": 2, "launch_app": 1, "write_file": 2,
     "create_file": 2, "append_file": 2, "mkdir": 2, "move_file": 2,
     "copy_file": 2, "delete_to_trash": 3, "run_command": 3,
 }
@@ -68,9 +68,9 @@ def sha(text):
 # Registry
 # ---------------------------------------------------------------------------
 
-def test_registry_has_22_tools_with_levels():
+def test_registry_has_23_tools_with_levels():
     assert set(TOOLS) == set(EXPECTED)
-    assert len(TOOLS) == 22
+    assert len(TOOLS) == 23
     for name, level in EXPECTED.items():
         assert TOOLS[name].level == level, name
         assert TOOLS[name].schema["type"] == "object"
@@ -84,7 +84,7 @@ def test_get_tool_unknown_raises():
 
 def test_list_tools_shape():
     listed = list_tools()
-    assert len(listed) == 22
+    assert len(listed) == 23
     for item in listed:
         assert set(item) == {"name", "description", "level", "network", "schema"}
         assert item["schema"]["type"] == "object"
@@ -359,7 +359,13 @@ def test_screenshot_unavailable_headless(ctx):
 @pytest.mark.skipif(sys.platform != "linux",
                     reason="Linux wmctrl/xdotool headless path; on Windows "
                            "PowerShell lists windows, so the tool succeeds")
-def test_list_windows_unavailable_headless(ctx):
+def test_list_windows_unavailable_headless(ctx, monkeypatch):
+    # Monkeypatch the backend away: calling the real get_backend() here
+    # would run atspi_init() with no bus, and libatspi's init is
+    # process-global and never recovers in-process after a failure
+    # (verified live 2026-11-26) — it would poison the live AT-SPI
+    # tests in test_window_control.py later in this process.
+    monkeypatch.setattr("core.window_control.get_backend", lambda: None)
     result = run("list_windows", {}, ctx)
     assert result["ok"] is False
     assert result["data"]["unavailable"] is True
