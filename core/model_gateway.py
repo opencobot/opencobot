@@ -222,6 +222,46 @@ def _default_configs() -> list[ProviderConfig]:
     ]
 
 
+def omnirouter_config(
+    model: str,
+    base_url: str = "https://api.omrouter.com/v1",
+    api_key_env: str = "OMNIROUTER_API_KEY",
+) -> ProviderConfig:
+    """Named config for the OmniRouter aggregator (ADR-011).
+
+    OmniRouter (OM Router, api.omrouter.com) is an OpenAI-compatible
+    model aggregator: one key reaches many models by catalogue ID.
+    ``model`` is REQUIRED — catalogue IDs are user-chosen, and a
+    silent default would route to a model nobody picked. The API key
+    comes from the environment at call time only (``api_key_env``),
+    never from the config file. Egress is "cloud-backed": secret data
+    never routes here (``Gateway._is_eligible``) and cloud calls need
+    the same pre-approval/budget treatment as any cloud provider.
+    Endpoint verified against docs.omrouter.com (2026-11-26); NOT
+    live-tested here (no key exists on this machine).
+
+    NOTE on the name: a self-hosted product called "OmniRoute" shares
+    the name — it is a different thing (a local gateway, e.g.
+    ``http://localhost:20128/v1``). That one works through the same
+    ``openai-compatible`` kind with a local base_url and
+    ``egress="local-only"``; this helper is the cloud one.
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("omnirouter_config needs a model (catalogue ID)")
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("omnirouter_config needs a base_url")
+    if not isinstance(api_key_env, str) or not api_key_env.strip():
+        raise ValueError("omnirouter_config needs an api_key_env")
+    return ProviderConfig(
+        name="omnirouter",
+        kind="openai-compatible",
+        base_url=base_url,
+        model=model,
+        api_key_env=api_key_env,
+        egress="cloud-backed",
+    )
+
+
 #: Environment variable naming a gateway config file (JSON). The file
 #: is trusted local configuration -- it only overrides which model /
 #: endpoint the already-configured providers use, and never carries
@@ -325,6 +365,16 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
             for field in _CONFIG_OVERRIDABLE:
                 if field in entry:
                     setattr(config, field, entry[field])
+            # "egress" is a security property (it decides whether
+            # secret data may reach the provider), so it is applied
+            # and validated here too — it used to be silently dropped
+            # on overrides, which could misroute secret data.
+            if "egress" in entry:
+                if entry["egress"] not in ("local-only", "cloud-backed"):
+                    raise ValueError(
+                        f"gateway config {config_path}: unknown egress "
+                        f"{entry['egress']!r} for provider {name!r}")
+                config.egress = entry["egress"]
             dirs = _validated_cli_binary_dirs(entry, config_path)
             if dirs is not None:
                 config.cli_binary_dirs = dirs
@@ -339,7 +389,7 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
             if entry["kind"] == "cli":
                 for field in ("cli_binary", "cli_argv_template",
                               "cli_prompt_via", "cli_output",
-                              "cli_output_field", "egress"):
+                              "cli_output_field"):
                     if field in entry:
                         cli_fields[field] = entry[field]
             configs.append(ProviderConfig(
@@ -349,6 +399,14 @@ def load_gateway_configs(path: str | None = None) -> list[ProviderConfig]:
                 model=entry.get("model", ""),
                 api_key_env=entry.get("api_key_env"),
                 timeout=entry.get("timeout", 30),
+                # "egress" applies to every kind, not just "cli": it
+                # used to be silently dropped here, so a cloud-backed
+                # openai-compatible provider defined in the file came
+                # out local-only (and secret data could reach it).
+                # ProviderConfig.__post_init__ validates the value
+                # (unknown egress fails loudly) and derives it from
+                # kind when absent.
+                egress=entry.get("egress"),
                 cli_binary_dirs=_validated_cli_binary_dirs(entry, config_path),
                 **cli_fields,
             ))

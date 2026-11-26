@@ -141,6 +141,39 @@ configuration — it only changes which model/endpoint already-configured
 providers use; API keys are never read from it (they still come from
 environment variables at call time).
 
+### OmniRouter (cloud aggregator)
+
+OmniRouter (OM Router, `api.omrouter.com`) is an OpenAI-compatible
+model aggregator: one key reaches many models by catalogue ID. Add it
+as a named provider (ADR-011); the endpoint is documented from
+docs.omrouter.com and is **not** live-tested here (no key exists on
+this machine):
+
+```json
+{"providers": [{"name": "omnirouter", "kind": "openai-compatible",
+                "base_url": "https://api.omrouter.com/v1",
+                "model": "<catalogue model id>",
+                "api_key_env": "OMNIROUTER_API_KEY",
+                "egress": "cloud-backed"}]}
+```
+
+Rules:
+
+- `model` is required and user-chosen — a catalogue ID such as
+  `openai/gpt-4o-mini`. There is no default; a silent default would
+  route to a model nobody picked. The same config is available in code
+  as `core.model_gateway.omnirouter_config(model)`.
+- The key comes from the environment only: set `OMNIROUTER_API_KEY`
+  before starting the daemon/gateway. It never goes in the config file.
+- `egress` is `cloud-backed`, so secret data never routes here (the
+  gateway's eligibility rule) and cloud calls need the same
+  pre-approval and budget treatment as any cloud provider.
+- Naming note: a self-hosted product called "OmniRoute" shares the
+  name — it is a different thing (a local gateway, e.g.
+  `http://localhost:20128/v1`). That one works through the same
+  `openai-compatible` kind with a local `base_url` and
+  `egress: "local-only"`; the snippet above is the cloud one.
+
 ### Pinned CLI binary dirs per provider (`cli_binary_dirs`)
 
 A provider entry may declare `cli_binary_dirs` — the directories a bare
