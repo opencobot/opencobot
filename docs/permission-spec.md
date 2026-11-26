@@ -288,7 +288,8 @@ hard-deletes. Every `verify()` first fails when `execute()` failed
 | `git_log` | 0 | No | `git log -n{max_count}` (`max_count` 1–100); parse hash/author/date/subject | Re-runs git log; exact commit-list equality |
 | `git_diff` | 0 | No | `git diff` (+ `--name-only`, `--stat`), truncated at 64 KiB | Re-runs git diff; exact text equality (after the same truncation) |
 | `screenshot` | 0 | No | Fails honestly if the adapter says unavailable; else `scrot`/`import`/`gnome-screenshot` → `state_dir/screenshots/screenshot-<ts>.png`. **On Windows always fails: "screenshot capture is not implemented on Windows"** | File exists, non-empty, size matches execute's report |
-| `list_windows` | 0 | No | Linux `wmctrl`/`xdotool`; Windows via adapter PowerShell query | Every reported window id (Linux `id` / Windows `pid`) must still be listed live |
+| `list_windows` | 0 | No | Tier 1 first when a backend is available (AT-SPI on Linux, UIA on Windows when it lands): bounds, pid, active state; else tier 2 — Linux `wmctrl`/`xdotool`; Windows via adapter PowerShell query | Every reported window id must still be listed live (tier-1 id, or Linux `id` / Windows `pid` on the tier-2 path) |
+| `window_focus` | 2 | No | Tier-1 only (ADR-012): resolve the id by (pid, title) through the AT-SPI/UIA backend and focus it; refuses when not found or ambiguous; honestly unavailable with no tier-1 backend | Re-lists through the backend; the target window must be the active window |
 | `launch_app` | 1 | No | Reject `BLOCKED_BINARIES` basename; path form must be an executable file, bare name via `shutil.which`; `subprocess.Popen(..., start_new_session=True, shell=False, DEVNULL stdio)` | Pid must exist in `/proc` and name/cmdline must match the app. **Linux-only (`/proc`)** |
 | `write_file` | 2 | No | Snapshot the original first, `write_text`; return size/sha256/`snapshot`/`created` | Re-hashes the file; must equal sha256 of `args["content"]` |
 | `create_file` | 2 | No | Fail if the path exists, write content | File exists and sha256 equals sha256 of `args["content"]` |
@@ -299,7 +300,7 @@ hard-deletes. Every `verify()` first fails when `execute()` failed
 | `delete_to_trash` | 3 | No | Adapter `trash_path(state_dir, path)`, `shutil.move` there | Original gone, trash copy exists, trash hash (files) matches the original |
 | `run_command` | 3 | **Yes — only network-capable tool** | Argv array only; reject `BLOCKED_BINARIES`; on Windows additionally `WINDOWS_BLOCKED_COMMANDS` (format, diskpart, del, nested powershell/pwsh/cmd, … — re-enforced by the adapter); reject `--no-preserve-root`; `timeout` 1–60s (default 30); Linux `subprocess.run`, Windows adapter `run_powershell` (never `cmd.exe`). Output capped 64 KiB; non-zero exit → `ok False` | **Weak by design, stated in code** — only checks `returncode == 0` and that stdout/stderr were captured. "It cannot prove the command's claimed side effect. Callers must verify side effects with a follow-up read tool." |
 
-**Level counts:** 0 ×13, 1 ×1 (`launch_app`), 2 ×6, 3 ×2
+**Level counts:** 0 ×13, 1 ×1 (`launch_app`), 2 ×7, 3 ×2
 (`delete_to_trash`, `run_command`), **4 ×0 — no tool is level 4.**
 
 ## 9. Where code and ARCHITECTURE.md disagree

@@ -183,7 +183,21 @@ def screenshot_available() -> tuple[bool, str]:
 
 
 def list_windows_available() -> tuple[bool, str]:
-    """(True, reason) only if a display server AND wmctrl/xdotool exist."""
+    """(True, reason) if a window-listing path exists.
+
+    Tier 1 first (ADR-012): the AT-SPI backend, when its library loads
+    and the session bus + registry answer. Tier 2: a display server AND
+    wmctrl/xdotool.
+    """
+    try:
+        from core import window_control as _wc
+        backend = _wc.get_backend()
+        if backend is not None:
+            available, reason = backend.available()
+            if available:
+                return True, f"tier-1 window backend available: {reason}"
+    except Exception:
+        pass  # fall through to the tier-2 check
     display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
     if not display:
         return False, "no display server (DISPLAY/WAYLAND_DISPLAY unset)"

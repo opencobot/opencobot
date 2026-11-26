@@ -47,10 +47,17 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+try:
+    from core import window_control as _window_control
+except ImportError:  # allow import without the repo root on sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from core import window_control as _window_control
 
 try:
     from adapters.linux import linux as linux_adapter
@@ -993,11 +1000,40 @@ def _list_windows_live() -> list[dict]:
     return windows
 
 
+def _tier1_windows() -> list[dict] | None:
+    """Tier-1 window list (ADR-012), or None when no tier-1 backend exists.
+
+    Returns the backend's windows as plain dicts (the ``list_windows``
+    tool shape). A backend that reports available but then fails is
+    treated as absent — the caller falls back to the tier-2 path.
+    """
+    try:
+        backend = _window_control.get_backend()
+    except Exception:
+        return None
+    if backend is None:
+        return None
+    try:
+        available, _reason = backend.available()
+        if not available:
+            return None
+        return [w.as_dict() for w in backend.list_windows()]
+    except Exception:
+        return None
+
+
 @_guard
 def _exec_list_windows(args, ctx):
     err = _validate(args, _SCHEMAS["list_windows"])
     if err:
         return _fail(err)
+    # Tier 1 first (AT-SPI on Linux, UIA on Windows when it lands):
+    # bounds, pid and active state. Tier 2 (wmctrl/xdotool, Get-Process)
+    # is the fallback when no tier-1 backend is available.
+    windows = _tier1_windows()
+    if windows is not None:
+        return _ok({"windows": windows, "count": len(windows),
+                    "backend": "tier1"})
     available, reason = _os_adapter().list_windows_available()
     if not available:
         return _fail(reason, {"unavailable": True, "reason": reason})
@@ -1007,7 +1043,8 @@ def _exec_list_windows(args, ctx):
         windows = _os_adapter().list_windows()
     else:
         windows = _list_windows_live()
-    return _ok({"windows": windows, "count": len(windows)})
+    return _ok({"windows": windows, "count": len(windows),
+                "backend": "tier2"})
 
 
 @_guard_verify
@@ -1015,6 +1052,14 @@ def _verify_list_windows(args, result, ctx):
     failed = _verify_failed(result)
     if failed:
         return failed
+    windows = _tier1_windows()
+    if windows is not None:
+        live_ids = {str(w.get("id")) for w in windows}
+        for window in result["data"].get("windows", []):
+            wid = str(window.get("id"))
+            if wid not in live_ids:
+                return False, f"window {wid} no longer listed"
+        return True, f"all {len(result['data'].get('windows', []))} windows still listed"
     available, reason = _os_adapter().list_windows_available()
     if not available:
         return False, f"window tool no longer available: {reason}"
@@ -1027,6 +1072,71 @@ def _verify_list_windows(args, result, ctx):
         if wid not in live_ids:
             return False, f"window {wid} no longer listed"
     return True, f"all {len(result['data'].get('windows', []))} windows still listed"
+
+
+# ---------------------------------------------------------------------------
+# 13b. Focus window (level 2) — tier 1 only (ADR-012)
+# ---------------------------------------------------------------------------
+
+@_guard
+def _exec_window_focus(args, ctx):
+    err = _validate(args, _SCHEMAS["window_focus"])
+    if err:
+        return _fail(err)
+    window_id = args["window_id"]
+    if not window_id or not isinstance(window_id, str):
+        return _fail("window_id must be a non-empty string")
+    backend = _window_control.get_backend()
+    if backend is None:
+        return _fail("no tier-1 window backend on this host; "
+                     "window_focus needs AT-SPI (Linux) or UI Automation "
+                     "(Windows)", {"unavailable": True})
+    available, reason = backend.available()
+    if not available:
+        return _fail(f"window backend unavailable: {reason}",
+                     {"unavailable": True, "reason": reason})
+    try:
+        focused = backend.focus_window(window_id)
+    except _window_control.WindowControlError as exc:
+        return _fail(f"window_focus failed: {exc}")
+    if not focused:
+        return _fail(f"window not found or ambiguous (refused): {window_id!r}")
+    return _ok({"window_id": window_id, "focused": True})
+
+
+@_guard_verify
+def _verify_window_focus(args, result, ctx):
+    failed = _verify_failed(result)
+    if failed:
+        return failed
+    window_id = args["window_id"]
+    backend = _window_control.get_backend()
+    if backend is None:
+        return False, "window backend no longer available"
+    # Focus activation is asynchronous (the window manager updates
+    # _NET_ACTIVE_WINDOW / the UIA focused element after the activation
+    # request returns), so poll briefly instead of asserting on a
+    # single read.
+    deadline = time.monotonic() + 2.0
+    last_active: str | None = None
+    while True:
+        try:
+            active = backend.get_active_window()
+        except _window_control.WindowControlError as exc:
+            return False, f"could not re-read active window: {exc}"
+        if active is None:
+            last_active = None
+        elif active.id == window_id:
+            return True, f"window {window_id!r} is active"
+        else:
+            last_active = active.id
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if last_active is None:
+        return False, "no window is active after focus"
+    return False, (f"window {window_id!r} is not active after focus "
+                   f"(active is {last_active!r})")
 
 
 # ---------------------------------------------------------------------------
@@ -1414,6 +1524,7 @@ _SCHEMAS: dict[str, dict] = {
     "git_diff": _schema({"path": _STR}, ["path"]),
     "screenshot": _schema({}),
     "list_windows": _schema({}),
+    "window_focus": _schema({"window_id": _STR}, ["window_id"]),
     "launch_app": _schema({"app": _STR,
                            "args": {"type": "array", "items": {"type": "string"}}},
                           ["app"]),
@@ -1462,6 +1573,8 @@ _SPECS: list[tuple[str, str, int, Callable, Callable]] = [
      _exec_screenshot, _verify_screenshot),
     ("list_windows", "List open windows (unavailable headless: honest failure)", 0,
      _exec_list_windows, _verify_list_windows),
+    ("window_focus", "Focus a window by its tier-1 id (AT-SPI/UIA; unavailable without a tier-1 backend)", 2,
+     _exec_window_focus, _verify_window_focus),
     ("launch_app", "Launch an application (argv array, no shell)", 1,
      _exec_launch_app, _verify_launch_app),
     ("write_file", "Overwrite/create a file; original snapshotted first", 2,
