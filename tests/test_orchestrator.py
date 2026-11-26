@@ -322,6 +322,34 @@ def test_verify_rejects_empty_output_and_absolute_path(tmp_path):
                         "x")["passed"] is False
 
 
+def test_verify_rejects_dotdot_escape_path(tmp_path):
+    # Same gap as the Windows "/etc/passwd" case, on the Linux side:
+    # "../escape.txt" is relative, so the old is_absolute()-only
+    # check passed it while integrate() refused it.
+    gw = FakeGateway(_configs("arch", "w1"))
+    orch = _make(tmp_path, gw)
+    verdict = orch.verify(_file_subtask(path="../escape.txt"), "x")
+    assert verdict["passed"] is False
+    assert "escapes the workspace" in verdict["evidence"]
+    verdict = orch.verify(_file_subtask(path="sub/../../escape.txt"), "x")
+    assert verdict["passed"] is False
+
+
+def test_resolve_in_workspace_accepts_and_rejects(tmp_path):
+    gw = FakeGateway(_configs("arch", "w1"))
+    orch = _make(tmp_path, gw)
+    target = orch._resolve_in_workspace("sub/file.txt")
+    assert target is not None
+    assert target.relative_to(orch.workspace) == Path("sub/file.txt")
+    assert orch._resolve_in_workspace("out.txt") is not None
+    assert orch._resolve_in_workspace("/etc/passwd") is None
+    assert orch._resolve_in_workspace("../escape.txt") is None
+    assert orch._resolve_in_workspace("sub/../../escape.txt") is None
+    assert orch._resolve_in_workspace("") is None
+    assert orch._resolve_in_workspace("   ") is None
+    assert orch._resolve_in_workspace(None) is None
+
+
 # ---------------------------------------------------------------- integrate
 
 def test_integrate_refuses_without_passing_verdict(tmp_path):

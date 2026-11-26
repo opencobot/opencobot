@@ -408,6 +408,32 @@ class Orchestrator:
 
     # -- verification --------------------------------------------------
 
+    def _resolve_in_workspace(self, path: str) -> Path | None:
+        """Resolve a worker-supplied file path inside the workspace.
+
+        Returns the resolved target, or None when the path is absolute
+        or escapes the workspace (``../``). ``Path.is_absolute()``
+        alone is not enough: on Windows a path like ``/etc/passwd``
+        is drive-relative, so ``is_absolute()`` is False yet the path
+        still lands outside the workspace — verify() used to pass it
+        while integrate() refused it (the Windows failure of
+        ``test_verify_rejects_empty_output_and_absolute_path``). The
+        same gap existed on Linux for ``../`` escapes. verify(),
+        integrate() and _workspace_key() all use this one check, so a
+        verdict can never pass a path that integrate() would refuse.
+        Resolve errors fail closed (None) instead of raising.
+        """
+        if not isinstance(path, str) or not path.strip():
+            return None
+        if Path(path).is_absolute():
+            return None
+        try:
+            target = (self.workspace / path).resolve()
+            target.relative_to(self.workspace)
+        except (ValueError, OSError, RuntimeError):
+            return None
+        return target
+
     def verify(
         self,
         subtask: dict,
@@ -437,6 +463,9 @@ class Orchestrator:
             if Path(path).is_absolute():
                 return {"passed": False, "method": "shape",
                         "evidence": f"file path must be relative: {path!r}"}
+            if self._resolve_in_workspace(path) is None:
+                return {"passed": False, "method": "shape",
+                        "evidence": f"file path escapes the workspace: {path!r}"}
         for check in subtask.get("checks") or []:
             methods.append("checks")
             if self._run_tool is None:
@@ -513,13 +542,8 @@ class Orchestrator:
             return {"ok": False, "integrated": False,
                     "error": "no runtime configured; cannot integrate"}
         path = output.get("path")
-        if not isinstance(path, str) or not path.strip() or Path(path).is_absolute():
-            return {"ok": False, "integrated": False,
-                    "error": f"refusing to integrate outside the workspace: {path!r}"}
-        target = (self.workspace / path).resolve()
-        try:
-            target.relative_to(self.workspace)
-        except ValueError:
+        target = self._resolve_in_workspace(path)
+        if target is None:
             return {"ok": False, "integrated": False,
                     "error": f"refusing to integrate outside the workspace: {path!r}"}
         tool = "write_file" if target.exists() else "create_file"
@@ -552,14 +576,10 @@ class Orchestrator:
         Normalizes spellings (``./a.py`` vs ``a.py``) so two workers
         targeting the same file are grouped as one conflict.
         """
-        if not isinstance(path, str) or not path.strip() \
-                or Path(path).is_absolute():
+        target = self._resolve_in_workspace(path)
+        if target is None:
             return None
-        try:
-            target = (self.workspace / path).resolve()
-            return target.relative_to(self.workspace).as_posix()
-        except ValueError:
-            return None
+        return target.relative_to(self.workspace).as_posix()
 
     # -- conflict resolution -------------------------------------------
 
