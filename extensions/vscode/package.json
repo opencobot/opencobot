@@ -1,0 +1,41 @@
+{
+  "activationEvents": [
+    "onCommand:opencobot.runTask",
+    "onCommand:opencobot.showLastRun"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "opencobot.runTask",
+        "title": "OpenCobot: Run orchestrator task"
+      },
+      {
+        "command": "opencobot.showLastRun",
+        "title": "OpenCobot: Show last orchestrator run"
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "opencobot.stateDir": {
+          "default": "",
+          "description": "State directory holding daemon.sock / daemon.auth (default: $OPENCOBOT_STATE or ~/.opencobot). Leave empty for the default.",
+          "type": "string"
+        }
+      },
+      "title": "OpenCobot"
+    }
+  },
+  "description": "Drive OpenCobot's local daemon (orchestrator runs) from VS Code. Thin client over the daemon protocol — see docs/IDE_API.md.",
+  "displayName": "OpenCobot",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "license": "MIT",
+  "main": "./extension.js",
+  "name": "opencobot",
+  "publisher": "opencobot",
+  "version": "0.1.0"
+}
