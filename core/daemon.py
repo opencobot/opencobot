@@ -18,6 +18,18 @@ Linux; it still needs live verification on a Windows host
 JSON-lines protocol is shared with policyd via :mod:`core.transport`.
 
 Run: ``python -m core.daemon --state-dir DIR`` (or ``python -m core``).
+
+Ops (every request: ``{"auth": <daemon token>, "op": ...}``):
+``status``, ``readonly_get``/``readonly_set``, ``list_tools``,
+``run_tool`` (policy-gated, needs policyd), ``kill``/``unkill``,
+``gateway_status``, and the orchestrator ops (ADR-011): 
+``orchestrator_run`` (synchronous; needs policyd, like ``run_tool``),
+``orchestrator_status`` (read-only memory read, no policyd needed),
+``orchestrator_retry`` (needs policyd). The orchestrator ops build
+an :class:`core.orchestrator.Orchestrator` on this daemon's Gateway
++ a Runtime over the same PolicyClient as ``run_tool`` — so every
+check and integration inside a run is policyd-authorized exactly as
+a direct ``run_tool`` call would be. No second authorization path.
 """
 
 from __future__ import annotations
@@ -320,6 +332,50 @@ class Daemon:
         except Exception:
             return False
 
+    # -- orchestrator (Phase 3, ADR-011) --------------------------------
+
+    def _orchestrator(self, request: dict) -> Any:
+        """Build an Orchestrator bound to this daemon's gateway + policy.
+
+        The Runtime goes through the same PolicyClient as ``run_tool``,
+        so every check and integration inside a run is
+        policyd-authorized; memory is the daemon's state-dir store.
+        Request fields: ``token`` (capability token for the inner tool
+        calls), ``workspace`` (project root; defaults to the daemon's
+        cwd), ``architect`` / ``workers`` (provider overrides),
+        ``project`` (memory key prefix; defaults to the workspace
+        name). Raises ValueError/TypeError for bad config (unknown
+        architect, non-list workers, unusable workspace) — the caller
+        turns those into ``{"ok": False, "error": ...}``.
+        """
+        from core.memory import Memory
+        from core.orchestrator import Orchestrator
+
+        workers = request.get("workers")
+        if workers is not None and (
+            not isinstance(workers, list)
+            or not all(isinstance(w, str) for w in workers)
+        ):
+            raise ValueError("workers must be a list of provider names")
+        architect = request.get("architect")
+        if architect is not None and not isinstance(architect, str):
+            raise ValueError("architect must be a provider name")
+        runtime = Runtime(
+            self.state_dir, self._policy_client(), self.registry,
+            gateway=self.gateway,
+        )
+        return Orchestrator(
+            gateway=self.gateway,
+            runtime=runtime,
+            memory=Memory(self.state_dir),
+            state_dir=self.state_dir,
+            workspace=request.get("workspace"),
+            token=request.get("token"),
+            architect=architect,
+            workers=workers,
+            project=request.get("project"),
+        )
+
     # -- request handling -------------------------------------------------
 
     def handle_request(self, request: Any) -> dict:
@@ -401,6 +457,64 @@ class Daemon:
                 "model": config.model,
                 "available": self.gateway.ping(config),
             }
+        if op == "orchestrator_run":
+            task = request.get("task")
+            if not isinstance(task, str) or not task.strip():
+                return {"ok": False, "error": "orchestrator_run needs task: <string>"}
+            sensitivity = request.get("sensitivity") or "public"
+            if sensitivity not in ("public", "personal", "secret"):
+                return {"ok": False,
+                        "error": "sensitivity must be public/personal/secret"}
+            if not self._policyd_reachable():
+                return {"ok": False, "error": "policyd unavailable"}
+            try:
+                orchestrator = self._orchestrator(request)
+            except (ValueError, TypeError) as exc:
+                return {"ok": False, "error": str(exc)}
+            # Synchronous: each connection runs in its own thread, so a
+            # long model run blocks only this connection. The returned
+            # summary's own "ok" is the run outcome; the outer "ok"
+            # says the op executed.
+            return {"ok": True,
+                    "run": orchestrator.run(task, sensitivity)}
+        if op == "orchestrator_status":
+            from core.memory import Memory
+
+            memory = Memory(self.state_dir)
+            run_id = request.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                stored = memory.get(f"orchestrator:run:{run_id}")
+                if not isinstance(stored, dict):
+                    return {"ok": False,
+                            "error": f"no stored run: {run_id!r}"}
+                return {"ok": True, "run": stored}
+            project = request.get("project")
+            if not isinstance(project, str) or not project:
+                return {"ok": False,
+                        "error": "orchestrator_status needs run_id or project"}
+            stored = memory.get(f"orchestrator:{project}:last_run")
+            if not isinstance(stored, dict):
+                return {"ok": False,
+                        "error": f"no stored run for project: {project!r}"}
+            return {"ok": True, "run": stored}
+        if op == "orchestrator_retry":
+            run_id = request.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                return {"ok": False,
+                        "error": "orchestrator_retry needs run_id: <string>"}
+            sensitivity = request.get("sensitivity")
+            if (sensitivity is not None
+                    and sensitivity not in ("public", "personal", "secret")):
+                return {"ok": False,
+                        "error": "sensitivity must be public/personal/secret"}
+            if not self._policyd_reachable():
+                return {"ok": False, "error": "policyd unavailable"}
+            try:
+                orchestrator = self._orchestrator(request)
+            except (ValueError, TypeError) as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True,
+                    "retry": orchestrator.retry_queued(run_id, sensitivity)}
         return {"ok": False, "error": f"unknown op: {op}"}
 
     # -- serving ----------------------------------------------------------

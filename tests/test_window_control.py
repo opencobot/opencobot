@@ -423,6 +423,10 @@ def test_real_libx11_binds():
         assert hasattr(lib, name), name
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="headless/no-backend premise is Linux-only "
+                           "(libatspi init); on Windows a working "
+                           "PowerShell means a live UIA backend (ADR-012)")
 def test_get_backend_none_headless_and_reset(monkeypatch, tmp_path):
     # Runs in a SUBPROCESS on purpose: libatspi's init is process-global
     # and never recovers in-process after a failed init (verified live
@@ -802,7 +806,12 @@ def _as_windows(monkeypatch):
     monkeypatch.setattr(platform, "system", lambda: "Windows")
 
 
+def _as_linux(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+
 def test_uia_available_false_on_linux(monkeypatch):
+    _as_linux(monkeypatch)
     runner = _FakeRunner(list_stdout=json.dumps(_UIA_ROWS))
     backend = UiaBackend(runner=runner)
     available, reason = backend.available()
