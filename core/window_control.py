@@ -851,7 +851,11 @@ _UIA_FOREGROUND_TYPE = (
     "using System.Runtime.InteropServices; "
     "public static class Win32 { "
     "[DllImport(\"user32.dll\")] "
-    "public static extern IntPtr GetForegroundWindow(); }'"
+    "public static extern IntPtr GetForegroundWindow(); "
+    "[DllImport(\"user32.dll\")] "
+    "public static extern bool SetForegroundWindow(IntPtr hWnd); "
+    "[DllImport(\"user32.dll\")] "
+    "public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); }'"
 )
 
 _UIA_LIST_SCRIPT = (
@@ -882,10 +886,14 @@ _UIA_LIST_SCRIPT = (
 _UIA_FOCUS_SCRIPT = (
     "Add-Type -AssemblyName UIAutomationClient; "
     + _UIA_FOREGROUND_TYPE
-    + "; $el = [System.Windows.Automation.AutomationElement]::FromHandle("
-    "[IntPtr]__HWND__); "
+    + "; $h = [IntPtr]__HWND__; "
+    "$el = [System.Windows.Automation.AutomationElement]::FromHandle($h); "
     "if ($null -eq $el) { exit 2 } "
-    "try { $el.SetFocus() } catch { exit 3 } "
+    # UIA SetFocus() throws "Target element cannot receive focus" for
+    # real top-level windows (live finding 2026-11-27: Notepad) — the
+    # Win32 foreground APIs are the mechanism that works.
+    "$null = [Win32]::ShowWindow($h, 9); "
+    "$null = [Win32]::SetForegroundWindow($h); "
     "Start-Sleep -Milliseconds 200; "
     "if ([Win32]::GetForegroundWindow().ToInt64() -eq __HWND__) "
     "{ 'true' } else { 'false' }"
@@ -1029,7 +1037,15 @@ class UiaBackend:
         return None
 
     def focus_window(self, window_id: str) -> bool:
-        """Focus by exact hwnd id (ADR-012: ``FromHandle(hwnd).SetFocus()``).
+        """Focus by exact hwnd id (ADR-012).
+
+        Mechanism is the Win32 foreground sequence — restore the window
+        (``ShowWindow(SW_RESTORE)``) then ``SetForegroundWindow`` — with
+        a foreground re-check. UIA ``FromHandle(hwnd).SetFocus()`` was
+        the original mechanism, but it throws "Target element cannot
+        receive focus" for real top-level windows (live finding
+        2026-11-27: Notepad), while the Win32 call brings the same
+        window to the foreground.
 
         Returns False when the id is malformed, the window is gone
         (script exit 2), or the foreground check says the window
