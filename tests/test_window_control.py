@@ -495,6 +495,15 @@ def test_list_windows_falls_back_without_backend(monkeypatch, ctx):
     monkeypatch.setattr("core.window_control.get_backend", lambda: None)
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    # Tier 2 is the OS adapter's window query (wmctrl/xdotool on Linux,
+    # PowerShell on Windows) — neutralise it too, or the test's "no
+    # backend anywhere" premise only holds where that query is absent
+    # (on Windows the PowerShell fallback succeeds and the tool returns
+    # ok=True; see the 2026-11-27 Windows run on 002087e).
+    monkeypatch.setattr(
+        "tools.definitions._os_adapter",
+        lambda: SimpleNamespace(
+            list_windows_available=lambda: (False, "no window provider available (test)")))
     result = _run("list_windows", {}, ctx)
     assert result["ok"] is False
     assert result["data"]["unavailable"] is True
