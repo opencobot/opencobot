@@ -978,7 +978,8 @@ def test_uia_scripts_contain_required_api_calls():
                   "NativeWindowHandle", "BoundingRectangle",
                   "GetForegroundWindow", "ConvertTo-Json"):
         assert token in _UIA_LIST_SCRIPT, token
-    for token in ("UIAutomationClient", "FromHandle", "SetFocus",
+    for token in ("UIAutomationClient", "FromHandle",
+                  "SetForegroundWindow", "ShowWindow",
                   "GetForegroundWindow"):
         assert token in _UIA_FOCUS_SCRIPT, token
     # No model-controlled interpolation: the only placeholder is the
@@ -986,6 +987,16 @@ def test_uia_scripts_contain_required_api_calls():
     assert "__HWND__" in _UIA_FOCUS_SCRIPT
     assert "$(" not in _UIA_FOCUS_SCRIPT.replace(
         "GetForegroundWindow().ToInt64()", "")
+
+
+def test_uia_focus_script_uses_win32_foreground_not_uia_setfocus():
+    """Live finding (2026-11-27): UIA SetFocus() throws "Target element
+    cannot receive focus" for a real Notepad window, while Win32
+    SetForegroundWindow brings the same window to the foreground. The
+    focus script must use the Win32 path."""
+    assert ".SetFocus()" not in _UIA_FOCUS_SCRIPT
+    assert "SetForegroundWindow" in _UIA_FOCUS_SCRIPT
+    assert "ShowWindow" in _UIA_FOCUS_SCRIPT
 
 
 def test_uia_scripts_never_assign_readonly_automatic_vars():
@@ -998,8 +1009,10 @@ def test_uia_scripts_never_assign_readonly_automatic_vars():
     # PowerShell read-only automatic variables (about_Automatic_
     # Variables). Assigning to any of them throws, so a script that
     # does so inside try/catch silently drops every row it touches.
+    # ($null is NOT in this list: assigning to it is the legal
+    # discard, used by the focus script for the bool results.)
     readonly = ("pid", "_", "args", "input", "host", "true", "false",
-                "null", "error", "myinvocation", "psversiontable",
+                "error", "myinvocation", "psversiontable",
                 "executioncontext", "pscommandpath", "psscriptroot",
                 "profile", "lastexitcode", "matches", "foreach",
                 "switch", "this", "sender", "event", "eventargs")
