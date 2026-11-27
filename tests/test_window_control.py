@@ -988,6 +988,27 @@ def test_uia_scripts_contain_required_api_calls():
         "GetForegroundWindow().ToInt64()", "")
 
 
+def test_uia_scripts_never_assign_readonly_automatic_vars():
+    """Regression test for the live Windows finding (2026-11-27): the
+    UIA list script assigned to $pid, a read-only automatic variable,
+    so the assignment threw for every window, the catch skipped it,
+    and list_windows returned 0 windows on real Windows — while the
+    mock tests (fake runner, canned JSON) all passed."""
+    import re
+    # PowerShell read-only automatic variables (about_Automatic_
+    # Variables). Assigning to any of them throws, so a script that
+    # does so inside try/catch silently drops every row it touches.
+    readonly = ("pid", "_", "args", "input", "host", "true", "false",
+                "null", "error", "myinvocation", "psversiontable",
+                "executioncontext", "pscommandpath", "psscriptroot",
+                "profile", "lastexitcode", "matches", "foreach",
+                "switch", "this", "sender", "event", "eventargs")
+    for script in (_UIA_LIST_SCRIPT, _UIA_FOCUS_SCRIPT):
+        for var in readonly:
+            assert re.search(rf"\${var}\s*=", script, re.IGNORECASE) is None, \
+                f"${var} is a read-only automatic variable"
+
+
 def test_uia_get_backend_dispatch_windows(monkeypatch):
     import core.window_control as wc
 
