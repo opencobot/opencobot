@@ -400,8 +400,8 @@ class _RecordingTransport:
     context-manager protocol PolicyClient._request uses. With
     ``fail_connect_times`` set, the first N connects raise
     TransportNotAvailableError, simulating a transient connect
-    failure (e.g. the Windows single-instance pipe race: the server
-    has not recycled the instance yet when the next client connects).
+    failure (e.g. a Windows connect failing transiently when every
+    pipe instance is briefly busy).
     """
 
     def __init__(self, replies, fail_connect_times=0):

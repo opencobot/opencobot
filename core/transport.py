@@ -94,10 +94,15 @@ def policyd_pipe_path() -> str:
     on Windows (see docs/test-results/2026-11-25-windows-ffa7b3c.md:
     13 webui ERRORs + policyd/daemon FAILs from a leaked fixture
     server holding the global pipe). Production never sets it, and
-    the real policyd keeps the fixed global pipe — the single-instance
-    property is deliberate (PR #32); raising max_instances stays
-    rejected. Follows the existing ``OPENCOBOT_READONLY`` /
-    ``OPENCOBOT_STATE`` env-override precedent.
+    the real policyd keeps the fixed global pipe. The listener
+    serves up to ``_PIPE_MAX_INSTANCES`` (8) concurrent
+    connections, so the old single-instance backstop against a
+    second policyd is gone (see the ``_PIPE_MAX_INSTANCES``
+    comment in ``_CtypesWindowsPipeApi``); the per-test override
+    still matters because a leaked fixture server on the global
+    pipe would still steal clients. Follows the existing
+    ``OPENCOBOT_READONLY`` / ``OPENCOBOT_STATE`` env-override
+    precedent.
     """
     return os.environ.get("OPENCOBOT_POLICYD_PIPE") or POLICYD_PIPE_PATH
 
@@ -391,7 +396,15 @@ class _CtypesWindowsPipeApi:
     * ``read_available(handle, size)`` -> bytes read, ``b""`` when
       the client disconnected.
     * ``write_all(handle, data)`` -> None (writes the whole buffer).
-    * ``disconnect(handle)`` / ``close(handle)``.
+    * ``disconnect(handle)`` / ``close(handle)``. ``close`` also
+      frees the SECURITY_ATTRIBUTES keepalive, so only the
+      listener calls it, once, for its listening handle when it
+      stops serving. A worker thread that owns a connection
+      handle calls ``close_handle(handle)`` instead, which closes
+      just the handle — the attributes must stay alive while the
+      listener keeps creating instances.
+    * ``close_handle(handle)`` -> None (closes one handle, keeps
+      the SECURITY_ATTRIBUTES alive).
 
     All Win32 errors raise :class:`TransportNotAvailableError` with
     the failing call named, so the listener can fail closed with a
@@ -403,14 +416,32 @@ class _CtypesWindowsPipeApi:
     _PIPE_TYPE_MESSAGE = 0x00000004
     _PIPE_READMODE_MESSAGE = 0x00000002
     _PIPE_WAIT = 0x00000000
-    # One server instance only: a second daemon's CreateNamedPipeW on
-    # the same name fails (ERROR_PIPE_BUSY) instead of silently
-    # serving a second pipe instance alongside the first, which would
-    # split clients between two daemons. This closes the same gap for
-    # policyd (same listener). Clients are unaffected: the listener
-    # serves one connection at a time on its single handle, and a
-    # client can only connect to an instance the server created.
-    _PIPE_MAX_INSTANCES = 1
+    # Bounded concurrent instances: one listening instance plus one
+    # instance per connection in flight. Win32 gives a client a pipe
+    # instance to connect to, so a single instance physically admits
+    # only one concurrent client — with 1, a long-running connection
+    # (e.g. an orchestrator run) makes every other client fail at
+    # connect time (ERROR_PIPE_BUSY), which is the incident this
+    # exists to fix. 8 comfortably covers the daemon's real client
+    # set (CLI, VS Code extension, web UI, plus probes) while
+    # bounding handle/buffer use.
+    #
+    # TRADE-OFF, read before changing: this used to be 1, which made
+    # a second daemon's CreateNamedPipeW fail outright instead of
+    # silently serving a second pipe instance alongside the first
+    # (which would split clients between two daemons). With 8, that
+    # hard backstop is gone for a *simultaneous* start: the
+    # single-daemon guarantee now rests on the reachable probe
+    # (``Daemon.serve_forever`` refuses when a daemon already
+    # answers) and the daemon pid file. A second daemon that starts
+    # in the same instant as the first can now create instances and
+    # split clients — the same exposure policyd already had, since
+    # ``policy.policyd.serve`` never probed. This is the deliberate
+    # cost of concurrent connections; do not raise the cap further
+    # without revisiting it, and see docs/threat-model.md (R-017)
+    # and the ``policyd_pipe_path`` docstring, which still describe
+    # the old single-instance property.
+    _PIPE_MAX_INSTANCES = 8
     _TOKEN_QUERY = 0x0008
     _TOKEN_USER = 1
     _SECURITY_DESCRIPTOR_REVISION = 1
@@ -701,7 +732,22 @@ class _CtypesWindowsPipeApi:
     def disconnect(self, handle: int) -> None:
         self._kernel32.DisconnectNamedPipe(handle)
 
+    def close_handle(self, handle: int) -> None:
+        """Close one connection handle; the attributes stay alive.
+
+        Called by the worker thread that owns a connection handle
+        (see :class:`NamedPipeListener`). Unlike :meth:`close`,
+        this never frees the SECURITY_ATTRIBUTES keepalive: the
+        listener is still creating instances against the same
+        attributes, and freeing the ACL under it would be a
+        use-after-free on the next ``CreateNamedPipeW``.
+        """
+        self._kernel32.CloseHandle(handle)
+
     def close(self, handle: int) -> None:
+        # Listener shutdown only: closing the listening handle also
+        # frees the keepalive, so this must never be called for a
+        # connection handle while the listener is still serving.
         try:
             self._kernel32.CloseHandle(handle)
         finally:
@@ -789,6 +835,23 @@ class NamedPipeListener:
     A failure mid-connection only ends that connection (the client
     disconnects; the server keeps listening), never the ACL.
 
+    CONCURRENCY: one thread per connection, like the POSIX
+    Unix-socket servers (``Daemon.serve_forever``). The accept loop
+    creates a fresh pipe instance per cycle (up to
+    ``_PIPE_MAX_INSTANCES``), hands an accepted connection's handle
+    to a daemon worker thread, and immediately goes back to
+    listening — so a long-running request (e.g. an orchestrator
+    run) blocks only its own connection, and a concurrent
+    ``daemon status`` is served instead of failing at connect
+    time. Worker threads are daemons: they never block process
+    exit, and ``listen`` never joins them. Each worker owns its
+    handle: it disconnects and closes it when its connection ends.
+    The listener owns only the instance it is currently waiting
+    on, and closes it when ``stop`` is set. Auth, token checks and
+    request handling are unchanged — the worker runs the same
+    ``_serve_one_connection`` the serial loop ran, on its own
+    handle.
+
     ``api`` is an injectable stand-in for the Win32 API (same
     methods as :class:`_CtypesWindowsPipeApi`); tests inject a fake
     so the accept loop and the fail-closed paths are verified on
@@ -812,6 +875,12 @@ class NamedPipeListener:
         started safely, and :class:`NotImplementedError` if the
         Win32 API is unavailable at all (e.g. this code running on
         a non-Windows host).
+
+        Each accepted connection is served by its own daemon
+        worker thread (see the class docstring): the accept loop
+        never waits on a handler. A connection still being served
+        when ``stop`` is set ends with the process — the worker
+        threads are daemons and are never joined.
         """
         if not is_windows():
             raise TransportNotAvailableError(
@@ -836,42 +905,54 @@ class NamedPipeListener:
                 "named-pipe server: cannot build the pipe ACL "
                 f"({exc}); refusing to serve without a protected pipe"
             ) from exc
-        try:
-            handle = api.create_pipe(self.pipe_path, sa)
-        except TransportNotAvailableError:
-            raise
-        except Exception as exc:
-            raise TransportNotAvailableError(
-                "named-pipe server: cannot create the pipe "
-                f"({exc}); refusing to serve"
-            ) from exc
         print(f"listening on named pipe {self.pipe_path}",
               file=sys.stderr, flush=True)
-        try:
-            while stop is None or not stop.is_set():
-                try:
-                    connected = api.wait_for_client(handle, stop)
-                except TransportNotAvailableError:
-                    raise
-                except Exception as exc:
-                    raise TransportNotAvailableError(
-                        "named-pipe server: waiting for a client failed "
-                        f"({exc})"
-                    ) from exc
-                if not connected:
-                    break
-                self._serve_one_connection(api, handle, handler, stop)
-        finally:
-            api.close(handle)
+        while stop is None or not stop.is_set():
+            try:
+                handle = api.create_pipe(self.pipe_path, sa)
+            except TransportNotAvailableError:
+                raise
+            except Exception as exc:
+                raise TransportNotAvailableError(
+                    "named-pipe server: cannot create the pipe "
+                    f"({exc}); refusing to serve"
+                ) from exc
+            try:
+                connected = api.wait_for_client(handle, stop)
+            except TransportNotAvailableError:
+                api.close(handle)
+                raise
+            except Exception as exc:
+                api.close(handle)
+                raise TransportNotAvailableError(
+                    "named-pipe server: waiting for a client failed "
+                    f"({exc})"
+                ) from exc
+            if not connected:
+                # ``stop`` was set while waiting: no client owns
+                # this instance, so the listener closes it itself.
+                api.close(handle)
+                break
+            # Hand this instance to a worker and go back to
+            # listening on a fresh instance. The worker owns the
+            # handle from here: it disconnects and closes it when
+            # its connection ends.
+            thread = threading.Thread(
+                target=self._serve_one_connection,
+                args=(api, handle, handler, stop),
+                daemon=True,
+            )
+            thread.start()
 
     def _serve_one_connection(self, api, handle, handler, stop) -> None:
         """Serve one connected client: lines in, replies out.
 
-        Mirrors the Unix-socket servers: blank lines are skipped, a
-        bad-JSON line gets an error reply (the connection stays up),
-        a handler exception gets an error reply, and a client
-        disconnect ends the connection. A read/write failure ends
-        the connection, never the server.
+        Runs on a worker thread (see :meth:`listen`); this thread
+        owns ``handle``. Mirrors the Unix-socket servers: blank
+        lines are skipped, a bad-JSON line gets an error reply (the
+        connection stays up), a handler exception gets an error
+        reply, and a client disconnect ends the connection. A
+        read/write failure ends the connection, never the server.
         """
         buffer = bytearray()
         try:
@@ -904,4 +985,11 @@ class NamedPipeListener:
                     except TransportNotAvailableError:
                         return
         finally:
-            api.disconnect(handle)
+            # This worker owns the handle: disconnect the client,
+            # then close the handle itself. It must NOT call
+            # api.close(): that frees the SECURITY_ATTRIBUTES the
+            # listener is still creating instances against.
+            try:
+                api.disconnect(handle)
+            finally:
+                api.close_handle(handle)

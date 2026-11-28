@@ -340,12 +340,14 @@ def cmd_daemon_start(args):
     pid_path.write_text(str(proc.pid), encoding="utf-8")
     # NOTE: trust the FIRST successful probe. The loop breaks as soon
     # as the daemon answers; re-probing immediately after would be a
-    # second connection, and on Windows the pipe listener (max
-    # instances 1) needs a beat between disconnect and the next
-    # ConnectNamedPipe, so that second probe can fail with
-    # ERROR_PIPE_BUSY even though the daemon is fine — which used to
-    # report a false "did not become ready" timeout and unlink
-    # daemon.pid, orphaning a live daemon (laptop round, PR #16).
+    # second connection. (The old single-instance listener needed a
+    # beat between disconnect and the next ConnectNamedPipe, so that
+    # second probe could fail with ERROR_PIPE_BUSY even though the
+    # daemon was fine — which used to report a false "did not become
+    # ready" timeout and unlink daemon.pid, orphaning a live daemon
+    # (laptop round, PR #16). The threaded listener serves concurrent
+    # connections, so the race is gone; the first-success break stays
+    # because it is the simplest correct behaviour.)
     ready = False
     deadline = time.time() + 5.0
     while time.time() < deadline:

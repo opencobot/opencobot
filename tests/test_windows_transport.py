@@ -15,6 +15,7 @@ import json
 import os
 import socket
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -92,10 +93,11 @@ class FakePipeApi:
     Implements the interface :class:`NamedPipeListener` uses
     (``build_security_attributes`` / ``create_pipe`` /
     ``wait_for_client`` / ``read_available`` / ``write_all`` /
-    ``disconnect`` / ``close``) so the listener's accept loop is
-    verified on Linux, where ``ctypes.windll`` does not exist. Serves
-    one request (``request_bytes``) then reports disconnect; a
-    second ``wait_for_client`` returns False so ``listen()`` exits.
+    ``disconnect`` / ``close_handle`` / ``close``) so the listener's
+    accept loop is verified on Linux, where ``ctypes.windll`` does
+    not exist. Serves one request (``request_bytes``) then reports
+    disconnect; a second ``wait_for_client`` returns False so
+    ``listen()`` exits.
     """
 
     def __init__(self, request_bytes: bytes):
@@ -105,6 +107,7 @@ class FakePipeApi:
         self.pipe_path = None
         self.security_attributes_built = False
         self.closed = False
+        self.connection_closed = False
 
     def build_security_attributes(self):
         self.security_attributes_built = True
@@ -132,6 +135,11 @@ class FakePipeApi:
 
     def disconnect(self, handle):
         pass
+
+    def close_handle(self, handle):
+        # Called by the worker thread that owns the connection;
+        # reaching it proves the worker finished serving.
+        self.connection_closed = True
 
     def close(self, handle):
         self.closed = True
@@ -368,6 +376,12 @@ def test_named_pipe_listener_serves_request_with_fake_api_on_windows(windows_pla
     listener = NamedPipeListener(POLICYD_PIPE_PATH, api=api)
     listener.listen(handler=lambda req: {"ok": True, "echo": req.get("op")},
                     stop=stop)
+    # The request is served by a worker thread: listen() can return
+    # before it finishes, so wait for it (deadline, never hang).
+    deadline = time.time() + 5
+    while not api.connection_closed:
+        assert time.time() < deadline, "worker thread did not finish"
+        time.sleep(0.01)
     assert api.pipe_path == POLICYD_PIPE_PATH
     assert api.security_attributes_built is True
     assert api.written == encode_message({"ok": True, "echo": "status"})
