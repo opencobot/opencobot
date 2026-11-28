@@ -44,6 +44,7 @@ import platform
 import socket
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -220,11 +221,18 @@ class NamedPipeTransport:
     """Windows named-pipe client transport.
 
     On a Windows host the pipe is opened with stdlib :func:`open` in
-    ``"r+b"`` mode (no ``shell``, no new dependency). ``open()`` blocks
-    until a server instance is listening, and has no timeout — a
-    ``ctypes`` ``CreateFile`` client with a timeout is the hardening
-    step for later; this round the 10 s read behaviour of the caller
-    still bounds a single request once connected.
+    ``"r+b"`` mode (no ``shell``, no new dependency). ``open()`` does
+    NOT wait for a server instance: if no instance is listening it
+    fails at once, and the server creates a fresh instance per accept
+    cycle, so between one connection being accepted and the next
+    instance being created there is a microsecond gap with no
+    listening instance (thread spawn + ``CreateNamedPipeW``) — an
+    ``open()`` landing in that gap fails even though the daemon is
+    alive. :meth:`connect` therefore retries the open briefly (see
+    ``_CONNECT_ATTEMPTS`` / ``_CONNECT_RETRY_DELAY_SECONDS``) before
+    giving up. A ``ctypes`` ``CreateFile`` client with a timeout is
+    the hardening step for later; this round the 10 s read behaviour
+    of the caller still bounds a single request once connected.
 
     On a non-Windows host :meth:`connect` raises
     :class:`TransportNotAvailableError` ("not available on this
@@ -233,15 +241,28 @@ class NamedPipeTransport:
     the client without a real pipe.
     """
 
+    # How many times connect() tries to open the pipe before giving
+    # up, and how long it waits between attempts. The inter-instance
+    # gap is microseconds (one thread spawn + one CreateNamedPipeW),
+    # so 5 attempts over ~80 ms is generous; a genuinely-down daemon
+    # costs at most (_CONNECT_ATTEMPTS - 1) * _CONNECT_RETRY_DELAY_SECONDS
+    # of added latency before the usual "cannot connect" error.
+    _CONNECT_ATTEMPTS = 5
+    _CONNECT_RETRY_DELAY_SECONDS = 0.02
+
     def __init__(
         self,
         pipe_path: str = POLICYD_PIPE_PATH,
         pipe_file=None,
         opener=None,
+        sleeper=None,
     ):
         self.pipe_path = pipe_path
         self._pipe_file = pipe_file
         self._opener = opener
+        # Injectable sleep so tests can count retries without
+        # actually sleeping; defaults to time.sleep.
+        self._sleeper = sleeper if sleeper is not None else time.sleep
 
     def connect(self):
         """Open the pipe (or return the injected fake for tests)."""
@@ -253,12 +274,17 @@ class NamedPipeTransport:
                 "(Windows only); use the Unix-socket transport"
             )
         opener = self._opener or open
-        try:
-            return opener(self.pipe_path, "r+b", buffering=0)
-        except OSError as exc:
-            raise TransportNotAvailableError(
-                f"cannot connect to named pipe: {self.pipe_path}"
-            ) from exc
+        last_exc = None
+        for attempt in range(self._CONNECT_ATTEMPTS):
+            try:
+                return opener(self.pipe_path, "r+b", buffering=0)
+            except OSError as exc:
+                last_exc = exc
+                if attempt < self._CONNECT_ATTEMPTS - 1:
+                    self._sleeper(self._CONNECT_RETRY_DELAY_SECONDS)
+        raise TransportNotAvailableError(
+            f"cannot connect to named pipe: {self.pipe_path}"
+        ) from last_exc
 
 
 # ---------------------------------------------------------------------------

@@ -298,6 +298,80 @@ def test_named_pipe_client_selected_on_windows(auth_state, windows_platform):
 
 
 # ---------------------------------------------------------------------------
+# Named-pipe connect(): retry across the listener's inter-instance gap
+# ---------------------------------------------------------------------------
+# The server creates a fresh pipe instance per accept cycle, so an
+# open() landing in the microsecond gap between one connection being
+# accepted and the next instance being created fails even though the
+# daemon is alive (laptop round on b29da55: the first `daemon status`
+# after start reported "query failed" for exactly this reason).
+# connect() retries the open briefly; these tests drive it with a
+# scripted opener and a fake sleeper, so no real sleeping happens.
+
+
+def test_named_pipe_connect_retries_transient_open_failures(windows_platform):
+    pipe = FakePipe(b"")
+    attempts = []
+    sleeps = []
+
+    def opener(path, mode, buffering=0):
+        attempts.append(path)
+        if len(attempts) < 3:
+            raise OSError(22, "Invalid argument")
+        return pipe
+
+    transport = NamedPipeTransport(opener=opener, sleeper=sleeps.append)
+    assert transport.connect() is pipe
+    assert len(attempts) == 3
+    assert sleeps == [NamedPipeTransport._CONNECT_RETRY_DELAY_SECONDS] * 2
+
+
+def test_named_pipe_connect_gives_up_after_configured_attempts(windows_platform):
+    attempts = []
+    sleeps = []
+
+    def opener(path, mode, buffering=0):
+        attempts.append(path)
+        raise OSError(2, "No such file or directory")
+
+    transport = NamedPipeTransport(opener=opener, sleeper=sleeps.append)
+    with pytest.raises(TransportNotAvailableError,
+                       match="cannot connect to named pipe"):
+        transport.connect()
+    assert len(attempts) == NamedPipeTransport._CONNECT_ATTEMPTS
+    assert len(sleeps) == NamedPipeTransport._CONNECT_ATTEMPTS - 1
+
+
+def test_named_pipe_connect_does_not_retry_non_os_error(windows_platform):
+    attempts = []
+    sleeps = []
+
+    def opener(path, mode, buffering=0):
+        attempts.append(path)
+        raise ValueError("not a pipe error")
+
+    transport = NamedPipeTransport(opener=opener, sleeper=sleeps.append)
+    with pytest.raises(ValueError, match="not a pipe error"):
+        transport.connect()
+    assert len(attempts) == 1
+    assert sleeps == []
+
+
+def test_named_pipe_connect_injected_pipe_ignores_opener_and_sleeper(
+        windows_platform):
+    pipe = FakePipe(b"")
+    sleeps = []
+
+    def opener(path, mode, buffering=0):
+        raise AssertionError("opener must not run for an injected pipe")
+
+    transport = NamedPipeTransport(pipe_file=pipe, opener=opener,
+                                   sleeper=sleeps.append)
+    assert transport.connect() is pipe
+    assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
 # policyd_pipe_path(): env override for per-test isolation
 # ---------------------------------------------------------------------------
 
