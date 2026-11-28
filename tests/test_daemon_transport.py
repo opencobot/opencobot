@@ -697,6 +697,207 @@ def test_cmd_daemon_stop_windows_kills_live_process_despite_winerror87(
     assert json.loads(capsys.readouterr().out)["running"] is False
 
 
+# ---------------------------------------------------------------------------
+# daemon stop also stops policyd (PR #66 follow-up to PR #64)
+# ---------------------------------------------------------------------------
+
+def _fake_pid_liveness(alive_pids):
+    """``_pid_alive`` stand-in backed by a mutable set of live pids."""
+    alive = set(alive_pids)
+
+    def _alive(pid):
+        return pid in alive
+
+    return alive, _alive
+
+
+def _fake_terminate(alive, killed, works=True):
+    """``_terminate_pid`` stand-in: records the call; removes the pid
+    from the live set when ``works`` (a kill that does not take effect
+    leaves it there, so the re-check still sees it alive)."""
+    def _terminate(pid):
+        killed.append(pid)
+        if works:
+            alive.discard(pid)
+
+    return _terminate
+
+
+def test_cmd_daemon_stop_windows_stops_policyd(state_dir, monkeypatch, capsys):
+    # Stopping the daemon also stops the policyd recorded in
+    # policyd.pid (laptop re-check on 26fc845: `daemon stop` left two
+    # policyd processes + a stale pid file behind). The daemon goes
+    # first (it depends on policyd), then policyd, then the pid file.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    alive, fake_alive = _fake_pid_liveness({7777})
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    (state_dir / "policyd.pid").write_text("7777", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 0
+    assert killed == [7777]  # only policyd: the daemon pid was already dead
+    assert not (state_dir / "daemon.pid").exists()
+    assert not (state_dir / "policyd.pid").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"running": False, "pid": 380, "policyd": "stopped"}
+
+
+def test_cmd_daemon_stop_windows_no_policyd_pid_file(state_dir, monkeypatch, capsys):
+    # No policyd.pid means nothing to stop: the stop succeeds, the
+    # payload says so, and _terminate_pid is never called.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    alive, fake_alive = _fake_pid_liveness(set())
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 0
+    assert killed == []
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["policyd"] == "not running"
+
+
+def test_cmd_daemon_stop_windows_stale_policyd_pid(state_dir, monkeypatch, capsys):
+    # A policyd pid that is already dead is a stale file, not a
+    # failure: the stop succeeds, the file is removed, no kill.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    alive, fake_alive = _fake_pid_liveness(set())
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    (state_dir / "policyd.pid").write_text("7777", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 0
+    assert killed == []
+    assert not (state_dir / "policyd.pid").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["policyd"] == "not running"
+
+
+def test_cmd_daemon_stop_windows_policyd_kill_failure_warns_but_stops(
+        state_dir, monkeypatch, capsys):
+    # A policyd that refuses to die must NOT fail the daemon stop:
+    # exit 0, policyd "failed", and the pid file is kept so a later
+    # stop can retry it.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    alive, fake_alive = _fake_pid_liveness({7777})
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed, works=False))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    (state_dir / "policyd.pid").write_text("7777", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 0
+    assert killed == [7777]
+    assert (state_dir / "policyd.pid").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["policyd"] == "failed"
+
+
+def test_cmd_daemon_stop_windows_policyd_kill_failure_warning_line(
+        state_dir, monkeypatch, capsys):
+    # In human (non-JSON) mode the policyd failure is a visible
+    # warning line next to the "daemon stopped" line.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    alive, fake_alive = _fake_pid_liveness({7777})
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed, works=False))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    (state_dir / "policyd.pid").write_text("7777", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir, as_json=False))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "daemon stopped (pid 380)" in out
+    assert "warning: policyd (pid 7777) did not stop" in out
+
+
+def test_cmd_daemon_stop_windows_corrupt_policyd_pid_removed(
+        state_dir, monkeypatch, capsys):
+    # An unparseable policyd.pid is stale garbage, not a failure: the
+    # stop succeeds and the file is removed.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    alive, fake_alive = _fake_pid_liveness(set())
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed))
+    (state_dir / "daemon.pid").write_text("380", encoding="utf-8")
+    (state_dir / "policyd.pid").write_text("garbage", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 0
+    assert killed == []
+    assert not (state_dir / "policyd.pid").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["policyd"] == "not running"
+
+
+def test_cmd_daemon_stop_windows_not_running_still_stops_policyd(
+        state_dir, monkeypatch, capsys):
+    # Decision: when the daemon is already down, `daemon stop` still
+    # stops policyd — the user asked to stop the services. The exit
+    # code stays 1 (the daemon was not running); only the policyd
+    # outcome is added.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: False)
+    alive, fake_alive = _fake_pid_liveness({7777})
+    killed = []
+    monkeypatch.setattr(cli_mod, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        _fake_terminate(alive, killed))
+    (state_dir / "policyd.pid").write_text("7777", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 1
+    assert killed == [7777]
+    assert not (state_dir / "policyd.pid").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"running": False, "policyd": "stopped"}
+
+
+def test_cmd_daemon_stop_windows_reachable_daemon_keeps_policyd(
+        state_dir, monkeypatch, capsys):
+    # Guard for the decision above: when the daemon is running but
+    # has no pid file, the stop refuses to guess — and policyd is
+    # left alone too, because stopping it under a live daemon would
+    # break the daemon's privileged ops.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    killed = []
+    monkeypatch.setattr(cli_mod, "_terminate_pid",
+                        lambda pid: killed.append(pid))
+    (state_dir / "policyd.pid").write_text("7777", encoding="utf-8")
+    rc = cli_mod.cmd_daemon_stop(_ns(state_dir))
+    assert rc == 1
+    assert killed == []
+    assert (state_dir / "policyd.pid").exists()
+    assert "no PID file" in capsys.readouterr().err
+
+
 def test_cmd_ui_stop_windows_kills_live_process_despite_winerror87(
         state_dir, monkeypatch, capsys):
     """Same bug, same helpers, through ui stop."""
