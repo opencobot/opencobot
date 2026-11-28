@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +20,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from core.model_gateway import Gateway, ProviderConfig  # noqa: E402
 from core.memory import Memory  # noqa: E402
 from core.orchestrator import (  # noqa: E402
     Orchestrator,
@@ -551,3 +555,76 @@ def test_real_runtime_integration_writes_verified_file(tmp_path):
     assert summary["ok"] is True
     assert summary["integrated"] == ["write file"]
     assert (ws / "out.txt").read_text(encoding="utf-8") == "hello from worker"
+
+
+# ---------------------------------------------------------------- no-provider
+# duration bound
+
+def test_no_provider_run_is_bounded(tmp_path, monkeypatch):
+    """A no-provider run finishes in ~2 x timeout and queues the subtask.
+
+    Regression test for the ~7-minute no-provider run seen on the
+    laptop (2026-11-27). The gateway is called 3 times per run
+    (decompose attempts 1-2 + one dispatch), but with both providers
+    black-holed the first call costs one timeout per provider and
+    the 60 s circuit-breaker cooldown makes the other two calls
+    return immediately -- so the whole run is bounded by ~2 x timeout
+    (60 s at production timeouts), and ~0.2 s here. The 10 s bound is
+    ~50x that: it guards against an unbounded wait (retry loop, sleep,
+    ignored timeout) without flaking on a loaded machine. The run is
+    done in a thread so the bound is enforced even if the run hangs --
+    a plain elapsed-time assert could never fire in exactly the
+    failure this guards. The fake urlopen sleeps for the timeout it
+    is given, so the test also pins that ``config.timeout`` really
+    reaches ``urlopen`` (same monkeypatch pattern as test_gateway.py).
+    """
+    timeout = 0.1
+    seen_timeouts: list = []
+
+    def fake_urlopen(request, timeout=None):
+        seen_timeouts.append(timeout)
+        time.sleep(timeout or 0)
+        raise urllib.error.URLError("timed out (black-holed provider)")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    configs = [
+        ProviderConfig("ollama-local", "ollama",
+                       "http://localhost:11434", "llama3.1",
+                       timeout=timeout),
+        ProviderConfig("openai-compatible", "openai-compatible",
+                       "http://localhost:1234/v1", "local-model",
+                       timeout=timeout),
+    ]
+    gw = Gateway(configs=configs)
+    orch = _make(tmp_path, gw, config={"architect": "ollama-local",
+                                       "workers": ["openai-compatible"]})
+    outcome: dict = {}
+
+    def _run() -> None:
+        try:
+            outcome["summary"] = orch.run("do the thing")
+        except BaseException as exc:  # surfaced after the join below
+            outcome["error"] = exc
+
+    started = time.monotonic()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    elapsed = time.monotonic() - started
+    assert not thread.is_alive(), (
+        "no-provider orchestrator run did not finish within 10 s")
+    assert elapsed < 10, f"no-provider run took {elapsed:.2f}s"
+    if "error" in outcome:
+        raise outcome["error"]
+    # The two timeouts were actually incurred (not instant failures),
+    # and the cooldown meant only the first gateway call did any work:
+    # exactly two urlopen calls, each with the configured timeout.
+    assert elapsed >= timeout, (
+        f"run finished in {elapsed:.3f}s -- the providers did not block "
+        "for their timeouts, so this test proved nothing")
+    assert seen_timeouts == [timeout, timeout]
+    summary = outcome["summary"]
+    assert summary["ok"] is False
+    assert summary["queued"] == ["do the thing"]
+    assert "no provider available" in summary["subtasks"][0]["reason"]
+    assert "queued" in (summary["error"] or "")
