@@ -369,7 +369,26 @@ def cmd_daemon_start(args):
         _err(f"daemon did not become ready within 5s (see {log_path})")
         pid_path.unlink(missing_ok=True)
         return 1
-    payload = {"running": True, "pid": proc.pid}
+    # The daemon gates every privileged op (run_tool, orchestrator_run,
+    # kill) on policyd being reachable, but nothing used to start it:
+    # after a fresh `daemon start` the VS Code extension's runTask was
+    # always refused with "policyd unavailable". So starting the daemon
+    # also makes sure policyd is up. ensure_policyd is a no-op when a
+    # policyd is already reachable. A policyd failure must NOT fail
+    # the start: the daemon itself is up and serves status /
+    # list_tools, and tool runs will refuse with the existing
+    # "policyd unavailable" error until policyd is up — so report it
+    # as a warning and keep the exit code 0.
+    try:
+        policyd_status, _policyd_proc = ensure_policyd(state_dir)
+        policyd_note = None
+    except PolicyUnavailable as exc:
+        policyd_status = "failed"
+        policyd_note = str(exc)
+    if policyd_status != "running":
+        policyd_note = policyd_note or (
+            f"policyd did not start (see {state_dir / 'policyd.log'})")
+    payload = {"running": True, "pid": proc.pid, "policyd": policyd_status}
     if sys.platform == "win32":
         from core.transport import DAEMON_PIPE_PATH  # lazy import
 
@@ -378,6 +397,10 @@ def cmd_daemon_start(args):
     else:
         payload["socket"] = str(state_dir / "daemon.sock")
         lines = [f"daemon started (pid {proc.pid}, socket {state_dir / 'daemon.sock'})"]
+    if policyd_status != "running":
+        lines.append(
+            f"warning: {policyd_note}; tool runs will be refused "
+            "until policyd is up")
     _emit(payload, args.json, lines)
     return 0
 
