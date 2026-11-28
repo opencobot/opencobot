@@ -279,11 +279,24 @@ def _probe_must_not_run(state):
         "cmd_daemon_status must query directly without a prior probe")
 
 
+def _ensure_policyd_must_not_run(state_dir):
+    """Fail if ``ensure_policyd`` is called before the daemon is up.
+
+    ``cmd_daemon_start`` ensures policyd only after the daemon is
+    confirmed ready; a call here means it ran on a path where the
+    daemon never became ready (or never started).
+    """
+    raise AssertionError(
+        "ensure_policyd must not run before the daemon is confirmed up")
+
+
 def test_cmd_daemon_start_windows_reports_pipe(state_dir, monkeypatch, capsys):
     import cli.opencobot_cli as cli_mod
 
     _patch_cli_windows(monkeypatch)
     monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    monkeypatch.setattr(cli_mod, "ensure_policyd",
+                        lambda state: ("running", None))
     monkeypatch.setattr(cli_mod.subprocess, "Popen",
                         lambda *a, **k: _FakeProc(pid=4321))
     rc = cli_mod.cmd_daemon_start(_ns(state_dir))
@@ -291,6 +304,7 @@ def test_cmd_daemon_start_windows_reports_pipe(state_dir, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["running"] is True
     assert payload["pid"] == 4321
+    assert payload["policyd"] == "running"
     assert payload["pipe"] == DAEMON_PIPE_PATH
     assert "socket" not in payload
 
@@ -309,6 +323,8 @@ def test_cmd_daemon_start_windows_second_probe_fails_still_succeeds(
     answers = iter([True, False])
     monkeypatch.setattr(cli_mod, "_daemon_reachable",
                         lambda state: next(answers))
+    monkeypatch.setattr(cli_mod, "ensure_policyd",
+                        lambda state: ("running", None))
     monkeypatch.setattr(cli_mod.subprocess, "Popen",
                         lambda *a, **k: _FakeProc(pid=4321))
     rc = cli_mod.cmd_daemon_start(_ns(state_dir))
@@ -317,6 +333,7 @@ def test_cmd_daemon_start_windows_second_probe_fails_still_succeeds(
     payload = json.loads(capsys.readouterr().out)
     assert payload["running"] is True
     assert payload["pid"] == 4321
+    assert payload["policyd"] == "running"
 
 
 def test_cmd_daemon_start_windows_daemon_dies(state_dir, monkeypatch, capsys):
@@ -324,6 +341,7 @@ def test_cmd_daemon_start_windows_daemon_dies(state_dir, monkeypatch, capsys):
 
     _patch_cli_windows(monkeypatch)
     monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: False)
+    monkeypatch.setattr(cli_mod, "ensure_policyd", _ensure_policyd_must_not_run)
     monkeypatch.setattr(cli_mod.subprocess, "Popen",
                         lambda *a, **k: _FakeProc(pid=4321, returncode=1))
     rc = cli_mod.cmd_daemon_start(_ns(state_dir))
@@ -338,11 +356,156 @@ def test_cmd_daemon_start_windows_never_ready(state_dir, monkeypatch, capsys):
 
     _patch_cli_windows(monkeypatch)
     monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: False)
+    monkeypatch.setattr(cli_mod, "ensure_policyd", _ensure_policyd_must_not_run)
     monkeypatch.setattr(cli_mod.subprocess, "Popen",
                         lambda *a, **k: _FakeProc(pid=4321))
     rc = cli_mod.cmd_daemon_start(_ns(state_dir))
     assert rc == 1
     assert "did not become ready" in capsys.readouterr().err
+
+
+def test_cmd_daemon_start_windows_starts_policyd(state_dir, monkeypatch, capsys):
+    # Starting the daemon also makes sure policyd is up: the daemon
+    # gates every privileged op on policyd being reachable, and a
+    # fresh `daemon start` used to leave it down, so the VS Code
+    # extension's runTask was always refused with "policyd
+    # unavailable". ensure_policyd runs once, after the daemon is
+    # confirmed ready, with the state dir.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    calls = []
+    def _ensure(state):
+        calls.append(state)
+        return ("running", _FakeProc(pid=7777))
+    monkeypatch.setattr(cli_mod, "ensure_policyd", _ensure)
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(pid=4321))
+    rc = cli_mod.cmd_daemon_start(_ns(state_dir))
+    assert rc == 0
+    assert calls == [state_dir]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] is True
+    assert payload["pid"] == 4321
+    assert payload["policyd"] == "running"
+
+
+def test_cmd_daemon_start_windows_policyd_already_running(
+        state_dir, monkeypatch, capsys):
+    # ("running", None) is ensure_policyd's already-running return
+    # (its own no-op is covered by
+    # test_windows_already_running_does_not_spawn in
+    # test_ensure_policyd.py): start still succeeds and reports
+    # policyd running.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    monkeypatch.setattr(cli_mod, "ensure_policyd",
+                        lambda state: ("running", None))
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(pid=4321))
+    rc = cli_mod.cmd_daemon_start(_ns(state_dir))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] is True
+    assert payload["policyd"] == "running"
+
+
+def test_cmd_daemon_start_windows_policyd_failure_warns_but_starts(
+        state_dir, monkeypatch, capsys):
+    # A policyd that fails to start must NOT fail the daemon start:
+    # the daemon itself is up and serves status / list_tools, so the
+    # start reports success with policyd "failed" and exit code 0.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    monkeypatch.setattr(cli_mod, "ensure_policyd",
+                        lambda state: ("failed", None))
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(pid=4321))
+    rc = cli_mod.cmd_daemon_start(_ns(state_dir))
+    assert rc == 0
+    assert (state_dir / "daemon.pid").read_text(encoding="utf-8") == "4321"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] is True
+    assert payload["pid"] == 4321
+    assert payload["policyd"] == "failed"
+
+
+def test_cmd_daemon_start_windows_policyd_failure_warning_line(
+        state_dir, monkeypatch, capsys):
+    # In human (non-JSON) mode the policyd failure is a visible
+    # warning line next to the "daemon started" line.
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    monkeypatch.setattr(cli_mod, "ensure_policyd",
+                        lambda state: ("failed", None))
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(pid=4321))
+    rc = cli_mod.cmd_daemon_start(_ns(state_dir, as_json=False))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "daemon started (pid 4321" in out
+    assert "warning: policyd did not start (see " in out
+    assert "policyd.log" in out
+    assert "tool runs will be refused" in out
+
+
+def test_cmd_daemon_start_windows_policyd_module_missing_warns_but_starts(
+        state_dir, monkeypatch, capsys):
+    # ensure_policyd raises PolicyUnavailable when the real policyd
+    # module is not installed; that is a policyd failure too, so the
+    # start still succeeds with policyd "failed".
+    import cli.opencobot_cli as cli_mod
+    from cli._compat import PolicyUnavailable
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    def _ensure_missing(state):
+        raise PolicyUnavailable(
+            "real policyd module (policy.policyd) is not installed; "
+            "reinstall OpenCobot")
+    monkeypatch.setattr(cli_mod, "ensure_policyd", _ensure_missing)
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(pid=4321))
+    rc = cli_mod.cmd_daemon_start(_ns(state_dir))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] is True
+    assert payload["policyd"] == "failed"
+
+
+def test_cmd_daemon_start_windows_already_running_daemon_does_not_ensure_policyd(
+        state_dir, monkeypatch, capsys):
+    # Deliberate scope boundary: when the daemon is already running,
+    # `daemon start` returns immediately without ensuring policyd —
+    # only a fresh start does. (If policyd died while the daemon kept
+    # running, `doctor` or a tool run starts it; a follow-up could
+    # ensure it here too.)
+    import cli.opencobot_cli as cli_mod
+    import subprocess
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "ensure_policyd", _ensure_policyd_must_not_run)
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        (state_dir / "daemon.pid").write_text(str(sleeper.pid),
+                                              encoding="utf-8")
+        rc = cli_mod.cmd_daemon_start(_ns(state_dir))
+    finally:
+        sleeper.terminate()
+        sleeper.wait()
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] is True
+    assert payload["pid"] == sleeper.pid
+    assert payload["note"] == "daemon already running"
 
 
 def test_cmd_daemon_status_windows_pipe(state_dir, monkeypatch, capsys):
