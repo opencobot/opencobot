@@ -44,6 +44,7 @@ import platform
 import socket
 import sys
 import threading
+import types
 from pathlib import Path
 
 # Fixed-width Win32 types. ``ctypes.wintypes`` is NOT used: on LP64
@@ -367,6 +368,16 @@ def _load_windows_api():
     listener raised (ADR-008): a pipe server cannot be built without
     the Win32 API, and refusing is the correct behaviour. On a real
     Windows host ``windll`` always exists.
+
+    The DLLs are loaded with ``use_last_error=True``: plain
+    ``ctypes.windll`` loads them without it, so
+    ``ctypes.get_last_error()`` returned 0 (or a stale code) after
+    every Win32 call — the ``ERROR_PIPE_CONNECTED`` check in
+    ``wait_for_client`` was dead code in practice, and the true
+    error behind a ``ConnectNamedPipe`` failure was hidden (the
+    daemon/policyd crash reported "Win32 error 0"). The prototypes
+    in ``_setup_prototypes`` are set on these very objects (see the
+    DLL OWNERSHIP RULE there).
     """
     windll = getattr(ctypes, "windll", None)
     if windll is None:
@@ -376,7 +387,10 @@ def _load_windows_api():
             "core/transport.py NamedPipeListener) and must be verified "
             "on a Windows host; refusing to serve without the ACL"
         )
-    return _CtypesWindowsPipeApi(windll)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    return _CtypesWindowsPipeApi(
+        types.SimpleNamespace(kernel32=kernel32, advapi32=advapi32))
 
 
 class _CtypesWindowsPipeApi:
@@ -413,6 +427,17 @@ class _CtypesWindowsPipeApi:
 
     # Win32 constants (WinBase.h / WinNT.h / WinError.h).
     _PIPE_ACCESS_DUPLEX = 0x00000003
+    # FILE_FLAG_OVERLAPPED: the pipe is created for overlapped I/O.
+    # Without it, the lpOverlapped passed to ConnectNamedPipe is
+    # ignored and the call blocks synchronously — the stop-aware
+    # 500 ms poll loop in wait_for_client never runs and ``stop``
+    # cannot interrupt the wait. It also governs ReadFile/WriteFile:
+    # on an overlapped handle they MUST be given a valid OVERLAPPED
+    # (Microsoft Learn, ReadFile: with lpOverlapped NULL the call
+    # "can incorrectly report that the operation is complete"), so
+    # read_available/write_all below issue them overlapped and wait
+    # via GetOverlappedResult.
+    _FILE_FLAG_OVERLAPPED = 0x40000000
     _PIPE_TYPE_MESSAGE = 0x00000004
     _PIPE_READMODE_MESSAGE = 0x00000002
     _PIPE_WAIT = 0x00000000
@@ -638,7 +663,7 @@ class _CtypesWindowsPipeApi:
     def create_pipe(self, pipe_path: str, sa) -> int:
         handle = self._kernel32.CreateNamedPipeW(
             pipe_path,
-            self._PIPE_ACCESS_DUPLEX,
+            self._PIPE_ACCESS_DUPLEX | self._FILE_FLAG_OVERLAPPED,
             self._PIPE_TYPE_MESSAGE | self._PIPE_READMODE_MESSAGE
             | self._PIPE_WAIT,
             self._PIPE_MAX_INSTANCES,
@@ -701,33 +726,81 @@ class _CtypesWindowsPipeApi:
             self._kernel32.CloseHandle(event)
 
     def read_available(self, handle: int, size: int) -> bytes:
+        # The pipe is created with FILE_FLAG_OVERLAPPED, so ReadFile
+        # MUST be given a valid OVERLAPPED (Microsoft Learn,
+        # ReadFile): with lpOverlapped NULL it "can incorrectly
+        # report that the read operation is complete". The wait is
+        # synchronous from the caller's view — GetOverlappedResult
+        # with bWait=True blocks until the read finishes — so the
+        # return contract is unchanged: bytes read, ``b""`` when
+        # the client disconnected.
         buf = ctypes.create_string_buffer(size)
         nread = _DWORD(0)
-        if self._kernel32.ReadFile(handle, buf, size,
-                                   ctypes.byref(nread), None):
-            return buf.raw[:nread.value]
-        err = ctypes.get_last_error()
-        if err in (self._ERROR_BROKEN_PIPE, self._ERROR_NO_DATA):
-            return b""  # client disconnected
-        raise TransportNotAvailableError(
-            f"named-pipe server: ReadFile failed (Win32 error {err})"
-        )
+        event = self._kernel32.CreateEventW(None, True, False, None)
+        if not event:
+            raise self._fail("CreateEventW")
+        overlapped = _Overlapped()
+        overlapped.hEvent = event
+        try:
+            if self._kernel32.ReadFile(
+                    handle, buf, size, ctypes.byref(nread),
+                    ctypes.byref(overlapped)):
+                return buf.raw[:nread.value]
+            err = ctypes.get_last_error()
+            if err == self._ERROR_IO_PENDING:
+                if not self._kernel32.GetOverlappedResult(
+                        handle, ctypes.byref(overlapped),
+                        ctypes.byref(nread), True):
+                    err = ctypes.get_last_error()
+                    if err in (self._ERROR_BROKEN_PIPE,
+                               self._ERROR_NO_DATA):
+                        return b""  # client disconnected mid-read
+                    raise self._fail("GetOverlappedResult")
+                return buf.raw[:nread.value]
+            if err in (self._ERROR_BROKEN_PIPE, self._ERROR_NO_DATA):
+                return b""  # client disconnected
+            raise TransportNotAvailableError(
+                f"named-pipe server: ReadFile failed (Win32 error {err})"
+            )
+        finally:
+            self._kernel32.CloseHandle(event)
 
     def write_all(self, handle: int, data: bytes) -> None:
+        # Same overlapped requirement as read_available: the pipe is
+        # created with FILE_FLAG_OVERLAPPED, so WriteFile MUST be
+        # given a valid OVERLAPPED. The wait is synchronous from the
+        # caller's view (GetOverlappedResult with bWait=True), so the
+        # contract — the whole buffer is written before returning —
+        # is unchanged.
         offset = 0
         while offset < len(data):
             nwritten = _DWORD(0)
             chunk = ctypes.create_string_buffer(
                 data[offset:], len(data) - offset)
-            if not self._kernel32.WriteFile(
-                    handle, chunk, len(data) - offset,
-                    ctypes.byref(nwritten), None):
-                raise self._fail("WriteFile")
-            if nwritten.value == 0:
-                raise TransportNotAvailableError(
-                    "named-pipe server: WriteFile wrote 0 bytes"
-                )
-            offset += nwritten.value
+            event = self._kernel32.CreateEventW(None, True, False, None)
+            if not event:
+                raise self._fail("CreateEventW")
+            overlapped = _Overlapped()
+            overlapped.hEvent = event
+            try:
+                if not self._kernel32.WriteFile(
+                        handle, chunk, len(data) - offset,
+                        ctypes.byref(nwritten), ctypes.byref(overlapped)):
+                    err = ctypes.get_last_error()
+                    if err == self._ERROR_IO_PENDING:
+                        if not self._kernel32.GetOverlappedResult(
+                                handle, ctypes.byref(overlapped),
+                                ctypes.byref(nwritten), True):
+                            raise self._fail("GetOverlappedResult")
+                    else:
+                        raise self._fail("WriteFile")
+                if nwritten.value == 0:
+                    raise TransportNotAvailableError(
+                        "named-pipe server: WriteFile wrote 0 bytes"
+                    )
+                offset += nwritten.value
+            finally:
+                self._kernel32.CloseHandle(event)
 
     def disconnect(self, handle: int) -> None:
         self._kernel32.DisconnectNamedPipe(handle)

@@ -42,6 +42,7 @@ from core.transport import (  # noqa: E402
     _CtypesWindowsPipeApi,
     _ExplicitAccess,
     _HANDLE,
+    _INVALID_HANDLE_VALUE,
     _Overlapped,
     _SecurityAttributes,
     _TokenUser,
@@ -897,3 +898,238 @@ def test_policyd_serve_passes_env_pipe_to_listener(
     reply = listener.handler({"op": "status", "auth": token})
     assert reply["ok"] is True
     assert reply["socket"] == unique
+
+
+# ---------------------------------------------------------------------------
+# Real API against a scriptable windll (ConnectNamedPipe crash tests)
+# ---------------------------------------------------------------------------
+#
+# The listener-level fake above cannot test _CtypesWindowsPipeApi
+# itself: the ERROR_PIPE_CONNECTED check, the error-code reporting
+# and the FILE_FLAG_OVERLAPPED flag all live in the real methods,
+# which never run on this Linux VM (no Win32 API). These tests drive
+# the real methods against a scriptable windll — same functions, on
+# the DLL that owns them (so the ownership rule still holds), but
+# returning scripted values — plus a controllable
+# ``ctypes.get_last_error`` (Windows-only; absent on Linux, so it is
+# injected here). What is NOT verified: the real ctypes calls against
+# a real pipe — that needs the laptop run in
+# docs/WINDOWS_TESTING.md §6.
+
+class _ScriptedWin32Function:
+    """A fake Win32 function with a scripted return value.
+
+    Like _FakeWin32Function it allows restype/argtypes assignment
+    (what _setup_prototypes does), but calling it runs ``impl``
+    and records the call, so the real _CtypesWindowsPipeApi methods
+    can be driven on Linux.
+    """
+
+    def __init__(self, impl=None):
+        self.restype = None
+        self.argtypes = None
+        self.calls: list = []
+        self._impl = impl if impl is not None else (lambda *a: 0)
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self._impl(*args)
+
+
+def _scripted_windll(**overrides):
+    """A _FakeWindll whose functions return scripted values.
+
+    Defaults keep the pipe plumbing usable (CreateEventW returns a
+    nonzero event handle, CloseHandle/CancelIoEx succeed); per-test
+    ``overrides`` map a function name to its impl. Only the DLL
+    that owns a function exposes it.
+    """
+    windll = _FakeWindll()
+    defaults = {
+        "CreateEventW": lambda *a: 500,
+        "CloseHandle": lambda *a: True,
+        "CancelIoEx": lambda *a: True,
+    }
+    for dll in (windll.kernel32, windll.advapi32):
+        for name in list(vars(dll)):
+            impl = overrides.get(name, defaults.get(name))
+            setattr(dll, name, _ScriptedWin32Function(impl))
+    return windll
+
+
+def _real_api(**overrides):
+    """The real _CtypesWindowsPipeApi against a scripted windll."""
+    return _CtypesWindowsPipeApi(_scripted_windll(**overrides))
+
+
+@pytest.fixture()
+def win32_error(monkeypatch):
+    """Controllable ctypes.get_last_error for the real-API tests.
+
+    get_last_error does not exist on Linux (Windows-only), so it is
+    injected here; on real Windows it returns the code from the
+    last call through a use_last_error=True DLL. Tests set
+    ``win32_error['code']`` before driving the API.
+    """
+    state = {"code": 0}
+    monkeypatch.setattr(ctypes, "get_last_error",
+                        lambda: state["code"], raising=False)
+    return state
+
+
+def _set_dword(ptr, value):
+    """Write ``value`` through a ``ctypes.byref(_DWORD)`` pointer."""
+    ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = value
+
+
+def test_create_pipe_sets_file_flag_overlapped():
+    """The pipe must be created with FILE_FLAG_OVERLAPPED: without
+    it, the lpOverlapped passed to ConnectNamedPipe is ignored and
+    the call blocks synchronously, so the stop-aware poll never runs."""
+    api = _real_api(CreateNamedPipeW=lambda *a: 7)
+    handle = api.create_pipe(POLICYD_PIPE_PATH, _SecurityAttributes())
+    assert handle == 7
+    (args,) = api._kernel32.CreateNamedPipeW.calls
+    open_mode = args[1]
+    assert open_mode & _CtypesWindowsPipeApi._FILE_FLAG_OVERLAPPED, (
+        "CreateNamedPipeW open mode lacks FILE_FLAG_OVERLAPPED")
+    assert open_mode & _CtypesWindowsPipeApi._PIPE_ACCESS_DUPLEX
+
+
+def test_create_pipe_failure_reports_real_error_code(win32_error):
+    """_fail reports the real Win32 code, not 0."""
+    win32_error["code"] = 1234
+    api = _real_api(CreateNamedPipeW=lambda *a: _INVALID_HANDLE_VALUE)
+    with pytest.raises(TransportNotAvailableError) as exc:
+        api.create_pipe(POLICYD_PIPE_PATH, _SecurityAttributes())
+    assert "CreateNamedPipeW" in str(exc.value)
+    assert "Win32 error 1234" in str(exc.value)
+    assert "Win32 error 0" not in str(exc.value)
+
+
+def test_wait_for_client_pipe_connected_counts_as_connected(win32_error):
+    """The crash this fixes: a client connecting between
+    CreateNamedPipeW and ConnectNamedPipe reports
+    ERROR_PIPE_CONNECTED (535) and counts as connected — it must
+    NOT raise 'ConnectNamedPipe failed (Win32 error 0)'."""
+    win32_error["code"] = 535
+    api = _real_api(ConnectNamedPipe=lambda *a: False)
+    assert api.wait_for_client(7, threading.Event()) is True
+
+
+def test_wait_for_client_reports_real_error_code(win32_error):
+    """Error reporting carries the real code: with a known failure
+    code the message must name that code, never 0."""
+    win32_error["code"] = 1234
+    api = _real_api(ConnectNamedPipe=lambda *a: False)
+    with pytest.raises(TransportNotAvailableError) as exc:
+        api.wait_for_client(7, threading.Event())
+    assert "Win32 error 1234" in str(exc.value)
+    assert "Win32 error 0" not in str(exc.value)
+
+
+def test_wait_for_client_pending_then_completes(win32_error):
+    """ERROR_IO_PENDING enters the poll loop; a signaled event plus
+    a successful GetOverlappedResult counts as connected."""
+    win32_error["code"] = 997  # ERROR_IO_PENDING
+    api = _real_api(
+        ConnectNamedPipe=lambda *a: False,
+        WaitForSingleObject=lambda *a: 0,  # WAIT_OBJECT_0
+        GetOverlappedResult=lambda *a: True,
+    )
+    assert api.wait_for_client(7, threading.Event()) is True
+
+
+def test_wait_for_client_stop_returns_false(win32_error):
+    """The stop-aware wait still works at the real-API level: with
+    the connect pending and stop set, the pending I/O is cancelled
+    and wait_for_client returns False."""
+    win32_error["code"] = 997  # ERROR_IO_PENDING
+    stop = threading.Event()
+    stop.set()
+    api = _real_api(
+        ConnectNamedPipe=lambda *a: False,
+        WaitForSingleObject=lambda *a: 0,
+    )
+    assert api.wait_for_client(7, stop) is False
+    assert api._kernel32.CancelIoEx.calls, "pending I/O must be cancelled"
+
+
+def test_read_available_immediate_success(win32_error):
+    """A ReadFile that completes at once returns its bytes — and
+    it is issued with a valid OVERLAPPED, never NULL."""
+    data = b"hello"
+
+    def read_file(handle, buf, size, nread_ptr, overlapped_ptr):
+        ctypes.memmove(buf, data, len(data))
+        _set_dword(nread_ptr, len(data))
+        return True
+
+    api = _real_api(ReadFile=read_file)
+    assert api.read_available(7, 65536) == data
+    (args,) = api._kernel32.ReadFile.calls
+    assert args[4] is not None, "ReadFile needs a valid OVERLAPPED"
+
+
+def test_read_available_pending_then_completes(win32_error):
+    """A ReadFile returning ERROR_IO_PENDING is waited on via
+    GetOverlappedResult, which fills the count."""
+    win32_error["code"] = 997  # ERROR_IO_PENDING
+    data = b'{"ok": true}\n'
+    captured = {}
+
+    def read_file(handle, buf, size, nread_ptr, overlapped_ptr):
+        captured["buf"] = buf
+        return False
+
+    def overlapped_result(handle, overlapped_ptr, nread_ptr, wait):
+        assert wait is True
+        ctypes.memmove(captured["buf"], data, len(data))
+        _set_dword(nread_ptr, len(data))
+        return True
+
+    api = _real_api(ReadFile=read_file,
+                    GetOverlappedResult=overlapped_result)
+    assert api.read_available(7, 65536) == data
+
+
+def test_read_available_broken_pipe_returns_empty(win32_error):
+    """A client disconnect (ERROR_BROKEN_PIPE) still ends the
+    connection with b'', as before."""
+    win32_error["code"] = 109  # ERROR_BROKEN_PIPE
+    api = _real_api(ReadFile=lambda *a: False)
+    assert api.read_available(7, 65536) == b""
+
+
+def test_write_all_immediate_success(win32_error):
+    """A WriteFile that completes at once writes the whole buffer —
+    issued with a valid OVERLAPPED, never NULL."""
+    def write_file(handle, chunk, size, nwritten_ptr, overlapped_ptr):
+        _set_dword(nwritten_ptr, size)
+        return True
+
+    api = _real_api(WriteFile=write_file)
+    api.write_all(7, b"abc")
+    (args,) = api._kernel32.WriteFile.calls
+    assert args[4] is not None, "WriteFile needs a valid OVERLAPPED"
+
+
+def test_write_all_pending_then_completes(win32_error):
+    """A WriteFile returning ERROR_IO_PENDING is waited on via
+    GetOverlappedResult, which fills the written count."""
+    win32_error["code"] = 997  # ERROR_IO_PENDING
+    written = {}
+
+    def write_file(handle, chunk, size, nwritten_ptr, overlapped_ptr):
+        written["data"] = bytes(chunk.raw[:size])
+        return False
+
+    def overlapped_result(handle, overlapped_ptr, nwritten_ptr, wait):
+        assert wait is True
+        _set_dword(nwritten_ptr, len(written["data"]))
+        return True
+
+    api = _real_api(WriteFile=write_file,
+                    GetOverlappedResult=overlapped_result)
+    api.write_all(7, b'{"ok": true}\n')
+    assert written["data"] == b'{"ok": true}\n'
