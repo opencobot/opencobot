@@ -310,6 +310,60 @@ def _terminate_pid(pid):
         os.kill(pid, signal.SIGKILL)
 
 
+def _stop_policyd(state_dir):
+    """Stop the policyd recorded in ``policyd.pid``, if any.
+
+    Returns ``(status, pid, note)`` where status is ``"stopped"``
+    (the recorded process was terminated), ``"not running"`` (no pid
+    file, or the recorded process was already gone) or ``"failed"``
+    (the process is still alive after the terminate wait). The pid
+    file is removed on ``"stopped"`` / ``"not running"``; on
+    ``"failed"`` it is kept so a later stop can retry. A missing or
+    corrupt pid file never fails: a corrupt file is removed as stale.
+
+    Only the pid-file process is stopped. The pid file tracks one
+    pid, and there is no robust cross-platform way to enumerate
+    processes by command line: the Windows process list
+    (``tasklist``) carries no cmdline, so a second policyd spawned
+    outside the pid file — e.g. two concurrent ``ensure_policyd``
+    calls racing the readiness probe, which is a probe, not a lock —
+    survives this stop. ``daemon start`` reuses whichever policyd is
+    reachable, so the leftover is leaked but harmless (laptop
+    re-check on 26fc845: two policyd processes + a stale pid file
+    after ``daemon stop``).
+    """
+    pid_path = state_dir / "policyd.pid"
+    if not pid_path.exists():
+        return "not running", None, None
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        pid_path.unlink(missing_ok=True)
+        return "not running", None, "corrupt policyd.pid removed"
+    was_alive = _pid_alive(pid)
+    if was_alive:
+        _terminate_pid(pid)
+        if _pid_alive(pid):
+            return ("failed", pid,
+                    f"policyd (pid {pid}) did not stop; stop it manually "
+                    "if it is still running")
+    pid_path.unlink(missing_ok=True)
+    if was_alive:
+        return "stopped", pid, None
+    return "not running", pid, None
+
+
+def _policyd_stop_lines(status, pid, note):
+    """Human lines for a ``_stop_policyd`` outcome (JSON carries the status)."""
+    if status == "stopped":
+        return [f"policyd stopped (pid {pid})"]
+    if status == "failed":
+        return [f"warning: {note}"]
+    if note:
+        return [f"note: {note}"]
+    return []
+
+
 def cmd_daemon_start(args):
     state_dir = _state_dir(args)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -422,7 +476,16 @@ def cmd_daemon_stop(args):
             _err("daemon socket exists but no PID file; refusing to guess — "
                  f"remove {sock_path} manually if the daemon is really gone")
             return 1
-        _emit({"running": False}, args.json, ["daemon not running"])
+        # The daemon is down, but policyd may still be running (it is
+        # only ever started, never stopped, until now): stop it too so
+        # a stray policyd does not outlive the daemon. The exit code
+        # stays 1 — the daemon was not running.
+        policyd_status, policyd_pid, policyd_note = _stop_policyd(state_dir)
+        payload = {"running": False, "policyd": policyd_status}
+        lines = ["daemon not running"]
+        lines.extend(_policyd_stop_lines(
+            policyd_status, policyd_pid, policyd_note))
+        _emit(payload, args.json, lines)
         return 1
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
@@ -434,8 +497,16 @@ def cmd_daemon_stop(args):
     pid_path.unlink(missing_ok=True)
     if sock_path.exists() and not _pid_alive(pid):
         sock_path.unlink(missing_ok=True)
-    _emit({"running": False, "pid": pid}, args.json,
-          [f"daemon stopped (pid {pid})"])
+    # Stop policyd after the daemon: the daemon depends on policyd,
+    # so the dependent goes first. A policyd failure never fails the
+    # stop — it is reported as a warning and the exit code stays 0
+    # (mirrors the start side, PR #64).
+    policyd_status, policyd_pid, policyd_note = _stop_policyd(state_dir)
+    payload = {"running": False, "pid": pid, "policyd": policyd_status}
+    lines = [f"daemon stopped (pid {pid})"]
+    lines.extend(_policyd_stop_lines(
+        policyd_status, policyd_pid, policyd_note))
+    _emit(payload, args.json, lines)
     return 0
 
 
