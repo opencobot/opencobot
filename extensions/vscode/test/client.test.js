@@ -1,7 +1,8 @@
 'use strict';
 // Tests for extensions/vscode/client.js — the thin daemon client.
 //
-// Runs in plain Node against a fake daemon (a Unix-socket server
+// Runs in plain Node against a fake daemon (a server on the platform
+// transport — a named pipe on Windows, a Unix socket elsewhere —
 // that records requests and answers canned JSON lines). No VS Code,
 // no real daemon, no network. Run: `node --test test/client.test.js`
 // from extensions/vscode/.
@@ -22,10 +23,47 @@ function tmpStateDir(t) {
   return dir;
 }
 
+// Sets OPENCOBOT_DAEMON_ADDRESS for the duration of the test, then
+// restores the previous value (or deletes it). All tests use this so
+// no test ever depends on ambient env state.
+function setOverride(t, value) {
+  const previous = process.env.OPENCOBOT_DAEMON_ADDRESS;
+  if (value === undefined) {
+    delete process.env.OPENCOBOT_DAEMON_ADDRESS;
+  } else {
+    process.env.OPENCOBOT_DAEMON_ADDRESS = value;
+  }
+  t.after(() => {
+    if (previous === undefined) {
+      delete process.env.OPENCOBOT_DAEMON_ADDRESS;
+    } else {
+      process.env.OPENCOBOT_DAEMON_ADDRESS = previous;
+    }
+  });
+}
+
+// Unique per-test daemon address on the platform transport, wired
+// into the client under test via OPENCOBOT_DAEMON_ADDRESS (see
+// client.daemonAddress). Unique per test so tests stay hermetic even
+// when a real daemon is listening on the production transport, and
+// so runs never share a pipe or socket file.
+let testAddressCounter = 0;
+function useTestAddress(t, stateDir) {
+  const address = process.platform === 'win32'
+    ? `\\\\.\\pipe\\opencobot-test-${process.pid}-${++testAddressCounter}`
+    : path.join(stateDir, 'daemon.sock');
+  setOverride(t, address);
+  return address;
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // A fake daemon: records each request line, replies with whatever
 // `reply` returns (a dict, a raw string, or null for silence).
 function fakeDaemon(t, stateDir, reply) {
-  const sock = path.join(stateDir, 'daemon.sock');
+  const address = useTestAddress(t, stateDir);
   const seen = [];
   const server = net.createServer((conn) => {
     let buffer = '';
@@ -51,9 +89,9 @@ function fakeDaemon(t, stateDir, reply) {
   });
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(sock, () => {
+    server.listen(address, () => {
       t.after(() => new Promise((done) => server.close(done)));
-      resolve({ server, seen, sock });
+      resolve({ server, seen, address });
     });
   });
 }
@@ -129,9 +167,13 @@ test('retryQueued sends run_id and the token', async (t) => {
   await assert.rejects(client.retryQueued(dir, { runId: '' }), /needs runId/);
 });
 
-test('missing daemon socket rejects with the address', async (t) => {
+test('missing daemon rejects with the address', async (t) => {
   const dir = tmpStateDir(t); // no server listening
-  await assert.rejects(client.daemonStatus(dir), /daemon\.sock/);
+  const address = useTestAddress(t, dir);
+  await assert.rejects(client.daemonStatus(dir), (err) => {
+    assert.match(err.message, new RegExp(escapeRegExp(address)));
+    return true;
+  });
 });
 
 test('missing daemon.auth rejects before connecting', async (t) => {
@@ -154,10 +196,36 @@ test('silent daemon rejects on timeout', async (t) => {
     /timed out after 50ms/);
 });
 
-test('readAuthToken trims whitespace; daemonAddress is the socket path', (t) => {
+test('readAuthToken trims whitespace; daemonAddress is the platform transport', (t) => {
   const dir = tmpStateDir(t);
   assert.equal(client.readAuthToken(dir), 'test-token');
-  assert.equal(client.daemonAddress(dir), path.join(dir, 'daemon.sock'));
+  // No test override here, so daemonAddress shows the production
+  // transport for this platform.
+  setOverride(t, undefined);
+  assert.equal(client.daemonAddress(dir), process.platform === 'win32'
+    ? client.DAEMON_PIPE
+    : path.join(dir, 'daemon.sock'));
   assert.equal(client.defaultStateDir(),
     process.env.OPENCOBOT_STATE || path.join(os.homedir(), '.opencobot'));
+});
+
+test('daemonAddress picks the named pipe on win32, the socket elsewhere; override wins', (t) => {
+  const dir = tmpStateDir(t);
+  const realPlatform = process.platform;
+  const setPlatform = (p) => Object.defineProperty(process, 'platform', { value: p });
+  t.after(() => setPlatform(realPlatform));
+  // Production transport per platform, with no test override set.
+  setOverride(t, undefined);
+  setPlatform('win32');
+  assert.equal(client.daemonAddress(dir), client.DAEMON_PIPE);
+  assert.equal(client.DAEMON_PIPE, '\\\\.\\pipe\\opencobot-daemon');
+  setPlatform('linux');
+  assert.equal(client.daemonAddress(dir), path.join(dir, 'daemon.sock'));
+  // The test override wins on either platform.
+  const override = '\\\\.\\pipe\\opencobot-test-override';
+  process.env.OPENCOBOT_DAEMON_ADDRESS = override;
+  setPlatform('win32');
+  assert.equal(client.daemonAddress(dir), override);
+  setPlatform('darwin');
+  assert.equal(client.daemonAddress(dir), override);
 });

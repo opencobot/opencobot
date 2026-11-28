@@ -30,6 +30,14 @@ function defaultStateDir() {
 }
 
 function daemonAddress(stateDir) {
+  // Test-only override: lets the unit tests point the client at a
+  // fake daemon on its own address (a unique named pipe on win32,
+  // a socket file elsewhere) instead of the production transport.
+  // Never set this in production — the real daemon listens only on
+  // the platform transport below.
+  if (process.env.OPENCOBOT_DAEMON_ADDRESS) {
+    return process.env.OPENCOBOT_DAEMON_ADDRESS;
+  }
   if (process.platform === 'win32') {
     return DAEMON_PIPE;
   }
@@ -188,4 +196,5 @@ module.exports = {
   retryQueued,
   DEFAULT_TIMEOUT_MS,
   RUN_TIMEOUT_MS,
+  DAEMON_PIPE,
 };
