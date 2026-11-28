@@ -267,6 +267,18 @@ def _patch_cli_windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
 
 
+def _probe_must_not_run(state):
+    """Fail if the old probe-then-query path is ever taken again.
+
+    ``cmd_daemon_status`` queries the daemon directly: the probe's
+    accept left no listening pipe instance for the microseconds until
+    the next one was created, so the immediate query failed on a live
+    daemon. A probe call here means the race is back.
+    """
+    raise AssertionError(
+        "cmd_daemon_status must query directly without a prior probe")
+
+
 def test_cmd_daemon_start_windows_reports_pipe(state_dir, monkeypatch, capsys):
     import cli.opencobot_cli as cli_mod
 
@@ -337,7 +349,7 @@ def test_cmd_daemon_status_windows_pipe(state_dir, monkeypatch, capsys):
     import cli.opencobot_cli as cli_mod
 
     _patch_cli_windows(monkeypatch)
-    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: True)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", _probe_must_not_run)
     monkeypatch.setattr(cli_mod, "_query_daemon",
                         lambda state, op, timeout=3.0: {"ok": True, "tools": 2})
     rc = cli_mod.cmd_daemon_status(_ns(state_dir))
@@ -349,11 +361,33 @@ def test_cmd_daemon_status_windows_pipe(state_dir, monkeypatch, capsys):
     assert "socket" not in payload
 
 
+def test_cmd_daemon_status_windows_queries_once_without_probe(
+        state_dir, monkeypatch, capsys):
+    # One status call makes exactly one connection — the query itself.
+    # The old probe+query sequence did two back-to-back connects, and
+    # the probe's accept left the listener with no instance to offer
+    # the query (see _probe_must_not_run).
+    import cli.opencobot_cli as cli_mod
+
+    _patch_cli_windows(monkeypatch)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", _probe_must_not_run)
+    calls = []
+    def _query(state, op, timeout=3.0):
+        calls.append(op)
+        return {"ok": True, "tools": 2}
+    monkeypatch.setattr(cli_mod, "_query_daemon", _query)
+    rc = cli_mod.cmd_daemon_status(_ns(state_dir))
+    assert rc == 0
+    assert calls == ["status"]
+
+
 def test_cmd_daemon_status_windows_not_running(state_dir, monkeypatch, capsys):
     import cli.opencobot_cli as cli_mod
 
     _patch_cli_windows(monkeypatch)
-    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: False)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", _probe_must_not_run)
+    monkeypatch.setattr(cli_mod, "_query_daemon",
+                        lambda state, op, timeout=3.0: None)
     rc = cli_mod.cmd_daemon_status(_ns(state_dir))
     assert rc == 1
     payload = json.loads(capsys.readouterr().out)
@@ -363,9 +397,11 @@ def test_cmd_daemon_status_windows_not_running(state_dir, monkeypatch, capsys):
 
 
 def test_cmd_daemon_status_windows_pid_alive_but_silent(state_dir, monkeypatch, capsys):
-    # A live PID with no answering pipe still counts as running (the
+    # A live PID with no answering daemon still counts as running (the
     # process is there), but there is no status payload and no note
-    # claiming the pipe is reachable.
+    # claiming the pipe is reachable — without a probe the command
+    # cannot tell a silent pipe from no pipe at all, so it reports
+    # just the live PID.
     import cli.opencobot_cli as cli_mod
 
     _patch_cli_windows(monkeypatch)
@@ -377,11 +413,14 @@ def test_cmd_daemon_status_windows_pid_alive_but_silent(state_dir, monkeypatch, 
         [sys.executable, "-c", "import time; time.sleep(30)"])
     (state_dir / "daemon.pid").write_text(str(sleeper.pid),
                                           encoding="utf-8")
-    monkeypatch.setattr(cli_mod, "_daemon_reachable", lambda state: False)
+    monkeypatch.setattr(cli_mod, "_daemon_reachable", _probe_must_not_run)
+    monkeypatch.setattr(cli_mod, "_query_daemon",
+                        lambda state, op, timeout=3.0: None)
     rc = cli_mod.cmd_daemon_status(_ns(state_dir))
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["running"] is True
+    assert payload["pipe"] is None
     assert payload["status"] is None
 
 

@@ -426,17 +426,25 @@ def cmd_daemon_status(args):
             running = _pid_alive(pid)
         except ValueError:
             pid = None
-    # Whether the live transport exists at all: the socket file on
-    # POSIX, an answering named pipe on Windows (there is no socket
-    # file there). The status query itself is attempted only when
-    # the transport is there.
+    # Whether the live transport exists at all. On POSIX the socket
+    # file's existence is a cheap, side-effect-free check. On Windows
+    # there is no socket file, so the status query itself is the
+    # liveness check: a reply proves the daemon is reachable, None
+    # proves it is not. A separate probe connection before the query
+    # used to race the listener's inter-instance gap — the probe's
+    # accept leaves no listening instance for the microseconds until
+    # the next one is created, so the immediate query failed on a
+    # live daemon ("status query failed") — so the query runs
+    # unconditionally here, and "reachable but silent" is just a
+    # live PID with no status payload.
     if sys.platform == "win32":
-        transport_exists = _daemon_reachable(state_dir)
         transport_name = "named pipe"
+        status = _query_daemon(state_dir, "status")
+        transport_exists = status is not None
     else:
-        transport_exists = (state_dir / "daemon.sock").exists()
         transport_name = "socket"
-    status = _query_daemon(state_dir, "status") if transport_exists else None
+        transport_exists = (state_dir / "daemon.sock").exists()
+        status = _query_daemon(state_dir, "status") if transport_exists else None
     if status is not None:
         running = True
     elif transport_exists and running:
