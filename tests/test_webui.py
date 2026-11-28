@@ -24,6 +24,7 @@ from policy.policyd import _load_or_create_auth, serve  # noqa: E402
 from tests._procutil import kill_pid_file, unique_policyd_pipe  # noqa: E402
 from tests.test_policy import _RecordingTransport  # noqa: E402
 from ui.web import (  # noqa: E402
+    LoginRateLimiter,
     WebUIBackend,
     create_server,
     load_auth_token,
@@ -96,6 +97,27 @@ def fetch_auth(server, path, **kwargs):
         kwargs["headers"]["Authorization"] = f"Bearer {server['token']}"
         return fetch(server["port"], path, token=None, **kwargs)
     return fetch(server["port"], path, token=token, **kwargs)
+
+
+def fetch_with_headers(port, path, method="GET", data=None, token="ok",
+                       headers=None):
+    """fetch() plus the response headers (for Retry-After assertions)."""
+    hdrs = dict(headers or {})
+    if token == "ok":
+        hdrs.setdefault("Authorization", "Bearer PLACEHOLDER")
+    elif token == "bad":
+        hdrs.setdefault("Authorization", "Bearer wrong-token")
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                 data=body, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read().decode("utf-8"), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
 
 
 # -- auth -----------------------------------------------------------------
@@ -332,6 +354,117 @@ def test_localhost_alias_accepted(tmp_path):
     srv = create_server(tmp_path / "state", host="localhost", port=0)
     assert srv.server_address[0] == "127.0.0.1"
     srv.server_close()
+
+
+# -- R-025 Origin allowlist + login rate limiting ---------------------------
+
+def test_cross_origin_post_rejected(server):
+    engine = PolicyEngine(server["state_dir"])
+    assert engine.is_readonly() is False
+    status, body = fetch_auth(
+        server, "/api/readonly", method="POST", data={"enabled": True},
+        headers={"Origin": "http://evil.example"})
+    assert status == 403
+    assert json.loads(body)["error"] == "cross-origin request rejected"
+    # Nothing changed state: the rejection happens before auth/handler.
+    assert PolicyEngine(server["state_dir"]).is_readonly() is False
+
+
+def test_cross_origin_post_wrong_port_rejected(server):
+    # Same host, wrong port: a page served from another local port is
+    # not this UI.
+    status, _ = fetch_auth(
+        server, "/api/readonly", method="POST", data={"enabled": True},
+        headers={"Origin": f"http://127.0.0.1:{server['port'] + 1}"})
+    assert status == 403
+
+
+def test_same_origin_post_allowed(server):
+    engine = PolicyEngine(server["state_dir"])
+    for origin in (f"http://127.0.0.1:{server['port']}",
+                   f"http://localhost:{server['port']}"):
+        status, body = fetch_auth(
+            server, "/api/readonly", method="POST", data={"enabled": True},
+            headers={"Origin": origin})
+        assert status == 200, origin
+        assert json.loads(body) == {"ok": True, "readonly": True}
+        status, body = fetch_auth(
+            server, "/api/readonly", method="POST", data={"enabled": False},
+            headers={"Origin": origin})
+        assert status == 200, origin
+    assert engine.is_readonly() is False
+
+
+def test_no_origin_post_allowed(server):
+    # No Origin header (curl/scripts) is allowed: only a browser
+    # sends Origin, and a missing one cannot be cross-site.
+    status, body = fetch_auth(server, "/api/readonly", method="POST",
+                              data={"enabled": True})
+    assert status == 200
+    assert json.loads(body) == {"ok": True, "readonly": True}
+    fetch_auth(server, "/api/readonly", method="POST", data={"enabled": False})
+
+
+def _login(server, token, headers=None):
+    """POST /login with a token; returns (status, body, headers)."""
+    return fetch_with_headers(server["port"], "/login", method="POST",
+                              data={"token": token}, token=None,
+                              headers=headers)
+
+
+def _short_limiter(server, max_failures=3, window_seconds=60):
+    """Swap in a small limiter so throttling tests run in milliseconds."""
+    server["server"].RequestHandlerClass.login_limiter = LoginRateLimiter(
+        max_failures=max_failures, window_seconds=window_seconds)
+
+
+def test_cross_origin_login_rejected(server):
+    # The Origin check runs before the login limiter, so a cross-site
+    # page can neither log in nor burn the victim's login budget.
+    status, _, _ = _login(server, "wrong-token",
+                          headers={"Origin": "http://evil.example"})
+    assert status == 403
+
+
+def test_login_throttled_after_failures(server):
+    _short_limiter(server)
+    for _ in range(3):
+        status, _, _ = _login(server, "wrong-token")
+        assert status == 401
+    # 4th failure inside the window: 429 with Retry-After.
+    status, body, headers = _login(server, "wrong-token")
+    assert status == 429
+    assert json.loads(body)["error"] == "too many failed login attempts"
+    lower = {k.lower(): v for k, v in headers.items()}
+    retry_after = int(lower["retry-after"])
+    assert 0 < retry_after <= 60
+    # Even the correct token is refused while throttled.
+    status, _, _ = _login(server, server["token"])
+    assert status == 429
+
+
+def test_successful_login_resets_failure_count(server):
+    _short_limiter(server)
+    for _ in range(2):
+        assert _login(server, "wrong-token")[0] == 401
+    # A successful login clears the counter ...
+    status, _, headers = _login(server, server["token"])
+    assert status == 200
+    lower = {k.lower(): v for k, v in headers.items()}
+    assert "opencobot_session" in lower.get("set-cookie", "")
+    # ... so three more failures are tolerated before the 429.
+    for _ in range(3):
+        assert _login(server, "wrong-token")[0] == 401
+    assert _login(server, "wrong-token")[0] == 429
+
+
+def test_login_window_expiry(server):
+    _short_limiter(server, window_seconds=1)
+    for _ in range(3):
+        assert _login(server, "wrong-token")[0] == 401
+    assert _login(server, "wrong-token")[0] == 429
+    time.sleep(1.2)  # the window expires; the counter restarts
+    assert _login(server, "wrong-token")[0] == 401
 
 
 # -- `opencobot ui` CLI ---------------------------------------------------------

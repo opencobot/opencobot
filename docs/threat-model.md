@@ -148,18 +148,30 @@ authentication.
   sliding (`SessionStore`); the daemon token never appears in a
   URL, redirect or log (R-013, ADR-009).
 
-**Gap:** there is **no Origin header check and no rate limiting**
-on the web UI, daemon or policyd. "Bind localhost only" is not a
-trust boundary by itself — ClawJacked showed a malicious website
-reaching a localhost daemon through the victim's browser. The
-SameSite=Lax cookie blocks the session cookie on cross-site
-POSTs, and the 256-bit daemon token is not guessable, so this is
-defence-in-depth rather than an open hole — but an attacker-
-controlled page can still probe the UI, and failed logins are
-neither throttled nor logged. New risk **R-025**.
+**Gap (web UI part FIXED 2026-11-28, branch
+`agent/webui-origin-rate-limit`):** there was **no Origin header
+check and no rate limiting** on the web UI, daemon or policyd.
+"Bind localhost only" is not a trust boundary by itself —
+ClawJacked showed a malicious website reaching a localhost daemon
+through the victim's browser. The SameSite=Lax cookie blocks the
+session cookie on cross-site POSTs, and the 256-bit daemon token
+is not guessable, so this was defence-in-depth rather than an open
+hole — but an attacker-controlled page could still probe the UI,
+and failed logins were neither throttled nor logged. New risk
+**R-025**. The web UI fix: `ui/web.py` now rejects cross-origin
+POSTs whose Origin is not the UI's own
+`http://127.0.0.1:<port>` / `http://localhost:<port>` (403 +
+logged; requests with no Origin are still allowed), and throttles
+failed `POST /login` attempts per IP (5 per 15 minutes, then 429
+with Retry-After; a successful login resets the counter; failures
+are logged, the token never is). SameSite=Lax kept. Still open:
+no rate limiting on the daemon or policyd (gap 10, folded into
+R-025).
 
 **Tests:** `tests/test_webui.py` (login, session, approval
-endpoints). **Red-team coverage:** no.
+endpoints; R-025: cross-origin POST rejected, same-origin and
+no-Origin POST allowed, login throttling incl. reset and window
+expiry). **Red-team coverage:** no.
 **Residual risk:** Medium for the local UI; the remote channel
 cannot be assessed until it exists.
 **SECURITY.md invariant:** 5. **Existing risk:** R-004 (Open —
@@ -422,7 +434,7 @@ indicator that the agent is in control.
 | 6 | No skill signing/sandboxing — DESIGNED ONLY, zero code | High* | R-002 (existing) | Do not ship a skill loader without signing, scanning and sandboxing; *severity is High when a loader lands, currently unexploitable (no loader) |
 | 7 | Audit log has no external anchor or signature — a same-user rewrite recomputes the chain | Medium | R-023 | Periodic external anchoring (signed checkpoints / remote copy / WORM); routine `audit verify` |
 | 8 | Secrets can reach logs: `redact_secrets()` only on CLI stderr failure; `run_command` argv stored in the runtime audit event; no keychain (env vars at call time) | Medium | R-024 | Redact stdout/success paths too; redact `argv` values that match secret shapes; implement the OS-keychain broker (SPEC §5.2) |
-| 9 | Web UI has no Origin validation and no rate limiting | Medium | R-025 | Add an Origin allowlist and login rate limiting + logging to `ui/web.py`; keep SameSite=Lax |
+| 9 | Web UI has no Origin validation and no rate limiting | Medium | R-025 | Fixed 2026-11-28 (branch `agent/webui-origin-rate-limit`): Origin allowlist on POSTs + login rate limiting (5 failures/15 min/IP, 429 + Retry-After) + logging in `ui/web.py`; SameSite=Lax kept |
 | 10 | No rate limiting anywhere (daemon, policyd, web UI) | Low | — (folded into R-025) | Add per-endpoint limits when the remote channel lands; not urgent for localhost-only |
 | 11 | No screen-privacy code (block/blur password managers, banking) | Medium | R-018 (existing) | Required before any screenshot/UI Automation path ships |
 | 12 | Red-team suite covers 8 cases but none of: skills, remote/IPC auth, supply chain, secrets-in-logs, approval forgery, audit tampering, kill switch | Medium | — | Extend `evals/redteam.py` with cases for each (propose as issues) |

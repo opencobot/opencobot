@@ -32,6 +32,19 @@ Endpoints:
   GET  /api/benchmark                 benchmark report for ?provider=
                                        (501 until core.benchmark lands)
 
+R-025: state-changing requests (POST) are Origin-checked against
+the UI's own origin (``http://127.0.0.1:<port>`` or
+``http://localhost:<port>``); requests with no Origin header
+(curl/scripts) are allowed, anything else gets 403 and is logged.
+Failed ``POST /login`` attempts are throttled per client IP
+(5 failures per 15 minutes, then HTTP 429 with Retry-After);
+a successful login clears the counter. Failed logins and
+rejections are logged (the token is never logged). GETs are not
+Origin-checked: they change no state, and the session cookie is
+SameSite=Lax so it is not sent on cross-site requests anyway.
+PUT/DELETE are not implemented (BaseHTTPRequestHandler answers
+501), so POST is the only state-changing method to check.
+
 Run: ``python -m ui.web --state-dir DIR [--port 8765]``.
 The UI shares the daemon's state dir, so read-only/kill/approvals
 take effect for the daemon and policyd immediately (same files).
@@ -42,6 +55,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import logging
 import os
 import secrets
 import sys
@@ -52,11 +66,83 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# R-025: security events (cross-origin rejections, failed logins,
+# login throttling) go to this logger. No handler is configured on
+# purpose: the stdlib last-resort handler writes WARNING+ to stderr,
+# which is where the UI operator already looks. The daemon token is
+# never logged.
+logger = logging.getLogger("opencobot.web")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 DEFAULT_PORT = 8765
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_AUDIT_LIMIT = 200
+
+# R-025: login rate limiting. 5 failed POST /login attempts per
+# client IP within a 15-minute window, then HTTP 429 with a
+# Retry-After header until the window expires. A successful login
+# clears the counter for that IP. The window is fixed (not sliding):
+# counting restarts only when the window expires, so a steady trickle
+# of guesses cannot keep the account locked forever, and a burst
+# cannot extend its own block. 5/15 min is deliberately lenient for
+# a single-user localhost UI (the operator fat-fingering the token)
+# while still making online guessing of a 256-bit token pointless.
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
+
+
+class LoginRateLimiter:
+    """In-memory per-IP throttle for failed POST /login attempts (R-025).
+
+    Thread-safe: the server is a ThreadingHTTPServer, so every method
+    takes the lock. Entries are pruned when their window expires, so
+    memory stays bounded by the distinct client IPs seen inside one
+    window — and the UI binds loopback only, so in practice that is
+    one address. The limiter is deliberately per-server (a fresh
+    instance per create_server call), never global, so tests and
+    restarts start clean.
+    """
+
+    def __init__(self, max_failures: int = LOGIN_MAX_FAILURES,
+                 window_seconds: int = LOGIN_WINDOW_SECONDS):
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._failures: dict[str, list] = {}  # ip -> [count, window_start]
+
+    def _prune_locked(self, now: float) -> None:
+        expired = [ip for ip, (_, start) in self._failures.items()
+                   if now - start >= self.window_seconds]
+        for ip in expired:
+            del self._failures[ip]
+
+    def record_failure(self, ip: str) -> int:
+        """Count one failed login; returns the failures in the window."""
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            entry = self._failures.get(ip)
+            if entry is None:
+                self._failures[ip] = [1, now]
+                return 1
+            entry[0] += 1
+            return entry[0]
+
+    def record_success(self, ip: str) -> None:
+        """A successful login clears the counter for that IP."""
+        with self._lock:
+            self._failures.pop(ip, None)
+
+    def retry_after(self, ip: str) -> int:
+        """Seconds until the IP's window expires (0 when not throttled)."""
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            entry = self._failures.get(ip)
+            if entry is None or entry[0] < self.max_failures:
+                return 0
+            return max(1, int(self.window_seconds - (now - entry[1])))
 
 # R-013: browser session cookie. HttpOnly so page scripts cannot read
 # it, SameSite=Lax so it is not sent on cross-site requests, Path=/
@@ -522,6 +608,7 @@ class _Handler(BaseHTTPRequestHandler):
     backend: WebUIBackend  # set by create_server
     auth_token: str  # set by create_server
     session_store: SessionStore  # set by create_server
+    login_limiter: LoginRateLimiter | None = None  # set by create_server
 
     # -- plumbing ------------------------------------------------------
     def log_message(self, *args):  # keep test/server output quiet
@@ -610,6 +697,48 @@ class _Handler(BaseHTTPRequestHandler):
     def _is_authenticated(self) -> bool:
         return self._session_valid() or self._header_token_matches()
 
+    # -- R-025 Origin allowlist ----------------------------------------
+    def _origin_allowed(self) -> bool:
+        """True when a state-changing request's Origin is the UI itself.
+
+        No Origin header (curl, scripts, non-browser clients) is
+        allowed: only a browser sends Origin, and a missing one
+        cannot be a cross-site browser request. An Origin that
+        parses to this UI's own http://127.0.0.1:<port> or
+        http://localhost:<port> is allowed. Anything else — a
+        foreign site, the right host on the wrong port, https, or an
+        unparseable value — is cross-site and rejected (fail closed).
+        The port compared is the port this server actually listens
+        on (``server_address[1]``), so an ephemeral test port works
+        the same as the default 8765.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            split = urllib.parse.urlsplit(origin)
+            if split.scheme != "http":
+                return False
+            if split.hostname not in ("127.0.0.1", "localhost"):
+                return False
+            return split.port == self.server.server_address[1]
+        except ValueError:
+            return False
+
+    def _reject_cross_origin(self) -> None:
+        """403 for a cross-origin state-changing request (R-025).
+
+        Logs the attempt (path without query — the query string is
+        never logged, it could carry a token in an old client).
+        """
+        logger.warning(
+            "web UI: rejected cross-origin %s %s from Origin %r (client %s)",
+            self.command, self.path.split("?")[0],
+            self.headers.get("Origin") or "", self.client_address[0],
+        )
+        self._send_json(403, {"ok": False,
+                              "error": "cross-origin request rejected"})
+
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length > 0 else b""
@@ -694,12 +823,39 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": f"handler error: {exc}"})
 
     def do_POST(self):
+        # R-025: Origin allowlist first -- before auth, before the
+        # body, and before the login limiter, so a cross-site page
+        # can neither change state nor burn the victim's login budget
+        # (that would be a trivial lockout). PUT/DELETE are not
+        # implemented (BaseHTTPRequestHandler answers 501), so POST is
+        # the only state-changing method to check.
+        if not self._origin_allowed():
+            self._reject_cross_origin()
+            return
         split = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(split.query)
         body = self._read_body()
         path = split.path
         # -- sign-in / sign-out (R-013) ---------------------------------
         if path == "/login":
+            # R-025: throttle failed logins per client IP. The check
+            # runs before the token comparison, so a correct token
+            # presented while throttled still gets 429 -- the window
+            # must expire first.
+            ip = self.client_address[0]
+            limiter = self.login_limiter
+            retry_after = limiter.retry_after(ip) if limiter is not None else 0
+            if retry_after > 0:
+                logger.warning(
+                    "web UI: login throttled for %s (retry after %ds)",
+                    ip, retry_after,
+                )
+                self._send_json(
+                    429, {"ok": False,
+                          "error": "too many failed login attempts"},
+                    [("Retry-After", str(retry_after))],
+                )
+                return
             # The only place a token in a request body is accepted: a
             # single login exchange that mints a session cookie. The
             # token is compared in constant time and never echoed back
@@ -708,6 +864,8 @@ class _Handler(BaseHTTPRequestHandler):
             if isinstance(supplied, str) and supplied and secrets.compare_digest(
                 supplied, self.auth_token
             ):
+                if limiter is not None:
+                    limiter.record_success(ip)
                 session_id = self._new_session()
                 if self._wants_html():
                     self.send_response(303)
@@ -721,6 +879,15 @@ class _Handler(BaseHTTPRequestHandler):
                         200, {"ok": True},
                         [self._session_cookie_header(session_id)])
             else:
+                # Never log the supplied token -- only that a login
+                # failed, and how many failures this IP has in the
+                # window.
+                if limiter is not None:
+                    failures = limiter.record_failure(ip)
+                    logger.warning(
+                        "web UI: failed login from %s (%d/%d in window)",
+                        ip, failures, limiter.max_failures,
+                    )
                 self._unauthorized(query)
             return
         if path == "/logout":
@@ -931,6 +1098,9 @@ def create_server(
     Handler.backend = WebUIBackend(state_dir)
     Handler.auth_token = token
     Handler.session_store = SessionStore(state_dir)
+    # R-025: a fresh login limiter per server (never shared between
+    # servers, and never global -- tests and restarts start clean).
+    Handler.login_limiter = LoginRateLimiter()
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     return server
