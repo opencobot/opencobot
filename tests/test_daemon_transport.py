@@ -629,11 +629,18 @@ class _FakeListener:
         self._listened.append(DAEMON_PIPE_PATH)
 
 
-def test_pipe_max_instances_is_one():
-    # Atomic backstop for second-instance refusal: a second daemon's
-    # CreateNamedPipeW fails (ERROR_PIPE_BUSY) instead of serving a
-    # second pipe instance alongside the first.
-    assert transport_mod._CtypesWindowsPipeApi._PIPE_MAX_INSTANCES == 1
+def test_pipe_max_instances_is_bounded_above_one():
+    # Thread-per-connection needs one pipe instance per concurrent
+    # client, so the cap is above 1 (8: one listening instance plus
+    # in-flight connections). The old value of 1 was the atomic
+    # backstop for second-instance refusal — a second daemon's
+    # CreateNamedPipeW failed instead of serving alongside the
+    # first. That backstop is gone by design: the single-daemon
+    # guarantee now rests on the reachable probe
+    # (``Daemon.serve_forever`` refuses when a daemon already
+    # answers) and the daemon pid file. The cap stays bounded so a
+    # runaway client cannot exhaust pipe instances.
+    assert transport_mod._CtypesWindowsPipeApi._PIPE_MAX_INSTANCES == 8
 
 
 # ---------------------------------------------------------------------------

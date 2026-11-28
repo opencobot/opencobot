@@ -12,6 +12,9 @@ Linux VM (no Win32 API), so everything here is mock-verified:
   sizes (fixed-width types, so the check is meaningful on Linux);
 * the accept loop, JSON-lines dispatch and every fail-closed path
   run against a fake Win32 API injected into the listener;
+* thread-per-connection: a handler blocked on one connection does
+  not stop the next connection from being served, and ``listen``
+  returns on ``stop`` without joining blocked workers;
 * the ``policyd`` / daemon wiring is checked by stubbing the
   listener class and calling the handler it was given.
 
@@ -69,6 +72,13 @@ class FakeWindowsPipeApi:
     connection; ``read_available`` serves at most ``read_chunk_size``
     bytes per call so line-splitting across chunks is testable.
     ``writes`` collects every reply the listener wrote, in order.
+
+    Each ``create_pipe`` call returns a fresh handle, and each
+    accepted connection is bound to the handle it was accepted on
+    — the model of the real multi-instance pipe, where one handle
+    serves one connection. ``accepted`` counts accepted
+    connections. ``close_handle`` closes a worker-owned handle;
+    ``close`` closes the listener's listening handle.
     """
 
     def __init__(self, connections=(), read_chunk_size=65536):
@@ -80,8 +90,10 @@ class FakeWindowsPipeApi:
         self.fail_acl: Exception | None = None
         self.fail_create: Exception | None = None
         self.fail_read_on: set[int] = set()
-        self._conn_index = -1
-        self._current: bytearray | None = None
+        self.accepted = 0
+        self._next_handle = 1001
+        self._by_handle: dict[int, bytearray] = {}
+        self._handle_index: dict[int, int] = {}
 
     def build_security_attributes(self):
         self.calls.append("build_security_attributes")
@@ -93,26 +105,30 @@ class FakeWindowsPipeApi:
         self.calls.append(("create_pipe", pipe_path, sa))
         if self.fail_create is not None:
             raise self.fail_create
-        return 1001  # fake HANDLE
+        handle = self._next_handle
+        self._next_handle += 1
+        return handle
 
     def wait_for_client(self, handle, stop):
         self.calls.append("wait_for_client")
         if self.connections:
-            self._current = self.connections.pop(0)
-            self._conn_index += 1
+            self._by_handle[handle] = self.connections.pop(0)
+            self._handle_index[handle] = self.accepted
+            self.accepted += 1
             return True
         if stop is not None:
             stop.set()
         return False
 
     def read_available(self, handle, size):
-        if self._conn_index in self.fail_read_on:
+        if self._handle_index.get(handle) in self.fail_read_on:
             raise TransportNotAvailableError("fake read failure")
-        if self._current is None or not self._current:
+        current = self._by_handle.get(handle)
+        if current is None or not current:
             return b""
-        n = min(len(self._current), size, self.read_chunk_size)
-        chunk = bytes(self._current[:n])
-        del self._current[:n]
+        n = min(len(current), size, self.read_chunk_size)
+        chunk = bytes(current[:n])
+        del current[:n]
         return chunk
 
     def write_all(self, handle, data):
@@ -121,6 +137,11 @@ class FakeWindowsPipeApi:
 
     def disconnect(self, handle):
         self.calls.append("disconnect")
+
+    def close_handle(self, handle):
+        self.calls.append(("close_handle", handle))
+        self._by_handle.pop(handle, None)
+        self._handle_index.pop(handle, None)
 
     def close(self, handle):
         self.calls.append(("close", handle))
@@ -218,31 +239,52 @@ def _listen(api, pipe_path=POLICYD_PIPE_PATH, handler=None, stop=None):
     if handler is None:
         handler = _echo_handler(calls)
     NamedPipeListener(pipe_path, api=api).listen(handler=handler, stop=stop)
+    # Workers are threads: listen() returns while the last one may
+    # still be finishing, so wait until every accepted connection
+    # has disconnected (deadline, then fail loudly, never hang).
+    deadline = time.time() + 5
+    while api.calls.count("disconnect") < api.accepted:
+        assert time.time() < deadline, "worker threads did not finish"
+        time.sleep(0.01)
     return calls
 
 
 class _RegistryFakeApi(FakeWindowsPipeApi):
     """Fake Win32 pipe API with a shared registry of bound pipe names.
 
-    Models the real ``CreateNamedPipeW`` behaviour: creating a second
-    pipe with a name that is already bound fails, and closing the
-    handle releases the name. ``wait_for_client`` blocks until the
+    Models the real ``CreateNamedPipeW`` behaviour: a name admits
+    up to ``_CtypesWindowsPipeApi._PIPE_MAX_INSTANCES`` instances
+    (one per concurrent connection); creating one more fails, and
+    closing a handle releases its instance. ``wait_for_client`` blocks until the
     listener is stopped, so the pipe stays bound while the listener
     thread is alive. The registry is class-level (the OS pipe
     namespace is process-wide), so tests must clear it first/last.
     """
 
-    bound: set = set()
+    bound: dict = {}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._handle_paths: dict[int, str] = {}
 
     def create_pipe(self, pipe_path, sa):
-        if pipe_path in type(self).bound:
-            raise OSError(f"pipe {pipe_path} is already bound")
-        type(self).bound.add(pipe_path)
-        self._bound_path = pipe_path
-        return super().create_pipe(pipe_path, sa)
+        if (type(self).bound.get(pipe_path, 0)
+                >= _CtypesWindowsPipeApi._PIPE_MAX_INSTANCES):
+            raise OSError(f"pipe {pipe_path} has no free instance")
+        type(self).bound[pipe_path] = (
+            type(self).bound.get(pipe_path, 0) + 1)
+        handle = super().create_pipe(pipe_path, sa)
+        self._handle_paths[handle] = pipe_path
+        return handle
 
     def close(self, handle):
-        type(self).bound.discard(getattr(self, "_bound_path", None))
+        path = self._handle_paths.pop(handle, None)
+        if path is not None:
+            left = type(self).bound.get(path, 0) - 1
+            if left <= 0:
+                type(self).bound.pop(path, None)
+            else:
+                type(self).bound[path] = left
         super().close(handle)
 
     def wait_for_client(self, handle, stop):
@@ -440,7 +482,11 @@ def test_listener_serves_one_request_and_replies(windows_platform):
     assert api.writes == [
         encode_message({"ok": True, "echo": "status"})]
     assert api.calls.count("disconnect") == 1
-    assert ("close", 1001) in api.calls
+    # Handle ownership is split: the worker closed its connection
+    # handle (1001), and the listener closed the fresh instance it
+    # went back to listening on (1002) when the clients ran out.
+    assert ("close_handle", 1001) in api.calls
+    assert ("close", 1002) in api.calls
 
 
 def test_listener_splits_lines_across_chunks(windows_platform):
@@ -512,6 +558,114 @@ def test_listener_read_failure_ends_connection_not_server(windows_platform):
     calls = _listen(api)
     assert calls == [{"op": "served"}]
     assert api.calls.count("disconnect") == 2
+
+
+def test_listener_serves_second_connection_while_first_is_blocked(
+        windows_platform):
+    """Thread-per-connection: a handler blocked on connection 1
+    must not stop connection 2 from being served.
+
+    This is the incident the change fixes: a long orchestrator run
+    held the single pipe instance and a concurrent ``daemon
+    status`` failed at connect time. The first connection's
+    handler blocks until the test releases it; the second
+    connection's reply must arrive while the first is still
+    blocked.
+    """
+    release_first = threading.Event()
+    first_started = threading.Event()
+
+    def handler(request):
+        if request.get("op") == "slow":
+            first_started.set()
+            release_first.wait(timeout=10)
+            return {"ok": True, "echo": "slow"}
+        return {"ok": True, "echo": request.get("op")}
+
+    api = FakeWindowsPipeApi(connections=[
+        encode_message({"op": "slow"}),
+        encode_message({"op": "fast"}),
+    ])
+    stop = threading.Event()
+    errors: list = []
+
+    def _run():
+        try:
+            NamedPipeListener(POLICYD_PIPE_PATH, api=api).listen(
+                handler=handler, stop=stop)
+        except Exception as exc:  # noqa: BLE001 - recorded for assert
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        assert first_started.wait(timeout=5), "slow handler never started"
+        fast_reply = encode_message({"ok": True, "echo": "fast"})
+        deadline = time.time() + 5
+        while fast_reply not in api.writes:
+            assert time.time() < deadline, \
+                "second connection was not served while the first " \
+                "was blocked"
+            time.sleep(0.01)
+        assert errors == []
+        release_first.set()
+        slow_reply = encode_message({"ok": True, "echo": "slow"})
+        deadline = time.time() + 5
+        while slow_reply not in api.writes:
+            assert time.time() < deadline, \
+                "first connection never completed after release"
+            time.sleep(0.01)
+        deadline = time.time() + 5
+        while api.calls.count("disconnect") < 2:
+            assert time.time() < deadline, "workers did not disconnect"
+            time.sleep(0.01)
+        assert errors == []
+    finally:
+        release_first.set()
+        stop.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_listener_returns_on_stop_without_joining_workers(
+        windows_platform):
+    """``listen`` must not wait for a blocked worker: workers are
+    daemon threads, so a connection still being served when
+    ``stop`` is set ends with the process instead of hanging
+    shutdown."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def handler(request):
+        started.set()
+        release.wait(timeout=10)
+        return {"ok": True, "echo": "slow"}
+
+    api = FakeWindowsPipeApi(
+        connections=[encode_message({"op": "slow"})])
+    stop = threading.Event()
+    errors: list = []
+
+    def _run():
+        try:
+            NamedPipeListener(POLICYD_PIPE_PATH, api=api).listen(
+                handler=handler, stop=stop)
+        except Exception as exc:  # noqa: BLE001 - recorded for assert
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        assert started.wait(timeout=5), "handler never started"
+        stop.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), \
+            "listen() waited for a blocked worker"
+        assert errors == []
+    finally:
+        release.set()
+        stop.set()
+        thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -619,16 +773,23 @@ def test_daemon_serve_forever_hands_listener_its_handler(
 # Per-test pipe isolation (Windows full-suite failures, PR #36)
 # ---------------------------------------------------------------------------
 
-def test_two_unique_pipes_coexist_and_bound_name_collides(windows_platform):
-    """Collision mechanism, mock-proven: two listeners on two unique
-    pipe names both start; a second listener on an already-bound name
-    fails; after the first stops, its name can be bound again.
+def test_two_unique_pipes_coexist_and_instances_are_capped(windows_platform):
+    """Instance model, mock-proven: a pipe name admits up to
+    ``_CtypesWindowsPipeApi._PIPE_MAX_INSTANCES`` instances (one per
+    concurrent connection). A second listener on an already-bound
+    name binds a further instance instead of failing, and only the
+    cap refuses.
+    The single-daemon guarantee therefore no longer comes from the
+    pipe — it comes from the reachable probe
+    (``Daemon.serve_forever``) — and per-test isolation still comes
+    from a unique OPENCOBOT_POLICYD_PIPE per test, so a leaked
+    server never shares a name with the next test.
 
-    This is the mechanism behind the Windows full-suite failures in
-    docs/test-results/2026-11-25-windows-ffa7b3c.md: every fixture
-    server bound the same fixed global pipe, so a leaked server
-    blocked the next one. The fix (a unique OPENCOBOT_POLICYD_PIPE
-    per test) makes each server hold only its own name.
+    This replaces the old single-instance assertion (a second bind
+    fails): that was the mechanism behind the Windows full-suite
+    failures in docs/test-results/2026-11-25-windows-ffa7b3c.md,
+    but thread-per-connection needs several instances of one name,
+    so the registry now models the cap, not exclusivity.
     """
     _RegistryFakeApi.bound.clear()
     try:
@@ -653,30 +814,62 @@ def test_two_unique_pipes_coexist_and_bound_name_collides(windows_platform):
         thread_b.start()
         try:
             deadline = time.time() + 5
-            while {name_a, name_b} - _RegistryFakeApi.bound:
+            while {name_a, name_b} - set(_RegistryFakeApi.bound):
                 assert time.time() < deadline, "listener did not bind in time"
                 time.sleep(0.01)
             assert errors == []
-            # Second listener on the already-bound name fails.
-            with pytest.raises(TransportNotAvailableError):
-                _listen(_RegistryFakeApi(), name_a, None, threading.Event())
-            # After the first stops, its name can be bound again.
-            stop_a.set()
-            thread_a.join(timeout=5)
-            assert not thread_a.is_alive()
-            assert name_a not in _RegistryFakeApi.bound
+            # A second listener on the already-bound name binds a
+            # further instance (thread-per-connection model).
             stop_a2 = threading.Event()
             thread_a2 = threading.Thread(
                 target=_run, args=(_RegistryFakeApi(), name_a, stop_a2),
                 daemon=True)
             thread_a2.start()
             deadline = time.time() + 5
-            while name_a not in _RegistryFakeApi.bound:
-                assert time.time() < deadline, "re-bind did not happen in time"
+            while _RegistryFakeApi.bound.get(name_a, 0) < 2:
+                assert time.time() < deadline, \
+                    "second instance did not bind in time"
                 time.sleep(0.01)
             stop_a2.set()
             thread_a2.join(timeout=5)
             assert not thread_a2.is_alive()
+            assert _RegistryFakeApi.bound.get(name_a, 0) == 1
+            assert errors == []
+            # Fill the name to the cap; the next instance fails,
+            # and a listener on the full name fails closed.
+            filler = _RegistryFakeApi()
+            handles = [
+                filler.create_pipe(name_a, filler.sa)
+                for _ in range(
+                    _CtypesWindowsPipeApi._PIPE_MAX_INSTANCES - 1)
+            ]
+            assert _RegistryFakeApi.bound[name_a] == \
+                _CtypesWindowsPipeApi._PIPE_MAX_INSTANCES
+            with pytest.raises(OSError):
+                filler.create_pipe(name_a, filler.sa)
+            with pytest.raises(TransportNotAvailableError):
+                _listen(_RegistryFakeApi(), name_a, None, threading.Event())
+            assert errors == []
+            for handle in handles:
+                filler.close(handle)
+            assert _RegistryFakeApi.bound.get(name_a, 0) == 1
+            # After the first stops, its name can be bound again.
+            stop_a.set()
+            thread_a.join(timeout=5)
+            assert not thread_a.is_alive()
+            assert name_a not in _RegistryFakeApi.bound
+            stop_a3 = threading.Event()
+            thread_a3 = threading.Thread(
+                target=_run, args=(_RegistryFakeApi(), name_a, stop_a3),
+                daemon=True)
+            thread_a3.start()
+            deadline = time.time() + 5
+            while name_a not in _RegistryFakeApi.bound:
+                assert time.time() < deadline, "re-bind did not happen in time"
+                time.sleep(0.01)
+            stop_a3.set()
+            thread_a3.join(timeout=5)
+            assert not thread_a3.is_alive()
             assert errors == []
         finally:
             stop_a.set()

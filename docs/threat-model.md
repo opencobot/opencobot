@@ -232,8 +232,11 @@ SECURITY.md adversary 5.
 - Windows: `core/transport.py:NamedPipeListener` +
   `_pipe_dacl_entries()` — DENY `NT AUTHORITY\NETWORK`
   (S-1-5-2) first, GRANT current user + `BUILTIN\Administrators`
-  (S-1-5-32-544), read+write only, `_PIPE_MAX_INSTANCES = 1`;
-  fails closed if the ACL cannot be built (R-017, ADR-010).
+  (S-1-5-32-544), read+write only, `_PIPE_MAX_INSTANCES = 8`
+  (one listening instance + one per connection in flight;
+  thread-per-connection, so a long-running connection no longer
+  blocks other clients); fails closed if the ACL cannot be built
+  (R-017, ADR-010).
 
 **Gaps / honest limits:** the boundary is a **same-user
 boundary, not a real OS boundary** (`policy/audit.py`, R-006) —
@@ -244,8 +247,16 @@ explicitly granted pipe access. The named-pipe listener is
 Linux only, never run on a real Windows host
 (`core/transport.py` header, `docs/WINDOWS_TESTING.md` §6).
 A different-user DACL negative check has never been run (no
-second local account on the test laptop).
-**Tests:** `tests/test_windows_pipe_server.py` (20 mock tests),
+second local account on the test laptop). The single-daemon
+guarantee no longer has the OS-level cap of 1 as a backstop
+(the cap is now 8, for concurrency): it rests on the reachable
+probe in `Daemon.serve_forever` and the `daemon.pid` check in
+`daemon start`; a simultaneous second start can now split
+clients. Policyd has no in-process probe — its guarantee rests
+only on the `ensure_policyd` reachability check before
+spawning — so a directly-started second policyd can now split
+clients too.
+**Tests:** `tests/test_windows_pipe_server.py` (27 mock tests),
 `tests/test_r006_permissions.py`, `tests/test_daemon_transport.py`,
 `tests/test_policyd_reachable.py`.
 **Red-team coverage:** no (no IPC/auth/DACL case).

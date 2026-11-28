@@ -567,11 +567,15 @@ class Daemon:
         if is_windows():
             # Refuse a second instance: if a daemon already answers
             # on the pipe, do not serve alongside it — a second
-            # named-pipe instance would silently split clients
-            # between two daemons. (The listener also caps pipe
-            # instances at 1, so a simultaneous start still fails
-            # at CreateNamedPipeW; this probe gives the clean
-            # "already running" error instead of a create failure.)
+            # daemon would silently split clients between two
+            # daemons. This probe is now the in-process backstop:
+            # the listener no longer caps pipe instances at 1 (it
+            # is 8, for thread-per-connection), so a simultaneous
+            # start can create instances instead of failing at
+            # CreateNamedPipeW. The CLI adds a second line of
+            # defence (`daemon start` refuses when daemon.pid
+            # names a live process); see docs/threat-model.md
+            # (R-017) for the residual.
             if daemon_reachable(self.state_dir):
                 raise RuntimeError(
                     f"daemon already running on {DAEMON_PIPE_PATH}")

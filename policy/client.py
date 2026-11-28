@@ -110,16 +110,16 @@ class PolicyClient:
             raise PolicyAuthError(f"policyd auth file empty: {auth_path}")
         return token
 
-    # Connect retries (Windows single-instance pipe race): the
-    # named-pipe server has exactly one instance
-    # (``core.transport._PIPE_MAX_INSTANCES = 1``) and serves one
-    # connection at a time; after a client disconnects, the server
-    # must recycle the instance (``DisconnectNamedPipe`` +
-    # ``ConnectNamedPipe``) before the next client can connect. A
-    # readiness probe — or any previous call — that just disconnected
-    # can therefore make the very next connect fail transiently
-    # (ERROR_PIPE_BUSY / EINVAL) even though policyd is healthy;
-    # on the laptop this broke CLI ``tool run`` right after
+    # Connect retries (Windows named-pipe connect race): the
+    # listener serves one thread per connection on up to
+    # ``_PIPE_MAX_INSTANCES`` (8) instances, so a disconnect no
+    # longer blocks the next connect the way the old single
+    # instance did (it had to be recycled with
+    # ``DisconnectNamedPipe`` + ``ConnectNamedPipe`` before the
+    # next client could connect). A connect can still fail
+    # transiently (ERROR_PIPE_BUSY / EINVAL) when every instance
+    # is briefly busy or a probe just disconnected; on the laptop
+    # the old race broke CLI ``tool run`` right after
     # ``ensure_policyd``. Retry the connect only, bounded, with a
     # short sleep: a failed connect sent no bytes, so retrying
     # cannot double-apply a request. Auth failures, bad replies and
